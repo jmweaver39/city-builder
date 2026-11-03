@@ -10,6 +10,7 @@ import * as THREE from 'three';
 import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import type { HdrEffect, PostPipelineApi } from './context';
 import type { QualitySettings } from './quality';
+import type { GpuPhase } from './profile';
 
 const FAR_LOG = (far: number) => Math.log2(far + 1);
 
@@ -34,7 +35,9 @@ ${DEPTH_FN}
 uniform vec2 uTan;
 uniform vec2 uTexel;
 uniform float uPx;
-const int SAMPLES = 10;
+#ifndef SAMPLES
+#define SAMPLES 10
+#endif
 vec3 viewPos(vec2 uv, float z) { return vec3((uv * 2.0 - 1.0) * uTan * z, -z); }
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 void main() {
@@ -210,6 +213,8 @@ export class PostPipeline implements PostPipelineApi {
   readonly composite: THREE.ShaderMaterial;
   /** Multiplied into bloom. Raised at night, when lamps should glow. */
   bloomStrength = 0.12;
+  /** Benchmark hook: told as the frame's GPU work moves between phases (render/profile.ts). */
+  phase: ((p: GpuPhase | null) => void) | null = null;
 
   constructor(
     private readonly gl: THREE.WebGLRenderer,
@@ -309,6 +314,11 @@ export class PostPipeline implements PostPipelineApi {
 
   setQuality(q: QualitySettings): void {
     this.settings = q;
+    const samples = Math.max(4, q.aoSamples || 10);
+    if (this.aoMat.defines.SAMPLES !== samples) {
+      this.aoMat.defines.SAMPLES = samples;
+      this.aoMat.needsUpdate = true;
+    }
     this.rebuild();
   }
 
@@ -375,6 +385,8 @@ export class PostPipeline implements PostPipelineApi {
   render(scene: THREE.Scene, camera: THREE.PerspectiveCamera, overlay: THREE.Scene): void {
     const gl = this.gl;
     const target = this.sceneTarget;
+    const phase = this.phase;
+    phase?.('shadow');
     if (!target) {
       gl.setRenderTarget(null);
       gl.clear();
@@ -383,8 +395,10 @@ export class PostPipeline implements PostPipelineApi {
       gl.setRenderTarget(target);
       gl.clear();
       gl.render(scene, camera);
+      phase?.('post');
       this.runAo(camera);
-      const bloom = this.runBloom();
+      // Bloom is scaled by night: by day it adds nothing, so its ten passes are skipped.
+      const bloom = this.bloomStrength > 0.004 ? this.runBloom() : null;
       const c = this.composite.uniforms;
       const tanH = Math.tan((camera.fov * Math.PI) / 360);
       c.uTan.value.set(tanH * camera.aspect, tanH);
@@ -396,8 +410,10 @@ export class PostPipeline implements PostPipelineApi {
       c.uBloom.value = bloom ? this.bloomStrength : 0;
       this.pass(this.composite, null);
     }
+    phase?.('overlay');
     gl.setRenderTarget(null);
     gl.render(overlay, camera);
+    phase?.(null);
   }
 
   /** Atmosphere inputs, set when the time of day changes. */

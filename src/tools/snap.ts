@@ -12,6 +12,7 @@ import { totalHalfWidth } from '../core/roadTypes';
 import type { Id, Vec3 } from '../core/types';
 import { nearestOnLevel } from './pick';
 import { refineSegmentHit, snapWithGrid, type GridSettings } from './grid';
+import { refineRoadHit, snapToSmartGuides, type GuideContext, type GuideResult } from './guides';
 
 export const ANGLE_STEP = (15 * Math.PI) / 180;
 export const LENGTH_STEP = 8;
@@ -24,7 +25,7 @@ export const NODE_CATCH = 8;
 /** A hit this close to a segment end lands on its node instead. */
 export const SEGMENT_END_GAP = 6;
 
-export type SnapKind = 'free' | 'node' | 'segment' | 'angle' | 'length' | 'angleLength' | 'grid' | 'gridLine';
+export type SnapKind = 'free' | 'node' | 'segment' | 'angle' | 'length' | 'angleLength' | 'grid' | 'gridLine' | 'guide';
 
 export interface SnapHit {
   pos: Vec3;
@@ -34,6 +35,8 @@ export interface SnapHit {
   angle: number | null;
   /** Guide ray to draw. */
   guide: { from: Vec3; to: Vec3 } | null;
+  /** Smart guide that placed it (guides.ts): label, marks, and a draft shape for parallel roads. */
+  guides?: GuideResult;
 }
 
 export interface SnapFrom {
@@ -64,6 +67,8 @@ export interface SnapQuery {
   grid?: GridSettings | null;
   /** Ground size of a screen pixel at the cursor, so grid catch radii stay a few pixels when zoomed in. */
   gridMetresPerPixel?: number;
+  /** Smart guides (guides.ts). Absent leaves snapping exactly as without them. */
+  guides?: GuideContext | null;
 }
 
 const BAND_TOLERANCE = 2.5;
@@ -193,7 +198,15 @@ export function snapRoadPoint(net: RoadNetwork, q: SnapQuery): SnapHit {
   }
   if (q.toggles.segments) {
     const hit = snapToSegment(net, q);
-    if (hit) return q.grid?.enabled ? refineSegmentHit(net, hit, q.grid, SEGMENT_END_GAP) : hit;
+    if (hit) {
+      const onGrid = q.grid?.enabled ? refineSegmentHit(net, hit, q.grid, SEGMENT_END_GAP) : hit;
+      return q.guides ? refineRoadHit(net, onGrid, q.from, q.guides) : onGrid;
+    }
+  }
+  // Smart guides (guides.ts): parallel, perpendicular, extension, line-up, spacing.
+  if (q.guides) {
+    const g = snapToSmartGuides(net, q.raw, q.from, q.guides);
+    if (g) return { pos: g.pos, anchor: { kind: 'free', pos: { ...g.pos } }, kind: 'guide', angle: turnFrom(q.from, g.pos), guide: null, guides: g.result };
   }
   // The optional grid (grid.ts) comes after nodes and roads, which make connections.
   if (q.grid?.enabled) return snapWithGrid(q, snapToGuides);

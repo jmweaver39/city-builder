@@ -8,6 +8,7 @@
  */
 
 import type { RailData } from './railTypes';
+import type { BarrierSpec, Quay, StructureSpec } from './wallTypes';
 
 export type Id = number;
 
@@ -23,6 +24,9 @@ export interface Vec3 {
 // ---------------------------------------------------------------------------
 
 export type LaneKind = 'drive' | 'bus' | 'bike' | 'rail';
+
+/** Power on a piece of track: overhead wire, a third rail, or none for diesels. */
+export type Electrification = 'overhead' | 'thirdRail' | 'none';
 
 export interface LaneDef {
   /**
@@ -146,20 +150,97 @@ export interface MarkingAnchor {
   corner?: number;
   /** Metres back along the arm from its cut line, for lines laid across the road. */
   back?: number;
+  /**
+   * Segment markings only: which end of the segment the anchor's cut line is at.
+   * `segmentId` is then the segment itself. Absent on node markings.
+   */
+  end?: 'a' | 'b';
+}
+
+/**
+ * Settings of one marking point: an arm's boundary at a node, or one end's boundary
+ * on a segment. They move every anchor on that boundary, rows along the arm too.
+ */
+export interface MarkingPointSetting {
+  segmentId: Id;
+  boundary: number;
+  /** Segment markings only, as on MarkingAnchor. */
+  end?: 'a' | 'b';
+  /** Metres along the cut line to the right, as seen looking into the junction (along a-to-b on a segment). */
+  offset?: number;
+  /** Sit on the left or right edge of the painted boundary line instead of its middle. */
+  place?: 'left' | 'right';
+  /** Turned off: not offered for new markings. Markings already using it stay. */
+  off?: true;
+}
+
+/**
+ * One automatic marking at a junction, by reference. 'stop' is an arm's stop line or
+ * yield teeth. 'arrow' is the turn arrow on one lane of an arm, by lane index. A
+ * guide carries a lane line through the junction from one arm to another; `part`
+ * is 'L' or 'R' for the edges of the movement and 'M0', 'M1'... for the lines
+ * between its lanes. A gore is the hatched nose between two branches of a ramp
+ * junction, named by the segments of both branches.
+ */
+export type AutoMarkingRef =
+  | { kind: 'stop'; segmentId: Id }
+  | { kind: 'arrow'; segmentId: Id; lane: number }
+  | { kind: 'guide'; from: Id; to: Id; part: string }
+  | { kind: 'gore'; segments: Id[] };
+
+/** Where a line's part starts or ends: one of its ends, or where it crosses another line. */
+export type RuleBound = { end: 0 | 1 } | { cross: Id };
+
+/** The look of a line, without where it goes. Shared by lines, their parts and presets. */
+export interface LineStyleSpec {
+  style: NodeLineStyle;
+  color: PaintColor;
+  /** A colour of the user's own, '#rrggbb'. Wins over `color`. */
+  hex?: string;
+  /** Line thickness, or the depth of a crosswalk, or the width of a lane. */
+  width: number;
+  /** Dash and gap lengths in metres for dashed styles, or stripe and gap for crosswalks and teeth. */
+  dash?: number;
+  space?: number;
+  /** Space between the two lines of a double style. */
+  gap?: number;
+  /** Metres to the right of the path, or along the arm for a crosswalk. */
+  offset?: number;
+  /** Which side of the path the paint sits on. Absent is centred. */
+  align?: 'left' | 'right';
+  /** Crosswalks: an edge line on both sides. */
+  border?: 'solid' | 'dashed';
+}
+
+/** One part of a line with a look of its own, between two bounds. Later parts win. */
+export interface LineRule {
+  from: RuleBound;
+  to: RuleBound;
+  style: LineStyleSpec;
 }
 
 export type NodeLineStyle =
   | 'solid'
   | 'dashed'
   | 'double'
+  | 'doubleDashed'
   | 'solidDashed'
+  | 'dashedSolid'
   | 'dotted'
+  | 'zigzag'
+  | 'sharkTeeth'
   | 'stopLine'
+  | 'lane'
   | 'crosswalkZebra'
+  | 'crosswalkDoubleZebra'
   | 'crosswalkLadder'
-  | 'crosswalkLines';
+  | 'crosswalkLines'
+  | 'crosswalkSolid'
+  | 'crosswalkChessboard'
+  /** No paint. Only useful for a part of a line. */
+  | 'empty';
 
-export type NodeFillStyle = 'solid' | 'hatch' | 'chevron';
+export type NodeFillStyle = 'solid' | 'hatch' | 'stripes' | 'grid' | 'chevron' | 'triangle';
 
 /** A painted line between two anchors. */
 export interface NodeLineMarking {
@@ -179,6 +260,16 @@ export interface NodeLineMarking {
    * `straight`.
    */
   path?: 'outline' | 'lanes';
+  /** See LineStyleSpec. All absent on lines placed before they existed. */
+  hex?: string;
+  dash?: number;
+  space?: number;
+  gap?: number;
+  offset?: number;
+  align?: 'left' | 'right';
+  border?: 'solid' | 'dashed';
+  /** Parts of the line drawn in other styles. */
+  rules?: LineRule[];
 }
 
 /** An area enclosed by three or more anchors. */
@@ -190,9 +281,22 @@ export interface NodeFillerMarking {
   color: PaintColor;
   /** Stripe thickness of hatch and chevron. */
   width: number;
+  /** A colour of the user's own, '#rrggbb'. Wins over `color`. */
+  hex?: string;
+  /** Degrees the pattern turns from the area's longest edge. */
+  angle?: number;
+  /** Metres between stripes, or the size of a grid or chessboard cell. */
+  step?: number;
+  /** Metres the pattern stands in from the area's edge. */
+  offset?: number;
+  /** Draw no edge line round a patterned area. */
+  noOutline?: true;
 }
 
 export type NodeMarking = NodeLineMarking | NodeFillerMarking;
+
+/** What hand-placed markings belong to: a junction or other node, or one segment between its ends. */
+export type MarkingHost = { kind: 'node'; id: Id } | { kind: 'segment'; id: Id };
 
 /** A user-specified lane link. `${segmentId}:${laneIndex}` on both sides. */
 export interface LaneLink {
@@ -211,8 +315,63 @@ export interface JunctionControl {
   crosswalks: Record<number, CrosswalkStyle>;
   /** Markings placed by hand at this node. Absent means none. */
   markings?: NodeMarking[];
+  /** Offsets and switches for the marking points at this node. Absent means all default. */
+  markingPoints?: MarkingPointSetting[];
+  /**
+   * Automatic markings taken away one by one: a stop line, a turn arrow, a guide
+   * or a gore. A crosswalk is taken away through `crosswalks` instead. Absent means none.
+   */
+  autoOff?: AutoMarkingRef[];
   /** Hide the automatic stop lines, yield teeth and crosswalks at this node. */
   hideAutoMarkings?: boolean;
+  /** Hand edits to the junction's physical shape. Absent means automatic. See core/junctionShape.ts. */
+  shape?: JunctionShape;
+}
+
+/**
+ * One corner of a junction: the kerb from an arm's left edge, looking at the node,
+ * clockwise to the next arm's right edge.
+ */
+export interface ShapeCorner {
+  /** Kerb radius in metres. Absent keeps the automatic corner. */
+  radius?: number;
+  /** Kerb moved into the road (+, a kerb extension) or back (-) at the middle of the corner, metres. */
+  kerb?: number;
+  /** False takes the sidewalk off this corner: the asphalt runs to its back edge. */
+  sidewalk?: boolean;
+}
+
+/** One arm's end at a junction. */
+export interface ShapeArm {
+  /** Metres added to the automatic trim. Positive makes the junction box larger. */
+  trim?: number;
+  /**
+   * Kerb shift at the junction end of each side, looking at the node. Positive moves
+   * the kerb into the road (a bulb-out), negative narrows the sidewalk.
+   */
+  edgeLeft?: number;
+  edgeRight?: number;
+}
+
+/** A raised island between two lane boundaries of one arm. */
+export interface ShapeIsland {
+  id: Id;
+  segmentId: Id;
+  /** Boundary indices counted from the arm's left edge looking at the node, from < to. */
+  from: number;
+  to: number;
+  /** Metres back along the arm from its cut line. */
+  back: number;
+  /** Metres forward from the cut line into the junction. */
+  reach: number;
+}
+
+export interface JunctionShape {
+  /** Keyed `${segmentId}>${nextSegmentId}`, the two arms either side of the corner, clockwise. */
+  corners?: Record<string, ShapeCorner>;
+  /** Keyed by the arm's segment id. */
+  arms?: Record<number, ShapeArm>;
+  islands?: ShapeIsland[];
 }
 
 export interface RoadNode {
@@ -232,12 +391,22 @@ export interface SegmentOverrides {
   laneSpeeds?: Record<number, number>;
   surface?: 'asphalt' | 'concrete' | 'darkAsphalt' | 'red' | 'gravel';
   name?: string;
+  /** Track only: how it is powered. Absent means the track type's default. */
+  electrification?: Electrification;
   /**
    * The a or b end leaves from, or joins, the side of another road at its node
    * instead of its centreline, as a ramp does on a highway. See core/ramps.ts.
    */
   attachA?: RampAttach;
   attachB?: RampAttach;
+  /** Embankment, retaining walls, trench and so on. Absent is 'auto'. See core/walls.ts. */
+  structure?: StructureSpec;
+  /** Sound barriers along the road edges. */
+  barriers?: BarrierSpec;
+  /** Markings placed by hand along this segment, between its two ends. Anchors carry `end`. */
+  handMarkings?: NodeMarking[];
+  /** Point settings for those markings. */
+  markingPoints?: MarkingPointSetting[];
 }
 
 /**
@@ -334,6 +503,11 @@ export interface RoadPaintRef {
   offset: number;
   /** The second side of an area, or the far end of a stamp laid across a lane. */
   offset2?: number;
+  /**
+   * Lines only: the offset at the far end, right of the walking direction there.
+   * The line moves across smoothly between the two. Absent keeps `offset` all the way.
+   */
+  offsetEnd?: number;
   /** Stamps: 1 faces along a-to-b, -1 faces b-to-a. */
   dir?: 1 | -1;
 }
@@ -367,6 +541,11 @@ export interface TrafficSettings {
   /** Remove vehicles stuck for this long. 0 disables. */
   despawnStuckSec: number;
   defaultMix: VehicleMix;
+  /**
+   * Cars stop for people on crosswalks (src/peds). Absent means true. False: people
+   * still cross, but only in gaps in the traffic.
+   */
+  pedestriansStopTraffic?: boolean;
 }
 
 export interface Project {
@@ -383,6 +562,55 @@ export interface Project {
   rail?: RailData;
   /** Zoned areas, later ones on top. Absent until the first one is placed. */
   zones?: ZoneRegion[];
+  /** Quay walls along the river. Absent until the first one is built. */
+  quays?: Quay[];
+  /** Landscaping height offsets (core/terrainEdit.ts). Absent until the land is first edited. */
+  terrain?: TerrainData;
+  /** Marking presets and templates used in this map, so it opens the same elsewhere. */
+  markingLibrary?: MarkingLibrary;
+}
+
+/** A named look for a line or filler. */
+export type MarkingPreset =
+  | { id: string; name: string; kind: 'line'; style: LineStyleSpec }
+  | { id: string; name: string; kind: 'filler'; style: Pick<NodeFillerMarking, 'fill' | 'color' | 'hex' | 'width' | 'angle' | 'step' | 'offset' | 'noOutline'> };
+
+/** One arm of a template: its direction and how many boundaries it has. */
+export interface TemplateArm {
+  /** Radians clockwise from the template's first arm, seen from above. */
+  angle: number;
+  boundaries: number;
+}
+
+/**
+ * A whole junction's markings, by arm index instead of segment and by boundary
+ * counted left to right looking at the node, so it fits another junction.
+ */
+export interface MarkingTemplate {
+  id: string;
+  name: string;
+  /** 'segment' templates have two arms: the a end and the b end. */
+  host: 'node' | 'segment';
+  arms: TemplateArm[];
+  markings: NodeMarking[];
+  points: MarkingPointSetting[];
+  hideAutoMarkings?: boolean;
+}
+
+export interface MarkingLibrary {
+  presets?: MarkingPreset[];
+  templates?: MarkingTemplate[];
+}
+
+/** Saved landscaping: sparse tiles of height offsets, packed by core/terrainEdit.ts. */
+export interface TerrainData {
+  v: 1;
+  /** Grid spacing in metres. */
+  cell: number;
+  /** Packed tiles, base64. Opaque outside terrainEdit.ts. */
+  tiles: string;
+  /** Ground opened to water with "Let water in", packed the same way. */
+  water?: string;
 }
 
 export type ZoneKind = 'residential' | 'commercial' | 'industrial' | 'office';
@@ -473,6 +701,12 @@ export interface NodeArm {
   cutDir: Vec3;
   /** Arc length cut off this end. Same as the SegmentGeom trim. */
   trim: number;
+  /**
+   * Where the outline meets the cut line, when a junction shape moved the kerb off
+   * the road edge. Absent means the kerb is at leftEdge or rightEdge.
+   */
+  kerbLeft?: Vec3;
+  kerbRight?: Vec3;
 }
 
 export interface NodeGeom {

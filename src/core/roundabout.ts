@@ -667,6 +667,61 @@ export function removeRoundabout(net: RoadNetwork, rb: Roundabout): Id | null {
 }
 
 // ---------------------------------------------------------------------------
+// Islands
+// ---------------------------------------------------------------------------
+
+export interface RoundaboutIslands {
+  /** The raised central island inside the ring. */
+  central: { centre: Vec3; radius: number };
+  /** Splitter islands on two-way arms, plan polygons wound one way round. */
+  splitters: Vec3[][];
+}
+
+/** Half width of a splitter island where it meets the ring, and at its tail. */
+const SPLITTER_HALF = 0.6;
+const SPLITTER_TAIL = 0.15;
+
+/**
+ * Where the islands go: a central island filling the ring, and on each two-way
+ * arm a tapered splitter between the entry and exit lanes, from the ring outward.
+ */
+export function roundaboutIslands(net: RoadNetwork, rb: Roundabout): RoundaboutIslands {
+  const ringHalfWidth = totalHalfWidth(net.roadTypeOf(rb.segments[0]));
+  const splitters: Vec3[][] = [];
+  const length = clamp(rb.radius * 0.45, 8, 20);
+  for (const arm of rb.arms) {
+    const def = net.roadTypeOf(arm.segmentId);
+    const back = def.lanes.filter((l) => l.dir === -1);
+    const fwd = def.lanes.filter((l) => l.dir === 1);
+    if (!back.length || !fwd.length) continue;
+    // The line between the two directions, as an offset from the centreline.
+    const split = (Math.max(...back.map((l) => l.offset + l.width / 2)) + Math.min(...fwd.map((l) => l.offset - l.width / 2))) / 2;
+    const geom = net.segmentGeom(arm.segmentId);
+    if (!geom || geom.stations.length < 2) continue;
+    const st = arm.atStart ? geom.stations : [...geom.stations].reverse();
+    const left: Vec3[] = [];
+    const right: Vec3[] = [];
+    let d = 0;
+    for (let i = 0; i < st.length; i++) {
+      if (i > 0) d += distXZ(st[i - 1].pos, st[i].pos);
+      const f = Math.min(1, d / length);
+      const half = SPLITTER_HALF + (SPLITTER_TAIL - SPLITTER_HALF) * f;
+      const { pos, right: r } = st[i];
+      const c = { x: pos.x + r.x * split, y: pos.y, z: pos.z + r.z * split };
+      left.push({ x: c.x - r.x * half, y: c.y, z: c.z - r.z * half });
+      right.push({ x: c.x + r.x * half, y: c.y, z: c.z + r.z * half });
+      if (d >= length) break;
+    }
+    if (d < length * 0.5) continue;
+    splitters.push([...left, ...right.reverse()]);
+  }
+  return {
+    central: { centre: { ...rb.centre }, radius: Math.max(0, rb.radius - ringHalfWidth - 0.25) },
+    splitters,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Lane use at ring nodes
 // ---------------------------------------------------------------------------
 

@@ -80,6 +80,8 @@ export class Simulation implements SimApi, ArrivalSink {
   private refreshEvery = 1;
   /** Closed lanes, by key so that a closure outlives graph rebuilds. */
   private blockedKeys = new Set<string>();
+  /** Stop short of these lane ends (setStopBack), by key. */
+  private stopBackKeys = new Map<string, number>();
   private sweepCache: SweepCache = new Map();
 
   // Per-segment readouts.
@@ -123,6 +125,14 @@ export class Simulation implements SimApi, ArrivalSink {
       const lane = g.graph.byKey.get(key);
       if (lane !== undefined) blocked[lane] = 1;
     }
+    let stopBack: Float32Array | undefined;
+    if (this.stopBackKeys.size) {
+      stopBack = new Float32Array(g.n);
+      for (const [key, m] of this.stopBackKeys) {
+        const lane = g.graph.byKey.get(key);
+        if (lane !== undefined) stopBack[lane] = m;
+      }
+    }
     return {
       net: this.net,
       g,
@@ -133,6 +143,7 @@ export class Simulation implements SimApi, ArrivalSink {
       sig,
       rng,
       blocked,
+      stopBack,
       tick: this.tick,
       time: this._time,
       counters: prev?.counters ?? emptyCounters(),
@@ -487,6 +498,18 @@ export class Simulation implements SimApi, ArrivalSink {
     if (blocked) this.blockedKeys.add(key);
     else this.blockedKeys.delete(key);
     w.blocked[lane] = blocked ? 1 : 0;
+  }
+
+  setStopBack(lane: number, metres: number): void {
+    this.sync();
+    const w = this.world;
+    const key = w.g.graph.lanes[lane]?.key;
+    if (key === undefined || w.g.isConn[lane]) return;
+    const m = Math.max(0, Math.min(8, metres));
+    if (m > 0) this.stopBackKeys.set(key, m);
+    else this.stopBackKeys.delete(key);
+    if (!w.stopBack && m > 0) w.stopBack = new Float32Array(w.g.n);
+    if (w.stopBack) w.stopBack[lane] = m;
   }
 
   endpointStats(id: Id): EndpointStats | null {

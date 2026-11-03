@@ -3,8 +3,8 @@
  * clearance, so sweeps have enough samples wherever the ground changes under them.
  */
 import type { Station } from '../core/types';
-import { riverDistance, terrainHeight } from '../core/terrain';
-import { ROAD_LIFT } from './constants';
+import { hasTerrainEdits, riverDistance, surfaceLevel, terrainEditDelta, terrainHeight } from '../core/terrain';
+import { ROAD_LIFT, TUNNEL_Y as TUNNEL_Y_FRAME } from './constants';
 
 export interface Frame {
   x: number;
@@ -23,9 +23,17 @@ export interface Frame {
   c: number;
   /** Terrain height at the centre. */
   ground: number;
+  /** Set by walls: an open trench or cut, never a tunnel, whatever its depth. */
+  open?: boolean;
+  /** Set by walls: a forced tunnel, covered wherever it is below the ground. */
+  covered?: boolean;
+  /** Set by walls: forced pillars, piers even on low stretches. */
+  viaduct?: boolean;
 }
 
-function makeFrame(a: Station, b: Station, f: number): Frame {
+type GroundFn = (x: number, z: number) => number;
+
+function makeFrame(a: Station, b: Station, f: number, groundAt: GroundFn): Frame {
   const x = a.pos.x + (b.pos.x - a.pos.x) * f;
   const y = a.pos.y + (b.pos.y - a.pos.y) * f + ROAD_LIFT;
   const z = a.pos.z + (b.pos.z - a.pos.z) * f;
@@ -41,7 +49,7 @@ function makeFrame(a: Station, b: Station, f: number): Frame {
   tx /= tl;
   ty /= tl;
   tz /= tl;
-  const ground = terrainHeight(x, z);
+  const ground = groundAt(x, z);
   return { x, y, z, rx, rz, tx, ty, tz, s: a.s + (b.s - a.s) * f, c: y - ROAD_LIFT - ground, ground };
 }
 
@@ -49,16 +57,28 @@ function makeFrame(a: Station, b: Station, f: number): Frame {
 const FINE_STEP = 5;
 
 function needsFine(a: Station, b: Station): boolean {
-  const check = (s: Station) => s.pos.y !== 0 || riverDistance(s.pos.x, s.pos.z) < 70;
+  // Landscaped ground changes under a road at any height.
+  const check = (s: Station) => s.pos.y !== 0 || riverDistance(s.pos.x, s.pos.z) < 70 || (hasTerrainEdits() && terrainEditDelta(s.pos.x, s.pos.z) !== 0);
   if (check(a) || check(b)) return true;
   // A long span could jump the whole channel.
   const mx = (a.pos.x + b.pos.x) / 2;
   const mz = (a.pos.z + b.pos.z) / 2;
-  return riverDistance(mx, mz) < 70;
+  if (riverDistance(mx, mz) < 70) return true;
+  // Or a landscaped hill or valley between its ends.
+  if (!hasTerrainEdits()) return false;
+  const len = Math.hypot(b.pos.x - a.pos.x, b.pos.z - a.pos.z);
+  for (let k = 1, n = Math.ceil(len / 8); k < n; k++) {
+    const f = k / n;
+    if (terrainEditDelta(a.pos.x + (b.pos.x - a.pos.x) * f, a.pos.z + (b.pos.z - a.pos.z) * f) !== 0) return true;
+  }
+  return false;
 }
 
-/** Extra arc lengths to keep as frames, on top of the refined stations. */
-export function buildFrames(stations: readonly Station[], extraS: readonly number[] = []): Frame[] {
+/**
+ * Extra arc lengths to keep as frames, on top of the refined stations. `groundAt`
+ * is the ground under the road, with embankments and cuts (core/terrainMods.ts).
+ */
+export function buildFrames(stations: readonly Station[], extraS: readonly number[] = [], groundAt: GroundFn = terrainHeight): Frame[] {
   const out: Frame[] = [];
   const extras = extraS.slice().sort((p, q) => p - q);
   let e = 0;
@@ -72,16 +92,24 @@ export function buildFrames(stations: readonly Station[], extraS: readonly numbe
       const f = k / parts;
       const s = a.s + span * f;
       const next = a.s + (span * (k + 1)) / parts;
-      out.push(makeFrame(a, b, f));
+      out.push(makeFrame(a, b, f, groundAt));
       while (e < extras.length && extras[e] <= s + 0.01) e++;
       while (e < extras.length && extras[e] < next - 0.01) {
-        out.push(makeFrame(a, b, (extras[e] - a.s) / span));
+        out.push(makeFrame(a, b, (extras[e] - a.s) / span, groundAt));
         e++;
       }
     }
   }
   const last = stations[stations.length - 1];
   const prev = stations[stations.length - 2] ?? last;
-  out.push(makeFrame(prev, last, 1));
+  out.push(makeFrame(prev, last, 1, groundAt));
   return out;
+}
+
+/** A covered tunnel stretch. Open trenches are never tunnels; forced tunnels cover any sunk stretch. */
+export function isTunnelFrame(f: Frame): boolean {
+  if (f.open) return false;
+  if (f.covered) return true;
+  // Measured from the surface, so a road on dug-out land is not a tunnel (core/terrain.ts).
+  return f.y - ROAD_LIFT <= surfaceLevel(f.x, f.z) + TUNNEL_Y_FRAME;
 }

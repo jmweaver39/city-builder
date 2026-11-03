@@ -76,6 +76,37 @@ Built-in road ids: `street-2`, `street-2-bike`, `street-2-oneway`, `street-4`, `
 - `validateDraft` adds `wrongWay` (error: a one-way road joining against the highway traffic) and
   `atGradeHighway` (warning: a two-way road joining a highway at grade).
 
+## Junction shape (`junctionShape.ts`)
+
+- `JunctionControl.shape` (optional): `corners[`${seg}>${nextSeg}`]` `{ radius?, kerb?, sidewalk?: false }`,
+  `arms[seg]` `{ trim?, edgeLeft?, edgeRight? }` (left and right looking at the node), `islands[]`
+  `{ id, segmentId, from, to, back, reach }` with boundaries counted from the arm's left looking at the node.
+  Keyed by segment ids, never positions. Split renames, removal strips, save keeps, reverse needs nothing.
+- Edit with `applyJunctionShape(net, node, shape)`, which validates and refuses with reasons (a kerb in the way
+  of a connector, an island over a lane, a lane left with no exit, a trim that buries a cut point). It runs in one
+  batch, so a refused shape never reaches listeners. `net.setJunctionShape` sets without checking.
+- `computeNodeLayout(id, arms, shape?)` and `buildNodeGeom(layout, pos, geomOf, shape?)` honour it: trims grow so a
+  kerb radius fits, the outline uses filleted, moved or sidewalk-less corners. `NodeArm.kerbLeft/kerbRight` is where
+  the outline meets the cut line when an arm-end kerb moved; read corners from `kerbLeftOf(arm)`, not `leftEdge`.
+- Connectors: `buildNodeLanes` drops connectors through an island (`islandBlocker`) and swings turns wider round
+  moved kerbs (`kerbFitter`, via `buildConnector(node, link, cubic?)`). Both are inert without a shape.
+- `segmentKerbShift(net, seg)` and `shapedKerbLines` give the kerb along a road near a shaped arm end.
+
+## Walls, barriers and quays (`walls.ts`, `terrainMods.ts`, `quays.ts`)
+
+- `SegmentOverrides.structure` (`StructureSpec`: mode `auto | embankment | retaining | trench | cut | pillars | tunnel`,
+  plus per-side `left`/`right` wall `on`, `style`, `top`, `height` cap) and `SegmentOverrides.barriers` (per-side sound
+  barrier `kind` and `height`). Both copy on split and swap sides on `reverseSegment`, so walls stay put in the world.
+- `sideSection(spec, side, def, surfaceY, natural)` / `segmentSections(net, id)` give wall faces, slopes and the ground
+  profile per station. Renderer and terrain modifiers both read them.
+- `terrainHeight` stays the untouched land. `groundHeight(net, x, z)` (or `terrainModsFor(net).groundAt`) adds
+  embankments, cuts, junction pads and quay fill, derived from the project and cached by `net.version`. Use it for
+  anything that stands on the ground.
+- `structureFootprint(net, {cubic, roadType, structure})` checks the extra width: another road in a wall is an error,
+  under a slope a warning (`code: 'structureFootprint'`).
+- Quays persist in optional `Project.quays` (`{id, bank, x0, x1, style, top}`): a stretch of one bank between two
+  centreline x values. `addQuay`, `updateQuay`, `removeQuay`, `net.quays`; change events set `quaysChanged`.
+
 ## Known limitations
 
 1. About 4.9% of junctions under random fuzz use a hull outline fallback (`outlineSimplified`),
@@ -91,3 +122,18 @@ Built-in road ids: `street-2`, `street-2-bike`, `street-2-oneway`, `street-4`, `
    tool and templates through `segmentOverlapIssues` in `overlap.ts`. `addSegment` does not check.
 5. A bike lane meeting a junction with no bike lanes gets a turnaround or stops. The no-orphan guarantee
    covers drive lanes.
+
+## Landscaping (`terrainEdit.ts`)
+
+- Ground height order: `baseTerrainHeight` (generated land) + landscaping offsets = `terrainHeight(x, z)`; the walls
+  module's embankments, cuts and quays go on top in `groundHeight(net, x, z)` and treat `terrainHeight` as the land.
+- `bindTerrainEdits(net)` (main.ts does it) makes `net.project.terrain` drive `terrainHeight`, loads and undo included.
+  Nothing bound or nothing edited: `terrainHeight` is exactly the old function.
+- `terrainEditVersion()` (terrain.ts) changes whenever committed landscaping changes. Cache anything derived from
+  `terrainHeight` on it as well as `net.version` (terrainMods does).
+- `surfaceLevel(x, z)`: what buildings sit on and tunnels are measured from: `max(terrainHeight, 0)` without edits, the
+  dug ground where the land was lowered. Tunnel means `y < surfaceLevel - 1.5`.
+- `isWater`: the river level is a water table; ground under `WATER_LEVEL` is water, wherever it is.
+- `net.setTerrain(data, box)` stores a stroke (one undo step), touches the roads in the box so everything on the ground
+  rebuilds, and fires `terrainChanged`. Roads are never moved by landscaping.
+

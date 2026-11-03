@@ -5,6 +5,7 @@
  */
 import type { Id, LaneGraph, RoadNetwork, TurnKind } from '../core';
 import { sweepConflicts, type SweepCache, type SweepHit } from './sweep';
+import { sharedStretches } from './proximity';
 import {
   CONNECTOR_CHORD,
   CONNECTOR_LATERAL_ACCEL,
@@ -75,7 +76,11 @@ export interface CompiledGraph {
   confSelf: Float64Array;
   confOther: Float64Array;
   confKind: Uint8Array;
-  /** Furthest crossing point along a connector, -1 when it crosses nothing. */
+  /** 1 when the core found a crossing on this connector, as opposed to a body conflict. */
+  coreCross: Uint8Array;
+  /** Heading change through a connector, radians, 0 for road lanes. */
+  turnAngle: Float64Array;
+  /** Furthest crossing or near-miss point along a connector, -1 when it has none. */
   lastCross: Float64Array;
   /** How far before the end of a lane to wait, clear of long bodies turning past. */
   setback: Float64Array;
@@ -88,6 +93,13 @@ export interface CompiledGraph {
   /** Allowed speed by distance along the lane, already braked for bends further along it. */
   profStart: Int32Array;
   prof: Float32Array;
+  /** Road lanes running too close to another for two bodies side by side. See proximity.ts. */
+  shareStart: Int32Array;
+  shareLane: Int32Array;
+  shareFrom: Float64Array;
+  shareTo: Float64Array;
+  shareOffset: Float64Array;
+  shareGap: Float64Array;
   /** Road lanes fed by two or more connectors. */
   mergeLanes: Int32Array;
   segCount: number;
@@ -243,6 +255,8 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
   const ptStart = new Int32Array(n + 1);
   const profStart = new Int32Array(n + 1);
   const lastCross = new Float64Array(n).fill(-1);
+  const coreCross = new Uint8Array(n);
+  const turnAngle = new Float64Array(n);
   const mergeFrom = new Float64Array(n);
 
   const segIds: Id[] = [];
@@ -301,6 +315,14 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
     nextList.set(l.next, nextStart[i]);
     prevList.set(l.prev, prevStart[i]);
     mergeFrom[i] = l.length;
+    if (l.kind === 'connector' && l.cum.length >= 2) {
+      const m = l.cum.length;
+      const ax = l.pts[3] - l.pts[0];
+      const az = l.pts[5] - l.pts[2];
+      const bx = l.pts[m * 3 - 3] - l.pts[m * 3 - 6];
+      const bz = l.pts[m * 3 - 1] - l.pts[m * 3 - 4];
+      turnAngle[i] = Math.abs(Math.atan2(ax * bz - az * bx, ax * bx + az * bz));
+    }
     let k = confStart[i];
     for (const c of l.conflicts) {
       confLane[k] = c.lane;
@@ -308,6 +330,7 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
       confOther[k] = c.otherS;
       confKind[k] = c.kind === 'cross' ? KIND_CROSS : c.kind === 'merge' ? KIND_MERGE : KIND_DIVERGE;
       if (c.kind === 'cross' && c.selfS > lastCross[i]) lastCross[i] = c.selfS;
+      if (c.kind === 'cross') coreCross[i] = 1;
       if (c.kind === 'merge' && c.selfS < mergeFrom[i]) mergeFrom[i] = c.selfS;
       k++;
     }
@@ -328,6 +351,30 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
     }
   }
   profStart[n] = profile.length;
+
+  const shared = sharedStretches(graph);
+  const shareStart = new Int32Array(n + 1);
+  let shareTotal = 0;
+  for (let i = 0; i < n; i++) {
+    shareStart[i] = shareTotal;
+    shareTotal += shared.get(i)?.length ?? 0;
+  }
+  shareStart[n] = shareTotal;
+  const shareLane = new Int32Array(shareTotal);
+  const shareFrom = new Float64Array(shareTotal);
+  const shareTo = new Float64Array(shareTotal);
+  const shareOffset = new Float64Array(shareTotal);
+  const shareGap = new Float64Array(shareTotal);
+  for (const [lane, list] of shared) {
+    let k = shareStart[lane];
+    for (const st of list) {
+      shareLane[k] = st.other;
+      shareFrom[k] = st.from;
+      shareTo[k] = st.to;
+      shareGap[k] = st.gap;
+      shareOffset[k++] = st.offset;
+    }
+  }
 
   const merges: number[] = [];
   for (let i = 0; i < n; i++) {
@@ -362,6 +409,8 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
     confOther,
     confKind,
     lastCross,
+    coreCross,
+    turnAngle,
     setback,
     mergeFrom,
     ptStart,
@@ -369,6 +418,12 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
     cum,
     profStart,
     prof: Float32Array.from(profile),
+    shareStart,
+    shareLane,
+    shareFrom,
+    shareTo,
+    shareOffset,
+    shareGap,
     mergeLanes: Int32Array.from(merges),
     segCount: segIds.length,
     segIds,

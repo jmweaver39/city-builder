@@ -1,6 +1,6 @@
 /**
- * Mesh helpers for track, stations and rolling stock, in the game's low-poly style:
- * flat-shaded facets and flat colours, no texture noise. A MeshBuf collects
+ * Mesh helpers for track, stations and rolling stock, in the shared smooth style:
+ * smooth shading and flat colours, no texture noise. A MeshBuf collects
  * positions, normals, colours and a material code per vertex; trackMaterial turns
  * the code into ballast, sleepers, steel and concrete in one draw call.
  */
@@ -91,7 +91,8 @@ export class MeshBuf {
     for (const f of faces) {
       const pts = f.map(([a, b, d]) => P(a, b, d));
       // Winding depends on the handedness of right and forward.
-      this.face(rx * fz - rz * fx < 0 ? pts : [pts[0], pts[3], pts[2], pts[1]], c, kind);
+      // The face lists wind outward for a right-handed (right, up, forward); flip for the other hand.
+      this.face(rx * fz - rz * fx >= 0 ? pts : [pts[0], pts[3], pts[2], pts[1]], c, kind);
     }
   }
 

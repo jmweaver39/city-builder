@@ -8,6 +8,8 @@ import { RoadNetwork } from '../../src/core';
 import { Simulation } from '../../src/sim';
 import { checkBodies, expectFiniteState, free, newBodyCheck, run, v } from './helpers';
 import { controlled, diamond, laneDrop, onRamp, roundabout, weave } from './scenarios';
+import { PedSim } from '../../src/peds/PedSim';
+import { town } from '../peds/scene';
 
 function expectNoContact(sim: Simulation, seconds: number) {
   const check = newBodyCheck();
@@ -79,6 +81,43 @@ describe('no collisions, by real footprint', () => {
     for (const p of [v(300, 0), v(-300, 0), v(0, 300), v(0, -300)]) net.addSegment(hub, net.addNode(p), { roadType: 'street-2-bike' });
     net.setTraffic({ autoGatewayRatePerLane: 500, defaultMix: { car: 6, van: 1, truck: 2, bus: 1 } });
     expectNoContact(new Simulation(net, 7), 900);
+  });
+
+  it('a town with pedestrians closing crosswalks: no contact, nobody enters a closed lane', () => {
+    const { net } = town();
+    net.setTraffic({ autoGatewayRatePerLane: 300 });
+    const sim = new Simulation(net, 11);
+    const peds = new PedSim(net, sim, { seed: 11 });
+    peds.hour = 12;
+    peds.setFocus(300, 200, 450);
+    const check = newBodyCheck();
+    let intoClosed = 0;
+    let closedSteps = 0;
+    const lastLane = new Map<number, number>();
+    for (let i = 0; i < 9000; i++) {
+      sim.step();
+      peds.step(0.1);
+      checkBodies(sim, check);
+      const { veh, blocked } = sim.state;
+      let anyClosed = false;
+      for (let l = 0; l < blocked.length && !anyClosed; l++) if (blocked[l]) anyClosed = true;
+      if (anyClosed) closedSteps++;
+      for (let j = 0; j < veh.liveCount; j++) {
+        const k = veh.live[j];
+        const was = lastLane.get(veh.id[k]);
+        if (was !== undefined && was !== veh.lane[k] && blocked[veh.lane[k]]) intoClosed++;
+        lastLane.set(veh.id[k], veh.lane[k]);
+      }
+    }
+    const s = sim.stats();
+    console.log(`town with pedestrians: closed ${closedSteps} steps, peds crossed ${peds.counts.crossed}, into closed ${intoClosed}, overlaps ${check.hits}, safety ${s.safetyStops}, stuck ${s.despawnedStuck}, arrived ${s.arrivedTotal}`);
+    expect(peds.counts.crossed).toBeGreaterThan(20);
+    expect(closedSteps).toBeGreaterThan(100);
+    expect(intoClosed).toBe(0);
+    expect(check.hits).toBe(0);
+    expect(s.collisions).toBe(0);
+    expect(s.despawnedStuck).toBe(0);
+    expect(s.arrivedTotal).toBeGreaterThan(100);
   });
 
   it.each([1, 2, 3, 4, 5])('fuzzed edits under traffic, seed %i', (seed) => {

@@ -6,8 +6,9 @@ import { sidewalkOn, totalHalfWidth } from '../core/roadTypes';
 import { terrainHeight } from '../core/terrain';
 import { COL, DECK_DEPTH, ELEVATED_CLEARANCE, KIND_CONCRETE, KIND_PLAIN, KIND_STEEL, TUNNEL_CLEARANCE, TUNNEL_Y, ROAD_LIFT } from './constants';
 import type { SurfBuf, SurfStyle } from './batch';
-import type { Frame } from './frames';
+import { isTunnelFrame, type Frame } from './frames';
 import { ribbon, runsOf, type RoadOutputs } from './roads';
+import { belowDeck, columnClear } from './piers';
 
 const PILLAR_SPACING = 34;
 /** Below this clearance a span needs no pier. */
@@ -26,7 +27,8 @@ function frameAt(frames: readonly Frame[], s: number): Frame | null {
     const rx = a.rx + (b.rx - a.rx) * f;
     const rz = a.rz + (b.rz - a.rz) * f;
     const rl = Math.hypot(rx, rz) || 1;
-    const ground = terrainHeight(x, z);
+    // The frames' own ground, which knows about embankments and cuts.
+    const ground = a.ground + (b.ground - a.ground) * f;
     return { ...a, x, y, z, rx: rx / rl, rz: rz / rl, s, ground, c: y - ROAD_LIFT - ground };
   }
   return null;
@@ -83,19 +85,110 @@ export function addPierAt(buf: SurfBuf, x: number, y: number, z: number, radius:
   buf.prism(x, z, terrainHeight(x, z) - 1, y - DECK_DEPTH + 0.1, radius, 12, style);
 }
 
+/** Columns of a pier at frame f, as addPier places them. */
+function pierColumns(f: Frame, halfWidth: number): { x: number; z: number; r: number }[] {
+  if (halfWidth > 13) {
+    const off = halfWidth * 0.46;
+    return [
+      { x: f.x + f.rx * off, z: f.z + f.rz * off, r: 1.05 * 1.7 },
+      { x: f.x - f.rx * off, z: f.z - f.rz * off, r: 1.05 * 1.7 },
+    ];
+  }
+  const r = Math.min(1.5, 0.8 + halfWidth * 0.07);
+  return [{ x: f.x, z: f.z, r: r * 1.7 }];
+}
+
+/** A portal frame: two legs outside the deck edges and a cross beam, straddling what is below. */
+function addPortal(buf: SurfBuf, f: Frame, halfWidth: number, legOff: number, style: SurfStyle): void {
+  const fx = f.rz;
+  const fz = -f.rx;
+  const top = f.y - DECK_DEPTH;
+  for (const side of [-1, 1]) {
+    const x = f.x + f.rx * side * legOff;
+    const z = f.z + f.rz * side * legOff;
+    buf.prism(x, z, terrainHeight(x, z) - 1, top - 1.2, 0.9, 12, style);
+  }
+  buf.box(f.x, top - 0.6, f.z, legOff + 0.9, 0.6, 1.0, f.rx, f.rz, fx, fz, style, { bottom: true });
+  void halfWidth;
+}
+
+export interface PierPlan {
+  piers: { f: Frame; kind: 'pier' | 'portal'; columns: { x: number; z: number; r: number }[]; legOff: number }[];
+  /** Spans with nowhere to stand, carried by steel girders: [from s, to s]. */
+  girders: [number, number][];
+}
+
+/**
+ * Where a deck's supports go: regular spacing, shifted along the span to miss
+ * whatever is below, a portal frame straddling it where a pier cannot stand, and
+ * a long girder span where neither fits.
+ */
+export function planPiers(net: RoadNetwork, id: Id, def: RoadTypeDef, frames: readonly Frame[]): PierPlan {
+  const halfWidth = totalHalfWidth(def);
+  // Rail viaducts have regular, shorter spans than road bridges.
+  const spacing = def.category === 'rail' ? 30 : PILLAR_SPACING;
+  const s0 = frames[0].s;
+  const s1 = frames[frames.length - 1].s;
+  const plan: PierPlan = { piers: [], girders: [] };
+  const missed: number[] = [];
+  for (let k = Math.ceil((s0 + 4) / spacing); k * spacing < s1 - 4; k++) {
+    const home = k * spacing;
+    let done = false;
+    for (const nudge of [0, 4, -4, 8, -8, 12, -12, 16, -16]) {
+      const f = frameAt(frames, home + nudge);
+      if (!f || f.c < (f.viaduct ? 1.4 : MIN_PIER_CLEARANCE)) continue;
+      const below = belowDeck(net, id, { minX: f.x - halfWidth - 3, minZ: f.z - halfWidth - 3, maxX: f.x + halfWidth + 3, maxZ: f.z + halfWidth + 3 }, f.y);
+      const columns = pierColumns(f, halfWidth);
+      if (columns.every((c) => columnClear(below, c.x, c.z, c.r))) {
+        plan.piers.push({ f, kind: 'pier', columns, legOff: 0 });
+        done = true;
+        break;
+      }
+      // Straddle it: legs outside the deck edges.
+      const legOff = halfWidth + 1.4;
+      const legs = [-1, 1].map((side) => ({ x: f.x + f.rx * side * legOff, z: f.z + f.rz * side * legOff, r: 1.4 }));
+      if (legs.every((l) => columnClear(below, l.x, l.z, l.r))) {
+        plan.piers.push({ f, kind: 'portal', columns: legs, legOff });
+        done = true;
+        break;
+      }
+    }
+    if (!done) {
+      const f = frameAt(frames, home);
+      if (f && f.c >= MIN_PIER_CLEARANCE) missed.push(home);
+    }
+  }
+  const stops = [s0, ...plan.piers.map((p) => p.f.s), s1].sort((a, b) => a - b);
+  for (let i = 0; i + 1 < stops.length; i++) {
+    if (missed.some((m) => m > stops[i] && m < stops[i + 1])) plan.girders.push([stops[i], stops[i + 1]]);
+  }
+  return plan;
+}
+
 function pillars(net: RoadNetwork, id: Id, def: RoadTypeDef, frames: readonly Frame[], out: RoadOutputs): void {
   const style: SurfStyle = { color: COL.concrete, kind: KIND_CONCRETE, slot: 0, bias: 0 };
   const halfWidth = totalHalfWidth(def);
-  const s0 = frames[0].s;
-  const s1 = frames[frames.length - 1].s;
-  for (let k = Math.ceil((s0 + 4) / PILLAR_SPACING); k * PILLAR_SPACING < s1 - 4; k++) {
-    const home = k * PILLAR_SPACING;
-    for (const nudge of [0, 7, -7, 13, -13]) {
-      const f = frameAt(frames, home + nudge);
-      if (!f || f.c < MIN_PIER_CLEARANCE) continue;
-      if (hitsLowerRoad(net, id, f.x, f.z, f.y, 1.5)) continue;
-      addPier(out.surf, f, halfWidth, style);
-      break;
+  const plan = planPiers(net, id, def, frames);
+  // Expansion joints: a steel strip across the deck over each support.
+  const joint: SurfStyle = { color: COL.girder, kind: KIND_STEEL, slot: 0, bias: 0 };
+  for (const p of plan.piers) {
+    if (p.kind === 'pier') addPier(out.surf, p.f, halfWidth, style);
+    else addPortal(out.surf, p.f, halfWidth, p.legOff, style);
+    if (def.category !== 'rail') out.surf.box(p.f.x, p.f.y + 0.012, p.f.z, def.halfWidth, 0.012, 0.11, p.f.rx, p.f.rz, p.f.rz, -p.f.rx, joint);
+  }
+  // Nowhere to stand: a longer steel girder span carries the deck over, edge girders below it.
+  const steel: SurfStyle = { color: COL.steel, kind: KIND_STEEL, slot: 0, bias: 0 };
+  for (const [a, b] of plan.girders) {
+    const i0 = frames.findIndex((f) => f.s >= a);
+    let i1 = frames.length - 1;
+    while (i1 > 0 && frames[i1].s > b) i1--;
+    if (i0 < 0 || i1 <= i0) continue;
+    const depth = Math.min(3, 1.2 + (b - a) / 40);
+    for (const side of [-1, 1] as const) {
+      const o = side * (halfWidth - 0.6);
+      const bottom = (f: Frame) => -DECK_DEPTH - depth * Math.max(0.35, Math.sin(Math.PI * Math.min(1, Math.max(0, (f.s - a) / (b - a)))));
+      if (side > 0) ribbon(out.surf, frames, i0, i1, () => [o, -DECK_DEPTH], (f) => [o, bottom(f)], steel);
+      else ribbon(out.surf, frames, i0, i1, (f) => [o, bottom(f)], () => [o, -DECK_DEPTH], steel);
     }
   }
 }
@@ -140,15 +233,20 @@ export function barrierStrip(
 }
 
 /** W-beam rail on posts, along fast roads at ground level. */
-function guardRails(def: RoadTypeDef, frames: readonly Frame[], out: RoadOutputs): void {
+function guardRails(def: RoadTypeDef, frames: readonly Frame[], out: RoadOutputs, plain: { a: boolean; b: boolean }): void {
   if (def.category !== 'highway' && def.category !== 'ramp') return;
   const steel: SurfStyle = { color: COL.steel, kind: KIND_STEEL, slot: 0, bias: 0 };
   const H = def.halfWidth + 0.62;
   const buf = out.surf;
   const atGrade = (f: Frame) => f.c > -0.04 && f.c <= ELEVATED_CLEARANCE && f.y - ROAD_LIFT > -0.3;
   for (const [a, b] of runsOf(frames, atGrade, 0)) {
+    // The rail tapers into the ground where it ends, but runs on through a plain
+    // joint into the next piece of the same road (core/curveChain.ts) without a break.
+    const openA = plain.a && a === 0;
+    const openB = plain.b && b === frames.length - 1;
     for (const side of [1, -1] as const) {
-      const ramp = (f: Frame) => Math.min(1, Math.min(f.s - frames[a].s, frames[b].s - f.s) / 5);
+      const ramp = (f: Frame) =>
+        Math.min(1, Math.min(openA ? Infinity : f.s - frames[a].s, openB ? Infinity : frames[b].s - f.s) / 5);
       const y = (f: Frame, h: number) => (h * ramp(f)) - 0.1 * (1 - ramp(f)) + vergeDrop(f);
       const strip = (h0: number, h1: number, out0: number, out1: number) => {
         if (side > 0) ribbon(buf, frames, a, b, (f) => [H + out1, y(f, h1)], (f) => [H + out0, y(f, h0)], steel);
@@ -188,7 +286,7 @@ function portal(buf: SurfBuf, a: Frame, b: Frame, def: RoadTypeDef): void {
   // a is on the open side, b in the tunnel. Interpolate to the crossing itself.
   const ya = a.y - ROAD_LIFT;
   const yb = b.y - ROAD_LIFT;
-  const k = (ya - TUNNEL_Y) / (ya - yb || 1);
+  const k = b.covered && !a.covered ? 0.5 : Math.min(1, Math.max(0, (ya - TUNNEL_Y) / (ya - yb || 1)));
   const x = a.x + (b.x - a.x) * k;
   const z = a.z + (b.z - a.z) * k;
   const y = a.y + (b.y - a.y) * k;
@@ -216,7 +314,7 @@ function portal(buf: SurfBuf, a: Frame, b: Frame, def: RoadTypeDef): void {
 }
 
 function portals(def: RoadTypeDef, frames: readonly Frame[], out: RoadOutputs): void {
-  const under = (f: Frame) => f.y - ROAD_LIFT <= TUNNEL_Y;
+  const under = isTunnelFrame;
   for (let i = 0; i + 1 < frames.length; i++) {
     const p = frames[i];
     const q = frames[i + 1];
@@ -229,6 +327,8 @@ function portals(def: RoadTypeDef, frames: readonly Frame[], out: RoadOutputs): 
 export function addSegmentStructures(net: RoadNetwork, id: Id, def: RoadTypeDef, frames: readonly Frame[], out: RoadOutputs): void {
   pillars(net, id, def, frames, out);
   barriers(def, frames, out);
-  guardRails(def, frames, out);
+  const seg = net.getSegment(id);
+  const plainAt = (node: Id | undefined) => node !== undefined && net.nodeGeom(node)?.kind === 'plain';
+  guardRails(def, frames, out, { a: plainAt(seg?.a), b: plainAt(seg?.b) });
   portals(def, frames, out);
 }

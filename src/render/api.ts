@@ -127,6 +127,8 @@ export interface RendererExtras {
   getQuality(): QualityName;
   /** Lower quality automatically when frames run long. On by default. */
   setAutoQuality(on: boolean): void;
+  /** Q and E turn the camera only while this is on (off while a tool uses them for elevation). Alt+Q/E always turns. */
+  setCameraRotateKeys(on: boolean): void;
   /** Show the drawing grid on the ground around a point. Null hides it. */
   setGrid(grid: GridView | null): void;
 }

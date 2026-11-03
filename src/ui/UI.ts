@@ -8,6 +8,14 @@ import { StatsPanel } from './StatsPanel';
 import { Toolbar } from './Toolbar';
 import { TopBar } from './TopBar';
 import { bindInput } from './Input';
+import { bindings, type KeyApp } from './keymap';
+import { Palette, type PaletteCommand } from './Palette';
+import { ShortcutPanel, type ShortcutState } from './ShortcutPanel';
+import { toggleGridSnap } from './GridControls';
+import { BUILTIN_ROAD_TYPES } from '../core/roadTypes';
+import { CONTROL_CARDS } from '../tools/junctionControl';
+import type { TabId } from './Toolbar';
+import { GROUPS } from './toolGroups';
 import type { AppActions, UiContext } from './context';
 import './style.css';
 
@@ -27,6 +35,8 @@ export class UI {
   readonly menu: Menu;
   readonly stats: StatsPanel;
   readonly inspectors: Inspectors;
+  readonly palette: Palette;
+  readonly shortcuts: ShortcutPanel;
   private readonly toasts: Toasts;
   private elapsed = 0;
 
@@ -43,7 +53,16 @@ export class UI {
       host,
       dock,
       toast: (message, kind) => this.toasts.show(message, kind),
-      inspect: (target) => this.inspectors.open(target),
+      inspect: (target) => {
+        // In the Junction tool, markings and shape open in its tray, not a floating panel.
+        if (target && (target.kind === 'nodeMarkings' || target.kind === 'junctionShape') && this.toolbar?.currentTab === 'junction') {
+          this.inspectors.open(null);
+          this.toolbar.refresh();
+          return;
+        }
+        this.inspectors.open(target);
+        this.shortcuts?.contextChanged();
+      },
       openDesigner: (id) => openRoadDesigner(context, id),
       openStats: () => this.stats.toggle(),
     };
@@ -57,8 +76,19 @@ export class UI {
     this.toolbar = new Toolbar(context);
     new CursorHudView(host, options.tools);
     options.tools.connect({ toast: context.toast, inspect: context.inspect, templates: options.templates });
-    bindInput(context, { toolbar: this.toolbar, topbar: this.topbar, infobar: this.infobar, menu: this.menu });
+    const state = (): ShortcutState => ({ tool: options.tools.active.id, select: this.inspectors.currentKind, tab: this.toolbar.currentTab });
+    this.shortcuts = new ShortcutPanel(host, state);
+    const app = this.keyApp();
+    this.palette = new Palette(host, () => this.commands(app));
+    options.tools.onChange(() => this.shortcuts.contextChanged());
+    bindInput(context, { toolbar: this.toolbar, topbar: this.topbar, infobar: this.infobar, menu: this.menu, app, palette: this.palette, shortcuts: this.shortcuts, state });
     this.menu.showHints();
+    // The loading screen in index.html goes once the interface is up.
+    const boot = document.getElementById('boot');
+    if (boot) {
+      boot.classList.add('done');
+      setTimeout(() => boot.remove(), 200);
+    }
     // The bar wraps on narrow windows, and panels below it must follow.
     new ResizeObserver(() => {
       host.style.setProperty('--top-h', `${this.topbar.root.offsetHeight}px`);
@@ -74,7 +104,123 @@ export class UI {
     this.tick();
   }
 
+  /** What keymap bindings act on. */
+  private keyApp(): KeyApp {
+    const { tools, history } = this.context;
+    const ui = this;
+    return {
+      get activeTool() {
+        return tools.active.id;
+      },
+      setTool: (id) => tools.setTool(id),
+      toggleTool: (id) => this.toolbar.toggleTool(id),
+      openTab: (id) => {
+        this.toolbar.openTab(id as TabId | null);
+        this.shortcuts.contextChanged();
+      },
+      get currentTab() {
+        return ui.toolbar.currentTab;
+      },
+      pickCard: (i) => this.toolbar.pickCard(i),
+      cycleCard: (step) => this.toolbar.cycleCard(step),
+      setDrawMode: (mode) => this.toolbar.setDrawMode(mode),
+      undo: () => history.undo(),
+      redo: () => history.redo(),
+      save: () => this.menu.saveNow(),
+      open: () => this.menu.openLoad(),
+      newMap: () => this.menu.newMap(),
+      openMenu: () => this.menu.open(),
+      openHelp: () => this.menu.help(),
+      openStats: () => this.stats.toggle(),
+      togglePause: () => this.topbar.togglePause(),
+      setSpeed: (speed) => this.topbar.setSpeed(speed),
+      toggleUnderground: () => this.infobar.toggleUnderground(),
+      toggleOverlay: (mode) => this.infobar.toggleOverlay(mode),
+      toggleShadows: () => this.infobar.toggleShadows(),
+      toggleGrid: () => toggleGridSnap(this.context),
+      toggleSnap: (key) => {
+        tools.settings[key] = !tools.settings[key];
+        tools.settingsChanged();
+        const names = { snapNodes: 'Snap to nodes', snapSegments: 'Snap along roads', snapAngle: 'Angle guides', snapLength: 'Length steps' };
+        this.context.toast(`${names[key]} ${tools.settings[key] ? 'on' : 'off'}`);
+      },
+      stepElevation: (d) => tools.road.stepElevation(d),
+      deleteSelection: () => {
+        if (tools.active.id === 'roundabout' && tools.roundabout.selection) {
+          tools.roundabout.deleteSelected();
+          return true;
+        }
+        return this.inspectors.deleteCurrent();
+      },
+      openPalette: () => this.palette.toggle(),
+      toggleShortcuts: () => this.shortcuts.togglePinned(),
+      setControlCard: (kind) => {
+        tools.settings.junctionControl = kind as typeof tools.settings.junctionControl;
+        this.toolbar.openTab('control');
+        tools.setTool('junction');
+        tools.settingsChanged();
+      },
+    };
+  }
+
+  /** Everything the command palette offers: keymap actions plus each card and setting. */
+  private commands(app: KeyApp): PaletteCommand[] {
+    const { tools } = this.context;
+    const out: PaletteCommand[] = [];
+    for (const b of bindings()) {
+      if (!b.run || b.noPalette) continue;
+      out.push({ id: b.id, label: b.label, group: b.group, keys: b.keys, desc: b.desc, run: () => b.run!(app) });
+    }
+    const roads = [...BUILTIN_ROAD_TYPES, ...this.context.net.project.customRoadTypes].filter((d) => d.category !== 'roundabout' && d.category !== 'rail');
+    for (const d of roads) {
+      out.push({
+        id: `road.${d.id}`,
+        label: `Draw ${d.name}`,
+        group: 'Roads',
+        keys: [],
+        run: () => {
+          tools.settings.roadType = d.id;
+          if (tools.settings.drawMode === 'upgrade') tools.settings.drawMode = 'straight';
+          this.toolbar.openTab(d.category as TabId);
+          tools.setTool('road');
+          tools.settingsChanged();
+        },
+      });
+    }
+    for (const c of CONTROL_CARDS) {
+      out.push({ id: `control.${c.kind}`, label: c.name, group: 'Traffic control', keys: [], desc: `${c.description}. Key ${c.key} in the Traffic Control tab`, run: () => app.setControlCard(c.kind) });
+    }
+    out.push({ id: 'control.advanced', label: 'Junction editor', group: 'Traffic control', keys: [], run: () => app.setControlCard('inspect') });
+    for (const lanes of [1, 2, 3] as const) {
+      out.push({
+        id: `roundabout.lanes${lanes}`,
+        label: `Roundabout: ${lanes} lane${lanes > 1 ? 's' : ''}`,
+        group: 'Roundabout',
+        keys: [],
+        run: () => {
+          app.openTab('control');
+          tools.setTool('roundabout');
+          tools.settings.roundabout.lanes = lanes;
+          tools.settingsChanged();
+        },
+      });
+    }
+    for (const g of GROUPS) {
+      out.push({ id: `open.${g.id}`, label: g.label, group: 'Tools', keys: [], desc: g.desc, run: () => app.openTab(g.id) });
+      for (const m of g.modes) {
+        if (g.modes.length < 2) continue;
+        out.push({ id: `mode.${g.id}.${m.id}`, label: `${g.label}: ${m.label}`, group: 'Tools', keys: [], desc: m.desc, run: () => this.toolbar.activateMode(m) });
+      }
+    }
+    for (const [m, label] of [['auto', 'fade when idle'], ['always', 'always show'], ['never', 'hide']] as const) {
+      out.push({ id: `shortcuts.${m}`, label: `Shortcut panel: ${label}`, group: 'Panels', keys: [], run: () => this.shortcuts.setMode(m) });
+    }
+    out.push({ id: 'file.export', label: 'Export JSON', group: 'File', keys: [], run: () => this.context.actions.exportJson() });
+    return out;
+  }
+
   private tick(): void {
+    this.shortcuts.contextChanged();
     this.topbar.tick();
     this.inspectors.tick();
     this.stats.tick();

@@ -1,6 +1,7 @@
 /**
- * Traffic endpoints: gateway markers at dead ends, and low-poly building
- * clusters for zones, sized by rate and set back from the road.
+ * Traffic endpoints: gateway markers at dead ends, and building clusters for
+ * zones, sized by rate and set back from the road. The buildings themselves,
+ * their buffer and facade material live in buildings.ts.
  */
 import * as THREE from 'three';
 import type { EndpointKind, Id, TrafficEndpoint, ZoneDensity, ZoneKind, ZoneRegion } from '../core/types';
@@ -8,228 +9,16 @@ import { zoneCoverage, zonePolygon, ZONE_STEP } from '../core/zones';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { cubicPoint, cubicTangentXZ } from '../core/bezier';
 import { totalHalfWidth } from '../core/roadTypes';
-import { terrainHeight } from '../core/terrain';
-import type { AttrSpec, Piece } from './batch';
+import { surfaceLevel } from '../core/terrain';
 import { ChunkBatch } from './batch';
+import { BUILDING_SCHEMA, BuildingBuf, MAT, WIN, buildingMaterial, disposeBuildingMaterial, facadeColour, midrise, parapetRoof, rooftop, shed, tower, type Footing } from './buildings';
 import { ROAD_LIFT, hexRGB, type RGB } from './constants';
 import type { Shared } from './materials';
-import { PALETTE } from './style';
+import { BUILDING_COLOURS, PALETTE } from './style';
+
+export { BuildingBuf };
 
 const P = PALETTE;
-
-const SCHEMA: AttrSpec[] = [
-  { name: 'position', size: 3 },
-  { name: 'normal', size: 3 },
-  { name: 'color', size: 3 },
-  // Along the wall, height, window kind (0 none), random seed
-  { name: 'aWin', size: 4 },
-];
-
-export class BuildingBuf {
-  pos: number[] = [];
-  nor: number[] = [];
-  col: number[] = [];
-  win: number[] = [];
-  idx: number[] = [];
-
-  quad(p: number[][], color: RGB, uv: number[][], winKind: number, seed: number): void {
-    const [a, b, , d] = p;
-    const ux = b[0] - a[0];
-    const uy = b[1] - a[1];
-    const uz = b[2] - a[2];
-    const vx = d[0] - a[0];
-    const vy = d[1] - a[1];
-    const vz = d[2] - a[2];
-    let nx = uy * vz - uz * vy;
-    let ny = uz * vx - ux * vz;
-    let nz = ux * vy - uy * vx;
-    const l = Math.hypot(nx, ny, nz) || 1;
-    nx /= l;
-    ny /= l;
-    nz /= l;
-    const base = this.pos.length / 3;
-    for (let i = 0; i < 4; i++) {
-      this.pos.push(p[i][0], p[i][1], p[i][2]);
-      this.nor.push(nx, ny, nz);
-      this.col.push(color[0], color[1], color[2]);
-      this.win.push(uv[i][0], uv[i][1], winKind, seed);
-    }
-    this.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
-  }
-
-  /** Box with windows on its walls. fx, fz is a horizontal unit vector. */
-  block(cx: number, y0: number, cz: number, hw: number, hd: number, h: number, fx: number, fz: number, wall: RGB, roof: RGB, winKind: number, seed: number): void {
-    const rx = -fz;
-    const rz = fx;
-    const c = (sr: number, sf: number, y: number): number[] => [cx + rx * sr * hw + fx * sf * hd, y, cz + rz * sr * hw + fz * sf * hd];
-    const y1 = y0 + h;
-    const corners: [number, number, number, number, number][] = [
-      [-1, -1, 1, -1, hw * 2],
-      [1, -1, 1, 1, hd * 2],
-      [1, 1, -1, 1, hw * 2],
-      [-1, 1, -1, -1, hd * 2],
-    ];
-    // Corners run anticlockwise seen from above, so each wall faces outward.
-    for (const [ax, af, bx, bf, width] of corners) {
-      this.quad([c(ax, af, y0), c(bx, bf, y0), c(bx, bf, y1), c(ax, af, y1)], wall, [[0, 0], [width, 0], [width, h], [0, h]], winKind, seed + width);
-    }
-    this.quad([c(-1, -1, y1), c(1, -1, y1), c(1, 1, y1), c(-1, 1, y1)], roof, [[0, 0], [0, 0], [0, 0], [0, 0]], 0, seed);
-  }
-
-  /** Upright cylinder, for tanks and silos. */
-  drum(cx: number, y0: number, cz: number, r: number, h: number, wall: RGB, roof: RGB): void {
-    const n = 12;
-    const none = [[0, 0], [0, 0], [0, 0], [0, 0]];
-    const at = (i: number, y: number): number[] => {
-      const a = (i / n) * Math.PI * 2;
-      return [cx + Math.cos(a) * r, y, cz + Math.sin(a) * r];
-    };
-    for (let i = 0; i < n; i++) {
-      this.quad([at(i, y0), at(i, y0 + h), at(i + 1, y0 + h), at(i + 1, y0)], wall, none, 0, 0);
-      const top = [cx, y0 + h + r * 0.15, cz];
-      this.quad([at(i, y0 + h), top, top, at(i + 1, y0 + h)], roof, none, 0, 0);
-    }
-  }
-
-  /**
-   * Ground cover lying on the terrain: one upward face, no edges, so a lawn blends
-   * into the grass around it instead of standing on a slab.
-   */
-  flat(cx: number, y: number, cz: number, hw: number, hd: number, fx: number, fz: number, color: RGB): void {
-    const rx = -fz;
-    const rz = fx;
-    const c = (sr: number, sf: number): number[] => [cx + rx * sr * hw + fx * sf * hd, y, cz + rz * sr * hw + fz * sf * hd];
-    // Same corner order as a block's roof, which faces up.
-    this.quad([c(-1, -1), c(1, -1), c(1, 1), c(-1, 1)], color, [[0, 0], [0, 0], [0, 0], [0, 0]], 0, 0);
-  }
-
-  /** Flat ground patch, as a thin slab. */
-  pad(cx: number, y: number, cz: number, hw: number, hd: number, fx: number, fz: number, color: RGB): void {
-    this.block(cx, y - 0.2, cz, hw, hd, 0.28, fx, fz, color, color, 0, 0);
-  }
-
-  /**
-   * Pitched roof over a block of the same half sizes, with its ridge along f.
-   * A closed solid: slopes with thickness, soffits, fascias, verges, and wall-coloured
-   * gable ends set back to the wall line under the overhang.
-   */
-  gable(cx: number, y: number, cz: number, hw: number, hd: number, rise: number, fx: number, fz: number, roof: RGB, wall: RGB, over = 0.45): void {
-    const rx = -fz;
-    const rz = fx;
-    const none = [[0, 0], [0, 0], [0, 0], [0, 0]];
-    const thick = 0.2;
-    const p = (r: number, up: number, f: number): number[] => [cx + rx * r + fx * f, y + up, cz + rz * r + fz * f];
-    const eave = hw + over;
-    const end = hd + over;
-    const drop = (over / hw) * rise;
-    // Top of the roof.
-    this.quad([p(-eave, -drop, -end), p(0, rise, -end), p(0, rise, end), p(-eave, -drop, end)], roof, none, 0, 0);
-    this.quad([p(eave, -drop, end), p(0, rise, end), p(0, rise, -end), p(eave, -drop, -end)], roof, none, 0, 0);
-    // Underside, seen from below the eaves.
-    const under = -thick;
-    this.quad([p(-eave, -drop + under, -end), p(0, rise + under, -end), p(0, rise + under, end), p(-eave, -drop + under, end)].reverse(), roof, none, 0, 0);
-    this.quad([p(eave, -drop + under, end), p(0, rise + under, end), p(0, rise + under, -end), p(eave, -drop + under, -end)].reverse(), roof, none, 0, 0);
-    // Fascia boards along the eaves.
-    this.quad([p(-eave, -drop + under, end), p(-eave, -drop, end), p(-eave, -drop, -end), p(-eave, -drop + under, -end)].reverse(), wall, none, 0, 0);
-    this.quad([p(eave, -drop + under, -end), p(eave, -drop, -end), p(eave, -drop, end), p(eave, -drop + under, end)].reverse(), wall, none, 0, 0);
-    // Verges closing the roof at each end.
-    for (const sf of [-1, 1]) {
-      const e = sf * end;
-      const left = [p(-eave, -drop + under, e), p(0, rise + under, e), p(0, rise, e), p(-eave, -drop, e)];
-      const right = [p(0, rise + under, e), p(eave, -drop + under, e), p(eave, -drop, e), p(0, rise, e)];
-      this.quad(sf > 0 ? left.reverse() : left, roof, none, 0, 0);
-      this.quad(sf > 0 ? right.reverse() : right, roof, none, 0, 0);
-      // Gable wall, under the overhang.
-      const g = sf * hd;
-      const tri = [p(-hw, 0, g), p(hw, 0, g), p(0, rise - thick, g), p(0, rise - thick, g)];
-      this.quad(sf > 0 ? [tri[1], tri[0], tri[2], tri[3]] : tri, wall, none, 0, 0);
-    }
-  }
-
-  toPiece(): Piece | null {
-    const n = this.pos.length / 3;
-    if (!n) return null;
-    return {
-      attrs: [new Float32Array(this.pos), new Float32Array(this.nor), new Float32Array(this.col), new Float32Array(this.win)],
-      index: new Uint32Array(this.idx),
-      vertexCount: n,
-      cx: this.pos[0],
-      cz: this.pos[2],
-    };
-  }
-}
-
-const glsl = (hex: number) => {
-  const c = new THREE.Color(hex);
-  return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
-};
-const WINDOW_GLSL = glsl(PALETTE.window);
-const WINDOW_LIT_GLSL = glsl(PALETTE.windowLit);
-
-function buildingMaterial(shared: Shared): THREE.MeshStandardMaterial {
-  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 });
-  m.onBeforeCompile = (s) => {
-    s.uniforms.uNight = shared.uNight;
-    s.uniforms.uNoise = shared.uNoise;
-    s.vertexShader = s.vertexShader
-      .replace('#include <common>', `#include <common>\nattribute vec4 aWin;\nvarying vec2 vWinUv;\nflat varying float vWinKind;\nflat varying float vSeed;\nvarying vec3 vPos;`)
-      .replace('#include <begin_vertex>', `#include <begin_vertex>\nvWinUv = aWin.xy;\nvWinKind = aWin.z;\nvSeed = aWin.w;\nvPos = position;`);
-    s.fragmentShader = s.fragmentShader
-      .replace(
-        '#include <common>',
-        /* glsl */ `#include <common>
-uniform float uNight;
-uniform sampler2D uNoise;
-varying vec2 vWinUv;
-flat varying float vWinKind;
-flat varying float vSeed;
-varying vec3 vPos;
-vec3 gWinGlow = vec3(0.0);
-float gRough = 0.82;
-float gMetal = 0.0;
-float rnd(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
-`,
-      )
-      .replace(
-        '#include <color_fragment>',
-        /* glsl */ `#include <color_fragment>
-{
-  if (vWinKind > 0.5) {
-    float kind = vWinKind;
-    vec2 cellSize = kind > 3.5 ? vec2(3.0, 3.6) : kind > 2.5 ? vec2(3.2, 3.6) : kind > 1.5 ? vec2(5.2, 4.6) : vec2(3.3, 3.0);
-    vec2 q = vWinUv / cellSize;
-    vec2 id = floor(q);
-    vec2 f = abs(fract(q) - 0.5) * 2.0;
-    vec2 size = kind > 3.5 ? vec2(0.94, 0.86) : kind > 2.5 ? vec2(0.8, 0.62) : kind > 1.5 ? vec2(0.7, 0.3) : vec2(0.54, 0.56);
-    vec2 w = fwidth(q) * 2.0;
-    vec2 e = smoothstep(size + w, size - w, f);
-    float sharp = 1.0 - smoothstep(0.35, 0.7, max(w.x, w.y));
-    float win = e.x * e.y * sharp;
-    // A frame around each pane, darker than the wall.
-    vec2 fr = smoothstep(size + w + 0.1, size + 0.06, f);
-    diffuseColor.rgb *= 1.0 - 0.3 * fr.x * fr.y * sharp;
-    // Shop fronts: the ground floor is one band of glass.
-    float shop = (kind > 2.5 && kind < 3.5) ? (1.0 - step(0.62, vWinUv.y / 4.2)) * step(0.5, fract(vWinUv.x / 7.0) * 2.0 + 0.3) : 0.0;
-    win = max(win, shop * sharp);
-    // Simple insets: flat blue-grey panes, a darker frame around them.
-    diffuseColor.rgb = mix(diffuseColor.rgb, ${WINDOW_GLSL}, win);
-    gRough = mix(gRough, 0.4, win);
-    float lit = step(0.55, rnd(id + vSeed));
-    float average = size.x * size.y * 0.45 * (1.0 - sharp);
-    gWinGlow = ${WINDOW_LIT_GLSL} * (win * lit + average) * uNight * 1.6;
-  } else if (vWinKind < -0.5) {
-    gRough = 0.92;
-  }
-}
-`,
-      )
-      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>\nroughnessFactor = gRough;`)
-      .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>\nmetalnessFactor = gMetal;`)
-      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\ntotalEmissiveRadiance += gWinGlow;`);
-  };
-  m.customProgramCacheKey = () => 'cl-building-lp';
-  return m;
-}
 
 const ZONE_PALETTE: Record<Exclude<EndpointKind, 'gateway'>, { walls: number[]; roofs: number[]; win: number }> = {
   residential: { walls: [P.wallCream, P.wallWhite, P.wallPeach, P.wallBrick, P.wallSage, P.wallSky], roofs: [P.roofRed, P.roofTerracotta, P.roofSlate], win: 1 },
@@ -256,12 +45,14 @@ export interface ZoneFootprint {
 const ASPHALT = hexRGB(0x5d6168);
 const CONCRETE_PAD = hexRGB(0xd8d2c4);
 const STRIPE = hexRGB(0xf4f2ec);
-const HEDGE = hexRGB(0x4f8f44);
+const HEDGE = hexRGB(0x46663a);
 const GRASS_PAD = hexRGB(0x84b266);
 /** Close to the terrain's own grass, a touch fresher, so a lawn reads but does not stand out. */
-const LAWN = hexRGB(0x5d8a45);
-const PARKED = [0xf4f2ec, 0xe24a3a, 0x3a78d0, 0xf6c444, 0x3aa070, 0x8c939a, 0xf0803a].map(hexRGB);
+const LAWN = hexRGB(0x6a7a44);
+const PARKED = [0xe8e8e4, 0x9a2a24, 0x2a4a7a, 0x1e2024, 0x8c939a, 0x5a5e62, 0xc8c8c4].map(hexRGB);
 const GLASS_DARK = hexRGB(0x30445a);
+/** Silos and tanks: pale galvanised or painted steel. */
+const SILO = [0xc4c8ca, 0xd0ccc0, 0xaab4b0, 0xb8bcbe];
 const STEEL = hexRGB(0xb8c0c6);
 
 /** Rows of bays with a few parked cars. */
@@ -282,57 +73,45 @@ function parking(buf: BuildingBuf, cx: number, y: number, cz: number, hw: number
         const qx = cx + rx * cu + fx * lineZ;
         const qz = cz + rz * cu + fz * lineZ;
         const c = PARKED[Math.floor(rng() * PARKED.length) % PARKED.length];
-        buf.block(qx, y + 0.3, qz, 0.88, 2.15, 0.6, fx, fz, c, c, 0, 0);
-        buf.block(qx, y + 0.9, qz, 0.76, 1.15, 0.42, fx, fz, GLASS_DARK, c, 0, 0);
+        buf.block(qx, y + 0.3, qz, 0.88, 2.2, 0.6, fx, fz, c, c, 0, 0, {});
+        buf.block(qx, y + 0.9, qz, 0.78, 1.2, 0.45, fx, fz, GLASS_DARK, c, 0, 0, { wall: MAT.glass });
       }
     }
   }
-}
-
-/** Plant on a flat roof. */
-function roofKit(buf: BuildingBuf, x: number, y: number, z: number, hw: number, hd: number, fx: number, fz: number, rng: () => number): void {
-  const rx = -fz;
-  const rz = fx;
-  const n = 1 + Math.floor(rng() * 3);
-  for (let i = 0; i < n; i++) {
-    const u = (rng() - 0.5) * hw * 1.2;
-    const v = (rng() - 0.5) * hd * 1.2;
-    buf.block(x + rx * u + fx * v, y, z + rz * u + fz * v, 0.8 + rng(), 0.7 + rng() * 0.6, 1 + rng() * 0.8, fx, fz, STEEL, hexRGB(0x6c7074), 0, 0);
-  }
-}
-
-/** Flat roof with a parapet, so the top reads as a roof and not a lid. */
-function parapet(buf: BuildingBuf, x: number, y: number, z: number, hw: number, hd: number, fx: number, fz: number, wall: RGB, roof: RGB): void {
-  const rx = -fz;
-  const rz = fx;
-  const t = 0.25;
-  const h = 0.8;
-  buf.block(x + fx * (hd - t), y, z + fz * (hd - t), hw, t, h, fx, fz, wall, wall, 0, 0);
-  buf.block(x - fx * (hd - t), y, z - fz * (hd - t), hw, t, h, fx, fz, wall, wall, 0, 0);
-  buf.block(x + rx * (hw - t), y, z + rz * (hw - t), t, hd, h, fx, fz, wall, wall, 0, 0);
-  buf.block(x - rx * (hw - t), y, z - rz * (hw - t), t, hd, h, fx, fz, wall, wall, 0, 0);
-  buf.block(x, y - 0.02, z, hw - t, hd - t, 0.1, fx, fz, roof, roof, 0, 0);
 }
 
 type Pick = <T>(a: T[]) => T;
 
 /**
  * One house on its lot. (tx, tz) runs along the street and (fx, fz) away from it.
- * Walls sit on a plinth; the door, path and drive are on the street side.
+ * Walls in render, siding or brick on a stone plinth, a tiled or slate roof with
+ * a chimney; the door, path and drive are on the street side.
  */
-function house(buf: BuildingBuf, x: number, ground: number, z: number, lot: number, tx: number, tz: number, fx: number, fz: number, pal: { walls: number[]; roofs: number[]; win: number }, rng: () => number, pick: Pick, toStreet: number): void {
-  const wall = hexRGB(pick(pal.walls));
-  const roof = hexRGB(pick(pal.roofs));
+function house(buf: BuildingBuf, x: number, ground: number, z: number, lot: number, tx: number, tz: number, fx: number, fz: number, _pal: { walls: number[]; roofs: number[]; win: number }, rng: () => number, pick: Pick, toStreet: number): void {
+  const C = BUILDING_COLOURS;
+  const style = rng();
+  const wallMat = style < 0.55 ? MAT.stucco : style < 0.8 ? MAT.siding : MAT.brick;
+  const wall = facadeColour(rng, wallMat === MAT.stucco ? C.stucco : wallMat === MAT.siding ? C.siding : C.brick);
+  const roof = facadeColour(rng, rng() < 0.62 ? C.roofTile : C.roofSlate);
+  const plinth = facadeColour(rng, C.stone);
+  const mats = { wall: wallMat, roof: MAT.roofTile };
   const seed = rng() * 40;
+  buf.ground = ground;
   // Half sizes across the street (hw) and along it (hd). Ridge runs along the street.
   const hd = Math.min(lot * 0.32, 4.6 + rng() * 2.6);
   const hw = 3.6 + rng() * 1.6;
   const floors = rng() < 0.6 ? 2 : 1;
   const h = floors * 2.9;
-  const rise = 1.5 + rng() * 1.5;
-  buf.block(x, ground - 0.25, z, hw + 0.14, hd + 0.14, 0.5, tx, tz, CONCRETE_PAD, CONCRETE_PAD, 0, 0);
-  buf.block(x, ground + 0.25, z, hw, hd, h, tx, tz, wall, roof, pal.win, seed);
-  buf.gable(x, ground + 0.25 + h, z, hw, hd, rise, tx, tz, roof, wall);
+  const rise = 2 + rng() * 1.6;
+  buf.block(x, ground - 0.25, z, hw + 0.1, hd + 0.1, 0.55, tx, tz, plinth, plinth, 0, 0, { wall: MAT.stone, roof: MAT.stone });
+  buf.block(x, ground + 0.3, z, hw, hd, h, tx, tz, wall, roof, WIN.house, seed, mats);
+  buf.gable(x, ground + 0.3 + h, z, hw, hd, rise, tx, tz, roof, wall, 0.45, mats);
+  // Chimney through one slope, near an end.
+  const cs = rng() < 0.5 ? -1 : 1;
+  const chx = x + tx * hd * 0.6 * cs - fx * hw * 0.35;
+  const chz = z + tz * hd * 0.6 * cs - fz * hw * 0.35;
+  const brick = facadeColour(rng, C.brick);
+  buf.block(chx, ground + 0.3 + h + rise * 0.3, chz, 0.38, 0.5, rise * 0.75 + 0.8, tx, tz, brick, brick, 0, 0, { wall: MAT.brick, roof: MAT.stone });
   // A wing toward the street turns some houses into an L.
   if (rng() < 0.45) {
     const off = hd * 0.55 * (rng() < 0.5 ? -1 : 1);
@@ -341,40 +120,73 @@ function house(buf: BuildingBuf, x: number, ground: number, z: number, lot: numb
     const wx = x + tx * off - fx * (hw + wd - 0.2);
     const wz = z + tz * off - fz * (hw + wd - 0.2);
     const wh = Math.min(h, 2.9);
-    buf.block(wx, ground - 0.25, wz, wd + 0.12, ww + 0.12, 0.5, tx, tz, CONCRETE_PAD, CONCRETE_PAD, 0, 0);
-    buf.block(wx, ground + 0.25, wz, wd, ww, wh, tx, tz, wall, roof, pal.win, seed + 7);
-    buf.gable(wx, ground + 0.25 + wh, wz, ww, wd, 1.2, fx, fz, roof, wall, 0.3);
+    buf.block(wx, ground - 0.25, wz, wd + 0.1, ww + 0.1, 0.55, tx, tz, plinth, plinth, 0, 0, { wall: MAT.stone, roof: MAT.stone });
+    buf.block(wx, ground + 0.3, wz, wd, ww, wh, tx, tz, wall, roof, WIN.house, seed + 7, mats);
+    buf.gable(wx, ground + 0.3 + wh, wz, ww, wd, 1.5, fx, fz, roof, wall, 0.3, mats);
   }
-  // Front door and porch step, proud of the street-side wall.
+  // Front door with a canopy, and a step.
   const front = hw + 0.03;
   const doorX = x - fx * front + tx * hd * 0.25;
   const doorZ = z - fz * front + tz * hd * 0.25;
-  buf.block(doorX, ground + 0.25, doorZ, 0.06, 0.5, 2.1, tx, tz, hexRGB(pick([0x3a2a20, 0x24406a, 0x7a2a22, 0x2c4a34])), wall, 0, 0);
-  buf.block(doorX - fx * 0.6, ground, doorZ - fz * 0.6, 0.6, 0.8, 0.26, tx, tz, CONCRETE_PAD, CONCRETE_PAD, 0, 0);
+  const doorC = hexRGB(pick([0x3a2a20, 0x24406a, 0x6a2a22, 0x2c4a34, 0xe8e4da]));
+  buf.block(doorX, ground + 0.3, doorZ, 0.06, 0.5, 2.1, tx, tz, doorC, wall, 0, 0);
+  buf.block(doorX - fx * 0.5, ground + 2.55, doorZ - fz * 0.5, 0.55, 0.8, 0.1, tx, tz, roof, roof, 0, 0);
+  buf.block(doorX - fx * 0.6, ground, doorZ - fz * 0.6, 0.6, 0.8, 0.3, tx, tz, plinth, plinth, 0, 0, { wall: MAT.stone, roof: MAT.stone });
   // Path to the street, hedge along it with a gap at the path.
   const pathLen = Math.max(1, (toStreet - hw) / 2);
   const pathX = doorX - fx * pathLen;
   const pathZ = doorZ - fz * pathLen;
-  buf.pad(pathX, ground + 0.02, pathZ, 0.7, pathLen, fx, fz, CONCRETE_PAD);
+  buf.pad(pathX, ground + 0.02, pathZ, 0.7, pathLen, fx, fz, CONCRETE_PAD, MAT.stone);
   const hedgeBack = toStreet - 0.8;
   for (const dir of [-1, 1]) {
     const len = lot * 0.22;
     const hx = x - fx * hedgeBack + tx * (hd * 0.25 + dir * (len + 1));
     const hz = z - fz * hedgeBack + tz * (hd * 0.25 + dir * (len + 1));
-    buf.block(hx, ground, hz, 0.45, len, 0.9 + rng() * 0.4, tx, tz, HEDGE, HEDGE, -1, 0);
+    buf.block(hx, ground, hz, 0.45, len, 0.9 + rng() * 0.4, tx, tz, HEDGE, HEDGE, WIN.hedge, 0, { wall: MAT.hedge, roof: MAT.hedge });
   }
   // Garage and drive on some lots, a shed behind on others.
   if (rng() < 0.55) {
     const gOff = -(hd + 2.2);
     const gx = x + tx * gOff;
     const gz = z + tz * gOff;
-    buf.block(gx, ground, gz, 3, 1.8, 2.5, tx, tz, wall, hexRGB(0x55575a), 0, 0);
-    buf.block(gx - fx * 3.03, ground + 0.04, gz - fz * 3.03, 0.05, 1.45, 2.05, tx, tz, hexRGB(0xc8c6be), wall, 0, 0);
+    buf.block(gx, ground, gz, 3, 1.8, 2.6, tx, tz, wall, hexRGB(0x5a5a58), 0, 0, { wall: wallMat, roof: MAT.flatRoof });
+    buf.block(gx - fx * 3.03, ground + 0.04, gz - fz * 3.03, 0.05, 1.45, 2.1, tx, tz, hexRGB(0xd8d6ce), wall, 0, 0, { wall: MAT.siding });
     const driveLen = Math.max(1, (toStreet - 3) / 2);
     buf.pad(gx - fx * (3 + driveLen), ground + 0.02, gz - fz * (3 + driveLen), 1.6, driveLen, fx, fz, ASPHALT);
   } else if (rng() < 0.6) {
-    buf.block(x + fx * (hw + 3.2), ground, z + fz * (hw + 3.2), 1.3, 1.6, 2.1, tx, tz, hexRGB(0x8a6a48), roof, 0, 0);
-    buf.gable(x + fx * (hw + 3.2), ground + 2.1, z + fz * (hw + 3.2), 1.3, 1.6, 0.6, tx, tz, roof, hexRGB(0x8a6a48), 0.15);
+    const shedC = hexRGB(0x7a5e44);
+    buf.block(x + fx * (hw + 3.2), ground, z + fz * (hw + 3.2), 1.3, 1.6, 2.1, tx, tz, shedC, roof, 0, 0, { wall: MAT.siding });
+    buf.gable(x + fx * (hw + 3.2), ground + 2.1, z + fz * (hw + 3.2), 1.3, 1.6, 0.6, tx, tz, roof, shedC, 0.15, { roof: MAT.roofTile, wall: MAT.siding });
+  }
+}
+
+/** A footing from the old block-style arguments: centre, half sizes, f along hd. */
+function footing(x: number, z: number, ground: number, hw: number, hd: number, fx: number, fz: number): Footing {
+  return { x, z, ground, hw, hd, fx, fz };
+}
+
+/** One or two storeys of shops under a flat roof, with a canopy over the pavement. */
+function shopStrip(buf: BuildingBuf, f: Footing, floors: number, rng: () => number, canopyAt: { x: number; z: number } | null): void {
+  const C = BUILDING_COLOURS;
+  const wallMat = rng() < 0.5 ? MAT.brick : MAT.stucco;
+  const wall = facadeColour(rng, wallMat === MAT.brick ? C.brick : C.stucco);
+  const stone = facadeColour(rng, C.stone);
+  const roof = facadeColour(rng, C.flatRoof);
+  const seed = rng() * 40;
+  buf.ground = f.ground;
+  buf.block(f.x, f.ground - 0.3, f.z, f.hw + 0.06, f.hd + 0.06, 0.31, f.fx, f.fz, stone, stone, 0, 0, { wall: MAT.stone, roof: MAT.stone });
+  buf.block(f.x, f.ground, f.z, f.hw, f.hd, 4.5, f.fx, f.fz, wall, roof, WIN.shop, seed, { wall: wallMat });
+  let y = f.ground + 4.5;
+  if (floors > 1) {
+    buf.block(f.x, y, f.z, f.hw, f.hd, 3.4, f.fx, f.fz, wall, roof, WIN.apartment, seed + 2, { wall: wallMat });
+    y += 3.4;
+  }
+  buf.block(f.x, y, f.z, f.hw + 0.25, f.hd + 0.25, 0.35, f.fx, f.fz, stone, stone, 0, 0, { wall: MAT.stone, roof: MAT.stone });
+  parapetRoof(buf, f, y + 0.35, wall, wallMat, roof, 0.8);
+  rooftop(buf, f, y + 0.35, rng, { units: 1 + Math.floor(rng() * 3) });
+  if (canopyAt) {
+    const awning = hexRGB([0x6a2a22, 0x22324a, 0x2a4a3a, 0x3a3c3e][Math.floor(rng() * 4)]);
+    buf.block(canopyAt.x, f.ground + 3.2, canopyAt.z, 1.4, f.hd * 0.9, 0.18, f.fx, f.fz, awning, awning, 0, 0, { wall: MAT.siding, roof: MAT.siding });
   }
 }
 
@@ -395,7 +207,7 @@ export function buildZone(net: RoadNetwork, ep: TrafficEndpoint, buf: BuildingBu
   const width = 62 * scale;
   const cx = p.x + rx * (setback + depth / 2);
   const cz = p.z + rz * (setback + depth / 2);
-  const ground = Math.max(terrainHeight(cx, cz), 0) + 0.08;
+  const ground = surfaceLevel(cx, cz) + 0.08;
   const pal = ZONE_PALETTE[ep.kind];
   const rng = rngOf(ep.id + 1);
   const pick = <T,>(a: T[]): T => a[Math.floor(rng() * a.length) % a.length];
@@ -411,7 +223,7 @@ export function buildZone(net: RoadNetwork, ep: TrafficEndpoint, buf: BuildingBu
   buf.pad(drive.x, ground, drive.z, 3.2, (setback - roadEdge + 8) / 2, fx, fz, ASPHALT);
   const count = Math.round(2 + scale * 2);
   if (ep.kind === 'residential') {
-    buf.flat(cx, Math.max(terrainHeight(cx, cz), 0) + 0.03, cz, width / 2, depth / 2, fx, fz, LAWN);
+    buf.flat(cx, surfaceLevel(cx, cz) + 0.03, cz, width / 2, depth / 2, fx, fz, LAWN);
     // Lots of different widths, so a street is not a row of copies.
     let walk = -width / 2 + 2;
     let guard = 0;
@@ -432,40 +244,27 @@ export function buildZone(net: RoadNetwork, ep: TrafficEndpoint, buf: BuildingBu
       const at = place(u, 0.42);
       const hw = (width / count) * (0.36 + rng() * 0.1);
       const hd = depth * (0.2 + rng() * 0.08);
-      const h = 4.4 + Math.floor(rng() * 3) * 3.6;
-      const wall = hexRGB(pick(pal.walls));
-      buf.block(at.x, ground - 0.2, at.z, hw + 0.15, hd + 0.15, 0.3, tx, tz, CONCRETE_PAD, CONCRETE_PAD, 0, 0);
-      buf.block(at.x, ground, at.z, hw, hd, h, tx, tz, wall, hexRGB(0x5c5e62), pal.win, rng() * 40);
-      parapet(buf, at.x, ground + h, at.z, hw, hd, tx, tz, wall, hexRGB(0x5c5e62));
-      roofKit(buf, at.x, ground + h, at.z, hw * 0.7, hd * 0.7, tx, tz, rng);
-      const canopy = place(u, 0.42 - (hd + 1.4) / (depth / 2));
-      buf.block(canopy.x, ground + 3.2, canopy.z, hw * 0.9, 1.4, 0.22, tx, tz, hexRGB(pick([0x8e2a22, 0x1f5a7a, 0x2a6a44, 0xc8a030])), hexRGB(0x505256), 0, 0);
+      const floors = 1 + Math.floor(rng() * 3);
+      const f = footing(at.x, at.z, ground, hw, hd, tx, tz);
+      if (floors <= 2) shopStrip(buf, f, floors, rng, place(u, 0.42 - (hd + 1.4) / (depth / 2)));
+      else midrise(buf, f, floors + 1, 'mixed', rng);
     }
   } else if (ep.kind === 'industrial') {
-    buf.pad(cx, ground - 0.01, cz, width / 2, depth / 2, fx, fz, CONCRETE_PAD);
-    for (let i = 0; i < Math.max(2, count - 1); i++) {
-      const n = Math.max(2, count - 1);
+    buf.pad(cx, ground - 0.01, cz, width / 2, depth / 2, fx, fz, CONCRETE_PAD, MAT.concrete);
+    const n = Math.max(2, count - 1);
+    for (let i = 0; i < n; i++) {
       const u = ((i + 0.5) / n) * 2 - 1;
       const at = place(u, 0.24);
       const hw = (width / n) * (0.32 + rng() * 0.1);
       const hd = depth * (0.26 + rng() * 0.1);
-      const h = 6.5 + rng() * 4;
-      const wall = hexRGB(pick(pal.walls));
-      const roof = hexRGB(pick(pal.roofs));
-      buf.block(at.x, ground, at.z, hw, hd, h, tx, tz, wall, roof, pal.win, rng() * 40);
-      buf.gable(at.x, ground + h, at.z, hw * 1.02, hd * 1.02, 1.7, fx, fz, roof, wall);
-      // Loading docks along the front.
-      for (let k = -1; k <= 1; k++) {
-        const dock = place(u + k * 0.14, 0.24 - (hd + 0.1) / (depth / 2));
-        buf.block(dock.x, ground, dock.z, 1.6, 0.12, 3.4, tx, tz, hexRGB(0x5e6468), hexRGB(0x5e6468), 0, 0);
-      }
+      shed(buf, footing(at.x, at.z, ground, hd, hw, fx, fz), 6.5 + rng() * 4, rng, rng() < 0.5);
       if (rng() < 0.7) {
         const t = place(u + 0.3, 0.84);
-        buf.drum(t.x, ground, t.z, 2.2 + rng() * 1.8, 6 + rng() * 5, hexRGB(0xb8bab6), hexRGB(0x8a8c8a));
+        buf.drum(t.x, ground, t.z, 2.2 + rng() * 1.8, 6 + rng() * 5, facadeColour(rng, SILO), hexRGB(0x8a8c8a), MAT.metal);
       }
     }
     const stack = place(-0.8, 0.7);
-    buf.drum(stack.x, ground, stack.z, 0.9, 24 + rng() * 10, hexRGB(0x8a7a6c), hexRGB(0x302c28));
+    buf.drum(stack.x, ground, stack.z, 0.9, 24 + rng() * 10, hexRGB(0x8a7a6c), hexRGB(0x302c28), MAT.brick, 0.05);
   } else {
     const lot = place(0, -0.62);
     parking(buf, lot.x, ground, lot.z, width * 0.46, depth * 0.2, fx, fz, rng);
@@ -475,16 +274,8 @@ export function buildZone(net: RoadNetwork, ep: TrafficEndpoint, buf: BuildingBu
       const at = place(u * 0.8, 0.4);
       const hw = Math.min((width / towers) * (0.26 + rng() * 0.1), 15);
       const hd = Math.min(depth * (0.22 + rng() * 0.08), 13);
-      const h = 18 + Math.floor(rng() * (6 + scale * 8)) * 3.6;
-      const wall = hexRGB(pick(pal.walls));
-      // Plinth, shaft, plant level.
-      buf.block(at.x, ground, at.z, hw * 1.12, hd * 1.12, 4.2, tx, tz, hexRGB(0x7a7c7e), hexRGB(0x5c5e62), 3, rng() * 40);
-      buf.block(at.x, ground + 4.2, at.z, hw, hd, h, tx, tz, wall, hexRGB(0x4c5056), 4, rng() * 40);
-      // Entrance canopy on the street side.
-      buf.block(at.x - fx * (hd * 1.12 + 1.4), ground + 3.4, at.z - fz * (hd * 1.12 + 1.4), 4, 1.4, 0.25, fx, fz, hexRGB(0x50545a), hexRGB(0x50545a), 0, 0);
-      parapet(buf, at.x, ground + 4.2 + h, at.z, hw, hd, tx, tz, hexRGB(0x62666c), hexRGB(0x4c5056));
-      buf.block(at.x, ground + 4.2 + h, at.z, hw * 0.5, hd * 0.5, 3.2, tx, tz, hexRGB(0x62666c), hexRGB(0x50545a), 0, 0);
-      roofKit(buf, at.x, ground + 7.4 + h, at.z, hw * 0.4, hd * 0.4, tx, tz, rng);
+      const floors = 6 + Math.floor(rng() * (2 + scale * 3));
+      tower(buf, footing(at.x, at.z, ground, hw, hd, tx, tz), floors, rng);
     }
   }
   return { x: cx, z: cz, r: Math.hypot(width, depth) / 2 };
@@ -532,37 +323,47 @@ function regionKey(net: RoadNetwork, region: ZoneRegion): string {
 function lotBuilding(buf: BuildingBuf, kind: ZoneKind, density: ZoneDensity, x: number, ground: number, z: number, w: number, d: number, tx: number, tz: number, fx: number, fz: number, rng: () => number): void {
   const pal = ZONE_PALETTE[kind as Exclude<EndpointKind, 'gateway'>];
   const pick = <T,>(a: T[]): T => a[Math.floor(rng() * a.length) % a.length];
-  const wall = hexRGB(pick(pal.walls));
-  const roof = hexRGB(pick(pal.roofs));
-  const flatRoof = hexRGB(0x5c5e62);
   // Half sizes across the road (hw) and along it (hd), kept inside the lot.
   const hd = w * (0.3 + rng() * 0.08);
   const hw = d * (0.26 + rng() * 0.08);
   const back = d * 0.08;
   const bx = x + fx * back;
   const bz = z + fz * back;
+  const f = footing(bx, bz, ground, hw, hd, tx, tz);
   if (kind === 'residential') {
     if (density === 'low') {
-      buf.flat(x, Math.max(terrainHeight(x, z), 0) + 0.03, z, w / 2, d / 2, tx, tz, LAWN);
+      buf.flat(x, surfaceLevel(x, z) + 0.03, z, w / 2, d / 2, tx, tz, LAWN);
       house(buf, bx, ground, bz, w, tx, tz, fx, fz, pal, rng, pick, d / 2 + back);
       return;
     }
-    const floors = density === 'medium' ? 3 + Math.floor(rng() * 2) : 6 + Math.floor(rng() * 8);
-    const h = floors * 3;
-    buf.block(bx, ground - 0.2, bz, hw + 0.2, hd + 0.2, 0.3, tx, tz, CONCRETE_PAD, CONCRETE_PAD, 0, 0);
-    buf.block(bx, ground, bz, hw, hd, h, tx, tz, wall, roof, pal.win, rng() * 40);
-    if (density === 'medium') buf.gable(bx, ground + h, bz, hw, hd, 2.2, tx, tz, roof, wall);
-    else parapet(buf, bx, ground + h, bz, hw, hd, tx, tz, wall, flatRoof);
+    if (density === 'medium') {
+      const floors = 3 + Math.floor(rng() * 2);
+      if (rng() < 0.45) {
+        // A gabled block of flats.
+        const C = BUILDING_COLOURS;
+        const wallMat = rng() < 0.6 ? MAT.brick : MAT.stucco;
+        const wall = facadeColour(rng, wallMat === MAT.brick ? C.brick : C.stucco);
+        const roof = facadeColour(rng, rng() < 0.5 ? C.roofTile : C.roofSlate);
+        const stone = facadeColour(rng, C.stone);
+        buf.ground = ground;
+        buf.block(bx, ground - 0.3, bz, hw + 0.06, hd + 0.06, 0.31, tx, tz, stone, stone, 0, 0, { wall: MAT.stone, roof: MAT.stone });
+        buf.block(bx, ground, bz, hw, hd, floors * 3, tx, tz, wall, roof, WIN.apartment, rng() * 40, { wall: wallMat });
+        buf.gable(bx, ground + floors * 3, bz, hw, hd, 2.6, tx, tz, roof, wall, 0.4, { roof: MAT.roofTile, wall: wallMat });
+        return;
+      }
+      midrise(buf, f, floors, 'flats', rng);
+      return;
+    }
+    midrise(buf, f, 6 + Math.floor(rng() * 8), 'flats', rng);
     return;
   }
   if (kind === 'industrial') {
     const h = (density === 'high' ? 10 : density === 'medium' ? 8 : 6.5) + rng() * 3;
-    buf.pad(x, ground - 0.01, z, w / 2, d / 2, fx, fz, CONCRETE_PAD);
-    buf.block(bx, ground, bz, hw, hd, h, tx, tz, wall, roof, pal.win, rng() * 40);
-    buf.gable(bx, ground + h, bz, hw * 1.02, hd * 1.02, 1.7, fx, fz, roof, wall);
+    buf.pad(x, ground - 0.01, z, w / 2, d / 2, fx, fz, CONCRETE_PAD, MAT.concrete);
+    shed(buf, f, h, rng, false);
     if (rng() < 0.5) {
       const r = 2 + rng() * 1.5;
-      buf.drum(x + fx * (d / 2 - r - 1) + tx * (w / 2 - r - 1), ground, z + fz * (d / 2 - r - 1) + tz * (w / 2 - r - 1), r, 6 + rng() * 5, hexRGB(0xb8bab6), hexRGB(0x8a8c8a));
+      buf.drum(x + fx * (d / 2 - r - 1) + tx * (w / 2 - r - 1), ground, z + fz * (d / 2 - r - 1) + tz * (w / 2 - r - 1), r, 6 + rng() * 5, facadeColour(rng, SILO), hexRGB(0x8a8c8a), MAT.metal);
     }
     return;
   }
@@ -570,15 +371,16 @@ function lotBuilding(buf: BuildingBuf, kind: ZoneKind, density: ZoneDensity, x: 
     kind === 'commercial' ? { low: [1, 2], medium: [3, 5], high: [8, 16] } : { low: [3, 4], medium: [6, 10], high: [14, 28] };
   const [lo, hi] = floorsBy[density];
   const floors = lo + Math.floor(rng() * (hi - lo + 1));
-  const h = floors * 3.6;
   if (density === 'low') parking(buf, x - fx * (d * 0.3), ground, z - fz * (d * 0.3), w * 0.42, d * 0.16, fx, fz, rng);
-  buf.block(bx, ground - 0.2, bz, hw + 0.15, hd + 0.15, 0.3, tx, tz, CONCRETE_PAD, CONCRETE_PAD, 0, 0);
-  buf.block(bx, ground, bz, hw, hd, h, tx, tz, wall, flatRoof, pal.win, rng() * 40);
-  parapet(buf, bx, ground + h, bz, hw, hd, tx, tz, wall, flatRoof);
-  roofKit(buf, bx, ground + h, bz, hw * 0.6, hd * 0.6, tx, tz, rng);
-  if (kind === 'commercial') {
-    buf.block(bx - fx * (hw + 1.4), ground + 3.2, bz - fz * (hw + 1.4), 1.4, hd * 0.9, 0.22, tx, tz, hexRGB(pick([0x8e2a22, 0x1f5a7a, 0x2a6a44, 0xc8a030])), flatRoof, 0, 0);
+  if (kind === 'commercial' && floors <= 2) {
+    shopStrip(buf, f, floors, rng, { x: bx - fx * (hw + 1.4), z: bz - fz * (hw + 1.4) });
+    return;
   }
+  if (density === 'high' && (kind === 'office' || rng() < 0.6)) {
+    tower(buf, { ...f, hw: f.hw * 0.86, hd: f.hd * 0.86 }, floors, rng);
+    return;
+  }
+  midrise(buf, f, floors, kind === 'office' ? 'offices' : 'mixed', rng);
 }
 
 /**
@@ -629,7 +431,7 @@ export function buildRegion(net: RoadNetwork, region: ZoneRegion, buf: BuildingB
       }
     }
     if (!ok) continue;
-    const ground = Math.max(terrainHeight(cx, cz), 0) + 0.08;
+    const ground = surfaceLevel(cx, cz) + 0.08;
     lotBuilding(buf, kind, region.density, cx, ground, cz, w, d, tx, tz, fx, fz, rng);
     placed.push({ x: cx, z: cz, r });
   }
@@ -652,7 +454,11 @@ function buildGateway(net: RoadNetwork, ep: TrafficEndpoint, nodeId: Id, bars: n
 export class EndpointLayer {
   readonly group = new THREE.Group();
   private batch: ChunkBatch;
+  /** Rooftop plant and other small parts, dropped beyond `detailRange`. */
+  private detailBatch: ChunkBatch;
   private material: THREE.MeshStandardMaterial;
+  /** Metres from the camera within which small building parts are drawn. 0 hides them. */
+  detailRange = 900;
   private known = new Set<Id>();
   private gateways: THREE.Mesh | null = null;
   private gatewayMat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.55, metalness: 0.4 });
@@ -666,8 +472,9 @@ export class EndpointLayer {
     shared: Shared,
   ) {
     this.material = buildingMaterial(shared);
-    this.batch = new ChunkBatch(SCHEMA, this.material, { castShadow: true, receiveShadow: true, chunkSize: 500 });
-    this.group.add(this.batch.group);
+    this.batch = new ChunkBatch(BUILDING_SCHEMA, this.material, { castShadow: true, receiveShadow: true, chunkSize: 500 });
+    this.detailBatch = new ChunkBatch(BUILDING_SCHEMA, this.material, { castShadow: true, receiveShadow: true, chunkSize: 160 });
+    this.group.add(this.batch.group, this.detailBatch.group);
   }
 
   rebuild(): void {
@@ -684,12 +491,15 @@ export class EndpointLayer {
       // A region draws its own buildings, so its access points draw none.
       if (ep.regionId !== undefined) {
         this.batch.set(ep.id, null);
+        this.detailBatch.set(ep.id, null);
         continue;
       }
       const buf = new BuildingBuf();
+      buf.detail = new BuildingBuf();
       const fp = buildZone(this.net, ep, buf);
       if (fp) this.footprints.push(fp);
       this.batch.set(ep.id, buf.toPiece());
+      this.detailBatch.set(ep.id, buf.detail.toPiece());
     }
     for (const region of this.net.project.zones ?? []) {
       if (region.kind === 'none') continue;
@@ -701,15 +511,22 @@ export class EndpointLayer {
         continue;
       }
       const buf = new BuildingBuf();
+      buf.detail = new BuildingBuf();
       const footprints = buildRegion(this.net, region, buf);
       this.regionCache.set(region.id, { key, footprints });
       this.footprints.push(...footprints);
       this.batch.set(region.id, buf.toPiece());
+      this.detailBatch.set(region.id, buf.detail.toPiece());
     }
     for (const id of this.regionCache.keys()) if (!seen.has(id)) this.regionCache.delete(id);
-    for (const id of this.known) if (!seen.has(id)) this.batch.set(id, null);
+    for (const id of this.known) {
+      if (seen.has(id)) continue;
+      this.batch.set(id, null);
+      this.detailBatch.set(id, null);
+    }
     this.known = seen;
     this.batch.flush();
+    this.detailBatch.flush();
     this.rebuildGateways(bars);
   }
 
@@ -808,9 +625,28 @@ export class EndpointLayer {
     this.group.add(this.arrows);
   }
 
+  /** Show small parts only near the camera. Cheap: one distance test per chunk. */
+  update(camera: THREE.Vector3): boolean {
+    const r2 = this.detailRange * this.detailRange;
+    let changed = false;
+    for (const child of this.detailBatch.group.children) {
+      const mesh = child as THREE.Mesh;
+      const s = mesh.geometry.boundingSphere;
+      if (!s) continue;
+      const d = Math.max(0, camera.distanceTo(s.center) - s.radius);
+      const show = d * d < r2;
+      if (mesh.visible !== show) {
+        mesh.visible = show;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
   dispose(): void {
     this.batch.dispose();
-    this.material.dispose();
+    this.detailBatch.dispose();
+    disposeBuildingMaterial(this.material);
     this.gatewayMat.dispose();
     this.arrowMat.dispose();
     this.gateways?.geometry.dispose();

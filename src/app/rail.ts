@@ -6,6 +6,7 @@ import { RailLayer } from '../render/rail';
 import type { Renderer } from '../render/Renderer';
 import type { Simulation } from '../sim/Simulation';
 import type { ToolManager } from '../tools/ToolManager';
+import { registerKeys } from '../ui/keymap';
 import { LinesPanel } from '../ui/RailPanels';
 import { confirmDialog } from '../ui/Panel';
 import type { UI } from '../ui/UI';
@@ -90,6 +91,31 @@ export function installRail(opts: { net: RoadNetwork; sim: Simulation; renderer:
       });
     },
   };
+  // Shortcuts and palette commands live in the shared keymap. O itself is handled by
+  // the tool manager while the cursor is over track; the binding documents it.
+  const wires = (on: boolean) => () => {
+    tools.electrify.electrify = on;
+    tools.setTool('electrify');
+    ui.toolbar.openTab('rail');
+  };
+  registerKeys([
+    {
+      id: 'rail.wires',
+      label: 'Overhead wires',
+      group: 'Trains',
+      keys: ['O', 'Shift+O'],
+      scope: 'hover:track',
+      shadows: ['tool.roundabout'],
+      desc: 'Over a track: toggle its overhead wires (third rail on metro). Shift does the whole line',
+      noPalette: true,
+    },
+    { id: 'station.layout', label: 'Next platform layout', group: 'Trains', keys: [']'], scope: 'tool:station', desc: 'Side, both sides or island', noPalette: true },
+    { id: 'station.flip', label: 'Flip platform side', group: 'Trains', keys: ['['], scope: 'tool:station', desc: 'Put the side platform, or the building, on the other side', noPalette: true },
+    { id: 'rail.electrify', label: 'Electrify track', group: 'Trains', keys: [], scope: 'global', desc: 'Sweep along track to put up overhead wires', run: wires(true) },
+    { id: 'rail.deElectrify', label: 'Remove overhead wires', group: 'Trains', keys: [], scope: 'global', desc: 'Sweep along track to make it diesel only', run: wires(false) },
+    { id: 'rail.lines', label: 'Train lines', group: 'Trains', keys: [], scope: 'global', desc: 'Every line with its trains and stats', run: () => lines.toggle() },
+    { id: 'rail.demo', label: 'Load the rail demo', group: 'Trains', keys: [], scope: 'global', desc: 'Replace the map with a sample railway', run: () => ui.context.rail?.loadDemo() },
+  ]);
   let tick = 0;
   const origUpdate = ui.update.bind(ui);
   ui.update = (dt: number) => {

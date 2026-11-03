@@ -34,6 +34,7 @@ import {
 } from './connectors';
 import { lanePolyline, type PolylineData } from './geometry';
 import { roundaboutLaneLinks } from './roundabout';
+import { islandBlocker, kerbFitter } from './junctionShape';
 
 /** A road lane before it has a dense index. Immutable once built. */
 export interface RoadLaneProto extends RoadLaneInfo {
@@ -105,9 +106,12 @@ export function buildNodeLanes(
   // Roundabout ring nodes have their own lane use, see core/roundabout.ts.
   const links = control.laneLinks ? controlLaneLinks(control, arms) : (roundaboutLaneLinks(arms, defOf) ?? autoLaneLinks(arms));
   const connectors: ConnectorProto[] = [];
+  // A junction shape's islands split traffic: nothing drives through one.
+  const blocked = islandBlocker(geom, control.shape, defOf, geomOf);
+  const fit = kerbFitter(geom, control.shape);
   for (const link of links) {
-    const c = buildConnector(nodeId, link);
-    if (c) connectors.push(c);
+    const c = fit ? fit(link, (cubic) => buildConnector(nodeId, link, cubic)) : buildConnector(nodeId, link);
+    if (c && !blocked?.(c)) connectors.push(c);
   }
   // Arm order rotates when an arm crosses heading +-PI. Connector order must not,
   // or a small drag would look like a change of lanes.

@@ -4,41 +4,7 @@ import type { UiContext } from './context';
 import { clear, el, iconButton } from './dom';
 import { ICONS } from './icons';
 import { confirmDialog, modal } from './Panel';
-
-const KEYS: [string, string][] = [
-  ['W A S D', 'Pan'],
-  ['Q E', 'Rotate camera'],
-  ['R F', 'Tilt camera'],
-  ['Wheel', 'Zoom'],
-  ['Right drag', 'Orbit'],
-  ['Left click', 'Place, select'],
-  ['Right click', 'Step back'],
-  ['Esc', 'Leave tool'],
-  ['N', 'Road tool'],
-  ['B', 'Bulldoze'],
-  ['M', 'Move'],
-  ['V', 'Inspect'],
-  ['J', 'Traffic control'],
-  ['G X C Y I Z', 'Light, stop, all-way, yield, priority, auto'],
-  ['O', 'Roundabout'],
-  ['[ ] Wheel', 'Roundabout radius'],
-  ['Del', 'Delete roundabout'],
-  ['L', 'Lane connector'],
-  ['P', 'Paint'],
-  ['T', 'Traffic'],
-  ['Z X C G', 'Draw modes'],
-  ['PgUp PgDn', 'Elevation 4 m'],
-  ['Ctrl or Cmd', 'Hold: no snapping'],
-  ['Shift+G', 'Grid snapping'],
-  ['K', 'Node markings'],
-  ['H', 'Reverse direction'],
-  ['Enter', 'Close a filler'],
-  ['Space', 'Pause'],
-  ['1 2 3', 'Sim speed'],
-  ['U', 'Underground'],
-  ['Ctrl+Z', 'Undo'],
-  ['Ctrl+Shift+Z', 'Redo'],
-];
+import { bindings, formatCombo, GESTURES, keyHint } from './keymap';
 
 export class Menu {
   private closeFn: (() => void) | null = null;
@@ -58,8 +24,11 @@ export class Menu {
 
   open(): void {
     const { actions } = this.ui;
-    const item = (icon: string, text: string, onClick: () => void) =>
-      el('button', { class: 'btn', html: `${icon}<span>${text}</span>`, attrs: { type: 'button' }, on: { click: onClick } });
+    const item = (icon: string, text: string, onClick: () => void, key?: string) => {
+      const b = el('button', { class: 'btn', html: `${icon}<span>${text}</span>`, attrs: { type: 'button' }, on: { click: onClick } });
+      if (key) b.append(el('kbd', { class: 'menu-key', text: key }));
+      return b;
+    };
     const importInput = el('input', {
       attrs: { type: 'file', accept: 'application/json,.json' },
       style: { display: 'none' },
@@ -86,22 +55,22 @@ export class Menu {
       el(
         'div',
         { class: 'menu-list' },
-        item(ICONS.plus, 'New', () => this.confirmNew()),
-        item(ICONS.down, 'Save', () => this.slots(true)),
-        item(ICONS.up, 'Load', () => this.slots(false)),
+        item(ICONS.plus, 'New', () => this.confirmNew(), keyHint('file.new')),
+        item(ICONS.down, 'Save', () => this.slots(true), keyHint('file.save')),
+        item(ICONS.up, 'Load', () => this.slots(false), keyHint('file.open')),
         item(ICONS.down, 'Export JSON', () => {
           actions.exportJson();
           this.close();
         }),
         item(ICONS.up, 'Import JSON', () => importInput.click()),
-        item(ICONS.help, 'Help and controls', () => this.help()),
+        item(ICONS.help, 'Keyboard reference', () => this.help(), keyHint('app.help')),
         importInput,
       ),
     );
     this.show('Cloverleaf', body);
   }
 
-  /** Ctrl+S: into the last slot used, or the slot picker the first time. */
+  /** Cmd+S or Ctrl+S: into the last slot used, or the slot picker the first time. */
   saveNow(): void {
     const { saves, net, renderer, toast } = this.ui;
     if (this.lastSlot === null) {
@@ -204,16 +173,40 @@ export class Menu {
     this.show(saving ? 'Save map' : 'Load map', body, null, false);
   }
 
+  /** The keyboard reference, built from the keymap so it is always current. */
   help(): void {
-    const keys = el('div', { class: 'keys' });
-    for (const [k, what] of KEYS) keys.append(el('kbd', { text: k }), el('span', { text: what }));
+    const groups = new Map<string, HTMLElement>();
+    const where = (scope: string) =>
+      scope.startsWith('tool:') ? ` (${scope.slice(5)} tool)` : scope.startsWith('select:') ? ` (${scope.slice(7)} selected)` : scope.startsWith('hover:') ? ` (over ${scope.slice(6)})` : scope === 'tab' ? ' (tray open)' : '';
+    for (const b of bindings()) {
+      if (!b.keys.length) continue;
+      let list = groups.get(b.group);
+      if (!list) groups.set(b.group, (list = el('div', { class: 'ref-list' })));
+      const caps = b.id === 'tab.pick' ? [el('kbd', { text: '1\u20139' })] : b.keys.slice(0, 4).map((k) => el('kbd', { text: formatCombo(k) }));
+      list.append(el('div', { class: 'ref-row' }, el('span', { class: 'ref-keys' }, ...caps), el('span', { class: 'ref-label', text: b.label + where(b.scope) })));
+    }
+    const gestures = el('div', { class: 'ref-list' });
+    for (const [g, what] of GESTURES) gestures.append(el('div', { class: 'ref-row' }, el('span', { class: 'ref-keys' }, el('kbd', { text: g })), el('span', { class: 'ref-label', text: what })));
+    const cols = el('div', { class: 'ref-grid' });
+    for (const [name, list] of groups) cols.append(el('section', {}, el('div', { class: 'section-title', text: name }), list));
+    cols.append(el('section', {}, el('div', { class: 'section-title', text: 'Mouse and trackpad' }), gestures));
     const body = el(
       'div',
       { class: 'dialog-body' },
-      el('p', { text: 'Draw roads from the bottom toolbar. Roads crossing at the same height make a junction. 6 m of height difference makes a bridge or tunnel.', style: { margin: '0 0 8px' } }),
-      keys,
+      el('p', { class: 'dialog-message', text: `Everything has a key. ${formatCombo('Mod+K')} searches every action; ? shows the keys for what you are doing.` }),
+      cols,
     );
-    this.show('Help and controls', body, null, false);
+    this.show('Keyboard reference', body, null, false);
+  }
+
+  /** New map, asking first. */
+  newMap(): void {
+    this.confirmNew();
+  }
+
+  /** Pick a save slot to load. */
+  openLoad(): void {
+    this.slots(false);
   }
 
   /** The strip shown on a first visit. */
@@ -223,8 +216,16 @@ export class Menu {
     const strip = el(
       'div',
       { class: 'panel hint-strip' },
-      el('span', { html: '<b>Welcome.</b> Pick <b>Streets</b> below and click to draw. <b>B</b> bulldozes, <b>PgUp</b> raises, right click steps back, and <b>Ctrl+Z</b> undoes.' }),
-      iconButton(ICONS.help, { tip: 'Help and controls', onClick: () => this.help() }),
+      el(
+        'div',
+        { class: 'hint-body' },
+        el(
+          'div',
+          { class: 'hint-keys' },
+          ...([['N', 'Build'], ['V', 'Modify'], ['J', 'Junction'], ['B', 'Bulldoze'], ['Mod+K', 'Search'], ['?', 'Keys']] as const).map(([k, t]) => el('span', {}, el('kbd', { text: formatCombo(k) }), t)),
+        ),
+      ),
+      iconButton(ICONS.help, { tip: 'Help and controls', desc: 'Every hotkey', onClick: () => this.help() }),
       iconButton(ICONS.close, {
         tip: 'Dismiss',
         onClick: () => {

@@ -21,11 +21,10 @@
 import { closestPointOnCubic, cubicLength, cubicPoint, cubicTangentXZ, subCubic, type Cubic } from '../core/bezier';
 import { distXZ, normalizeXZ, sub } from '../core/math';
 import type { RoadAnchor, RoadNetwork } from '../core/RoadNetwork';
-import { totalHalfWidth } from '../core/roadTypes';
 import type { Id, Vec3 } from '../core/types';
 import type { ToolMark } from '../render/api';
 import { gridAxes, type GridSettings } from './grid';
-import { fitOffset, offsetPoint, PARALLEL_GAP, touchingOffset } from './parallel';
+import { fitOffset, fitThrough, offsetPoint, PARALLEL_GAP, touchingOffset } from './parallel';
 import type { SnapFrom, SnapHit } from './snap';
 
 export interface GuideToggles {
@@ -49,6 +48,8 @@ export interface GuideContext {
   roadType: string;
   /** The grid when it is on, for aligned offsets and line-up axes. */
   grid: GridSettings | null;
+  /** The grid snapping uses at this zoom (finest visible subdivision). A guide snap slides along to its lines. */
+  snapGrid?: GridSettings | null;
   /** Shift held: the direction locked from the start point. */
   lock?: Vec3 | null;
   /** The start anchor of the road being drawn. */
@@ -193,19 +194,25 @@ function offsetConstraint(
     },
     cubic(pos) {
       if (!from) return undefined;
-      const ts = at(from.pos);
-      const te = at(pos);
-      if (ts <= 1e-4 || ts >= 1 - 1e-4 || Math.abs(te - ts) < 1e-3) return undefined;
-      const start = offsetPoint(c, ts, offset);
-      if (distXZ(start, from.pos) > 0.3) return undefined;
-      const sub0 = subCubic(c, Math.min(ts, te), Math.max(ts, te));
-      const fit = fitOffset(sub0, offset);
+      const path = offsetPath(net, segId, offset, from.pos, pos);
+      if (!path) return undefined;
+      let fit: { cubic: Cubic; error: number };
+      if (path.single) {
+        // On one piece: fit the offset of the exact stretch, at the curve's own parameters.
+        const { ts, te } = path.single;
+        const f = fitOffset(subCubic(c, Math.min(ts, te), Math.max(ts, te)), offset);
+        fit = te < ts ? { cubic: { p0: f.cubic.p3, p1: f.cubic.p2, p2: f.cubic.p1, p3: f.cubic.p0 }, error: f.error } : f;
+      } else {
+        const pts = path.points;
+        if (pts.length < 3) return undefined;
+        const dir = (i: number, j: number) => normalizeXZ(sub(pts[j], pts[i]));
+        fit = fitThrough(pts, dir(0, 1), dir(pts.length - 2, pts.length - 1));
+      }
       if (fit.error > 0.3) return undefined;
-      let cubic = fit.cubic;
-      if (te < ts) cubic = { p0: cubic.p3, p1: cubic.p2, p2: cubic.p1, p3: cubic.p0 };
       // Exact ends, heights from the draft.
       const y0 = from.pos.y;
       const y1 = pos.y;
+      const cubic = fit.cubic;
       return {
         p0: { ...from.pos },
         p1: { x: cubic.p1.x, y: y0 + (y1 - y0) / 3, z: cubic.p1.z },
@@ -214,6 +221,70 @@ function offsetConstraint(
       };
     },
   };
+}
+
+/**
+ * Points along the offset `offset` of a road from where `start` sits on it to
+ * where `end` does, including the neighbouring piece through a smooth joint when
+ * the start is on that one. Null when the start is not on this offset.
+ */
+function offsetPath(net: RoadNetwork, segId: Id, offset: number, start: Vec3, end: Vec3): { points: Vec3[]; single: { ts: number; te: number } | null } | null {
+  const c = net.cubicOf(segId);
+  const te = closestPointOnCubic(c, end).t;
+  const sample = (cu: Cubic, t0: number, t1: number, d: number, out: Vec3[]) => {
+    const n = Math.max(4, Math.ceil(Math.abs(t1 - t0) * 32));
+    for (let i = 0; i <= n; i++) {
+      const p = offsetPoint(cu, t0 + ((t1 - t0) * i) / n, d);
+      if (!out.length || distXZ(out[out.length - 1], p) > 1e-6) out.push(p);
+    }
+  };
+  const onIt = (cu: Cubic, d: number) => {
+    const t = closestPointOnCubic(cu, start).t;
+    return t > 1e-4 && t < 1 - 1e-4 && distXZ(offsetPoint(cu, t, d), start) < 0.3 ? t : null;
+  };
+  const ts = onIt(c, offset);
+  if (ts !== null) {
+    if (Math.abs(te - ts) < 1e-3) return null;
+    return { points: [], single: { ts, te } };
+  }
+  // The start may be beside the next piece of the same road, through a smooth joint.
+  const seg = net.getSegment(segId)!;
+  for (const [node, tc] of [[seg.a, 0], [seg.b, 1]] as const) {
+    const dc = cubicTangentXZ(c, tc);
+    for (const other of net.getNode(node)?.segments ?? []) {
+      if (other === segId) continue;
+      const o = net.cubicOf(other);
+      const tn = net.getSegment(other)!.a === node ? 0 : 1;
+      const dn = cubicTangentXZ(o, tn);
+      const dot = dc.x * dn.x + dc.z * dn.z;
+      if (Math.abs(dot) < Math.cos((8 * Math.PI) / 180)) continue;
+      // Pieces running the same way keep the side; opposed pieces swap it.
+      const d = dot > 0 ? offset : -offset;
+      const to = onIt(o, d);
+      if (to === null) continue;
+      const out: Vec3[] = [];
+      sample(o, to, tn, d, out);
+      sample(c, tc, te, offset, out);
+      return { points: out, single: null };
+    }
+  }
+  return null;
+}
+
+/** The point of a road nearest `p`, looking past either end into the next piece. */
+function roadPointNear(net: RoadNetwork, segId: Id, p: Vec3): Vec3 {
+  const c = net.cubicOf(segId);
+  const hit = closestPointOnCubic(c, p);
+  if (hit.t > 1e-3 && hit.t < 1 - 1e-3) return hit.point;
+  const seg = net.getSegment(segId)!;
+  const node = hit.t < 0.5 ? seg.a : seg.b;
+  let best = hit;
+  for (const other of net.getNode(node)?.segments ?? []) {
+    if (other === segId) continue;
+    const h = closestPointOnCubic(net.cubicOf(other), p);
+    if (h.distance < best.distance) best = h;
+  }
+  return best.point;
 }
 
 function nearbySegments(net: RoadNetwork, p: Vec3, reach: number): Id[] {
@@ -241,7 +312,13 @@ function parallelConstraints(net: RoadNetwork, raw: Vec3, from: SnapFrom | null,
     if (hit.t <= 1e-4 || hit.t >= 1 - 1e-4) continue;
     if (Math.abs(hit.point.y - raw.y) > 2.5 || hit.distance > PARALLEL_REACH) continue;
     const tan = cubicTangentXZ(c, hit.t);
-    if (dir && Math.abs(tan.x * dir.x + tan.z * dir.z) < cosMax) continue;
+    if (dir && from) {
+      // On a bend, compare with the road's own chord over the same stretch.
+      const back = roadPointNear(net, id, from.pos);
+      const chord = sub(hit.point, back);
+      const along = Math.hypot(chord.x, chord.z) > 5 ? normalizeXZ(chord) : tan;
+      if (Math.abs(along.x * dir.x + along.z * dir.z) < cosMax) continue;
+    }
     const lateral = (raw.x - hit.point.x) * -tan.z + (raw.z - hit.point.z) * tan.x;
     near.push({ id, t: hit.t, point: hit.point, tan, lateral });
   }
@@ -290,12 +367,10 @@ function parallelConstraints(net: RoadNetwork, raw: Vec3, from: SnapFrom | null,
               const pa = closestPointOnCubic(ca, pos).point;
               const pb = closestPointOnCubic(cb, pos).point;
               const nearer = distXZ(pa, pos) < distXZ(pb, pos) ? pa : pb;
-              const farther = nearer === pa ? pb : pa;
               const marks: ToolMark[] = [
                 { kind: 'line', points: [{ ...pa, y: pos.y }, { ...pb, y: pos.y }], color: GUIDE_COLOR, width: MARK_WIDTH },
                 { kind: 'line', points: [{ ...nearer, y: pos.y }, pos], color: GUIDE_COLOR, width: MARK_WIDTH },
               ];
-              void farther;
               return marks;
             }),
           );
@@ -479,7 +554,7 @@ export function snapToSmartGuides(net: RoadNetwork, raw: Vec3, from: SnapFrom | 
       if (x && distXZ(x, raw) <= catchM * 1.5 && (!best || distXZ(x, raw) < distXZ(best.pos, raw))) best = { pos: x, other: c };
     }
     if (best) return finish(best.pos, [lock, best.other], ctx.lock);
-    return finish(base.pos, [lock], ctx.lock);
+    return finish(onGridAlong(base.pos, ctx.lock, ctx, catchM), [lock], ctx.lock);
   }
 
   const near = all
@@ -500,12 +575,41 @@ export function snapToSmartGuides(net: RoadNetwork, raw: Vec3, from: SnapFrom | 
   }
   if (best) return finish(best.pos, [best.a, best.b], null);
   const top = near[0];
-  return finish(top.p.pos, [top.c], top.p.dir);
+  const slid = onGridAlong(top.p.pos, top.p.dir, ctx, catchM);
+  // A curved guide is straight over a short slide; put the point back on it.
+  const back = slid === top.p.pos ? top.p : top.c.project(slid);
+  return finish(back && back.dist < 0.05 ? back.pos : slid, [top.c], top.p.dir);
+}
+
+/** Slide a guide point along its direction to the nearest grid line crossing, when the grid is on and one is close. */
+function onGridAlong(pos: Vec3, dir: Vec3, ctx: GuideContext, catchM: number): Vec3 {
+  const g = ctx.snapGrid;
+  if (!g?.enabled) return pos;
+  const s = g.spacing;
+  const { u, v } = gridAxes(g);
+  const dx = pos.x - g.originX;
+  const dz = pos.z - g.originZ;
+  let best: number | null = null;
+  for (const axis of [u, v]) {
+    const at = dx * axis.x + dz * axis.z;
+    const rate = dir.x * axis.x + dir.z * axis.z;
+    if (Math.abs(rate) < 0.2) continue;
+    const k = Math.round(at / s);
+    const step = (k * s - at) / rate;
+    if (best === null || Math.abs(step) < Math.abs(best)) best = step;
+  }
+  if (best === null || Math.abs(best) > Math.min(catchM, s / 2)) return pos;
+  return { x: pos.x + dir.x * best, y: pos.y, z: pos.z + dir.z * best };
 }
 
 function finish(pos: Vec3, used: Constraint[], dir: Vec3 | null): GuideSnap {
   const marks = used.flatMap((c) => c.marks(pos));
-  const cubic = used.length === 1 ? used[0].cubic?.(pos) : undefined;
+  // The point lies on every guide used, so a parallel guide among them still gives its shape.
+  let cubic: Cubic | undefined;
+  for (const c of used) {
+    cubic = c.cubic?.(pos);
+    if (cubic) break;
+  }
   const d = dir ?? used[0].project(pos)?.dir ?? null;
   return { pos, result: { label: used.map((c) => c.label).join(' · '), marks, dir: d, cubic } };
 }
@@ -581,39 +685,11 @@ export function parallelDistanceInfo(net: RoadNetwork, pos: Vec3, from: SnapFrom
     const c = net.cubicOf(id);
     const hit = closestPointOnCubic(c, pos);
     if (hit.t <= 1e-4 || hit.t >= 1 - 1e-4 || Math.abs(hit.point.y - pos.y) > 2.5) continue;
-    const tan = cubicTangentXZ(c, hit.t);
-    if (Math.abs(tan.x * dir.x + tan.z * dir.z) < Math.cos(PARALLEL_ANGLE)) continue;
+    const back = roadPointNear(net, id, from.pos);
+    const chord = sub(hit.point, back);
+    const along = Math.hypot(chord.x, chord.z) > 5 ? normalizeXZ(chord) : cubicTangentXZ(c, hit.t);
+    if (Math.abs(along.x * dir.x + along.z * dir.z) < Math.cos(PARALLEL_ANGLE)) continue;
     best = Math.min(best, hit.distance);
   }
   return Number.isFinite(best) ? `To parallel road ${best.toFixed(1)} m` : null;
-}
-
-/**
- * The existing node or road a new road's end lands on, or a free point. Within a
- * road's half width counts, so a road drawn up to another joins it.
- */
-export function resolveEndAnchor(net: RoadNetwork, p: Vec3, roadType: string, ignore?: ReadonlySet<Id>): RoadAnchor {
-  const near = net.nearestNode(p, 3);
-  const node = near ? net.getNode(near.nodeId) : undefined;
-  if (node && Math.abs(node.pos.y - p.y) < 1.5) return { kind: 'node', id: node.id };
-  const def = net.roadType(roadType);
-  void def;
-  let best: { id: Id; t: number; d: number } | null = null;
-  for (const id of nearbySegments(net, p, 30)) {
-    if (ignore?.has(id)) continue;
-    const c = net.cubicOf(id);
-    const hit = closestPointOnCubic(c, p);
-    if (Math.abs(hit.point.y - p.y) > 1.5) continue;
-    const tol = totalHalfWidth(net.roadTypeOf(id)) + 1;
-    if (hit.distance > tol || (best && hit.distance >= best.d)) continue;
-    best = { id, t: hit.t, d: hit.distance };
-  }
-  if (best) {
-    const seg = net.getSegment(best.id)!;
-    const len = net.segmentGeom(best.id)?.fullLength ?? 0;
-    if (best.t * len < 6) return { kind: 'node', id: seg.a };
-    if ((1 - best.t) * len < 6) return { kind: 'node', id: seg.b };
-    return { kind: 'segment', id: best.id, t: best.t };
-  }
-  return { kind: 'free', pos: { ...p } };
 }

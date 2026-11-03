@@ -1,6 +1,6 @@
 /**
- * Procedural rolling stock in low-poly style: chunky faceted shapes, flat colour
- * per part, simple window bands. Every vehicle is built from swept profiles, boxes and
+ * Procedural rolling stock: clean smooth-shaded shapes, flat colour per part,
+ * simple window bands. Every vehicle is built from swept profiles, boxes and
  * cylinders, with a part code per vertex so one shader can paint the livery, light
  * the lamps and windows, and show open doors. Local frame: forward is -Z, x right,
  * y up from the top of the rail, origin halfway along the body.
@@ -76,6 +76,16 @@ export class ModelBuilder {
     this.tri(a, c, d, color, part);
   }
 
+  /** Quad with a normal per corner, for smooth shading. */
+  quadN(a: V3, b: V3, c: V3, d: V3, na: V3, nb: V3, nc: V3, nd: V3, color: Col, part: number): void {
+    this.push(a, na, color, part);
+    this.push(b, nb, color, part);
+    this.push(c, nc, color, part);
+    this.push(a, na, color, part);
+    this.push(c, nc, color, part);
+    this.push(d, nd, color, part);
+  }
+
   box(x0: number, x1: number, y0: number, y1: number, z0: number, z1: number, color: Col, part: number, bottom = false): void {
     this.quad([x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0], color, part);
     this.quad([x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0], color, part);
@@ -108,13 +118,33 @@ export class ModelBuilder {
     const n = profile.length;
     const colorOf = typeof color === 'function' ? color : () => color;
     const partOf = typeof part === 'function' ? part : () => part;
+    // Smooth shading across gentle corners of a straight sweep, hard across sharp ones.
+    const smooth = !opts.shape;
+    const edgeN = profile.map(([x0, y0], i) => {
+      const [x1, y1] = profile[(i + 1) % n];
+      const l = Math.hypot(x1 - x0, y1 - y0) || 1;
+      return [(y1 - y0) / l, -(x1 - x0) / l];
+    });
+    const cornerN = (edge: number, vertex: number): V3 => {
+      const own = edgeN[edge];
+      const other = edgeN[vertex === edge ? (edge + n - 1) % n : (edge + 1) % n];
+      if (own[0] * other[0] + own[1] * other[1] < 0.65) return [own[0], own[1], 0];
+      const x = own[0] + other[0];
+      const y = own[1] + other[1];
+      const l = Math.hypot(x, y) || 1;
+      return [x / l, y / l, 0];
+    };
     let prev = ring(0);
     for (let k = 1; k <= steps; k++) {
       const cur = ring(k);
       for (let i = 0; i < n; i++) {
         const j = (i + 1) % n;
         // Profile runs counter-clockwise seen from -Z, so outward faces wind this way.
-        this.quad(prev[i], prev[j], cur[j], cur[i], colorOf(i), partOf(i));
+        if (smooth) {
+          const ni = cornerN(i, i);
+          const nj = cornerN(i, j);
+          this.quadN(prev[i], prev[j], cur[j], cur[i], ni, nj, nj, ni, colorOf(i), partOf(i));
+        } else this.quad(prev[i], prev[j], cur[j], cur[i], colorOf(i), partOf(i));
       }
       prev = cur;
     }
@@ -130,7 +160,7 @@ export class ModelBuilder {
   }
 
   /** Cylinder along Z. */
-  cylZ(cx: number, cy: number, r: number, z0: number, z1: number, color: Col, part: number, sides = 8, caps = true): void {
+  cylZ(cx: number, cy: number, r: number, z0: number, z1: number, color: Col, part: number, sides = 14, caps = true): void {
     const prof: [number, number][] = [];
     for (let i = 0; i < sides; i++) {
       const a = (i / sides) * Math.PI * 2;
@@ -140,7 +170,7 @@ export class ModelBuilder {
   }
 
   /** Cylinder along X, for wheels and axles. */
-  cylX(x0: number, x1: number, cy: number, cz: number, r: number, color: Col, part: number, sides = 6): void {
+  cylX(x0: number, x1: number, cy: number, cz: number, r: number, color: Col, part: number, sides = 10): void {
     for (let i = 0; i < sides; i++) {
       const a0 = (i / sides) * Math.PI * 2;
       const a1 = ((i + 1) / sides) * Math.PI * 2;
@@ -183,8 +213,8 @@ function carProfile(hw: number, floor: number, top: number): [number, number][] 
     [hw, floor + 0.5],
     [hw, eave],
   ];
-  for (let i = 1; i <= 2; i++) {
-    const a = (i / 3) * Math.PI;
+  for (let i = 1; i <= 5; i++) {
+    const a = (i / 6) * Math.PI;
     pts.push([Math.cos(a) * hw * 0.98, eave + Math.sin(a) * (top - eave)]);
   }
   pts.push([-hw, eave], [-hw, floor + 0.5]);
@@ -503,6 +533,44 @@ function autorack(): THREE.BufferGeometry {
   return m.build();
 }
 
+/** American bilevel commuter coach: tall, flat-sided, two rows of windows, with an optional cab end. */
+function bilevel(cab: boolean): THREE.BufferGeometry {
+  const k = CAR_KINDS[cab ? CAR.bilevelCab : CAR.bilevel];
+  const m = new ModelBuilder();
+  const hw = k.width / 2;
+  const L = k.length;
+  const floor = 0.75;
+  const top = k.height;
+  const prof: [number, number][] = [
+    [-hw + 0.1, floor],
+    [hw - 0.1, floor],
+    [hw, floor + 0.3],
+    [hw, top - 0.45],
+    [hw - 0.45, top],
+    [-hw + 0.45, top],
+    [-hw, top - 0.45],
+    [-hw, floor + 0.3],
+  ];
+  m.sweep(prof, -L / 2, L / 2, (i) => (i === 0 ? UNDER : WHITE), (i) => (i === 0 ? P_DARK : i === 2 || i === 7 ? P_STRIPE : P_BODY));
+  // Lower and upper window bands, doors low in the middle.
+  m.sides(hw, -L / 2 + 3.2, L / 2 - 3.2, floor + 0.9, floor + 1.6, GLASS, P_GLASS);
+  m.sides(hw, -L / 2 + 3.2, L / 2 - 3.2, floor + 2.6, floor + 3.3, GLASS, P_GLASS);
+  for (const d of [-L / 2 + 1.6, L / 2 - 1.6]) {
+    m.sides(hw, d - 0.65, d + 0.65, floor + 0.3, floor + 2.3, WHITE, P_DOOR, 0.02);
+    m.sides(hw, d - 0.5, d + 0.5, floor + 1.2, floor + 2.0, GLASS, P_GLASS, 0.03);
+  }
+  if (cab) {
+    m.end(-L / 2 - 0.02, -hw + 0.4, hw - 0.4, floor + 2.6, top - 0.7, GLASS, P_GLASS);
+    for (const s of [-1, 1]) m.box(s * (hw - 0.55) - 0.2, s * (hw - 0.55) + 0.2, floor + 1.0, floor + 1.25, -L / 2 - 0.05, -L / 2, LAMP, P_LAMP);
+    m.box(-0.3, 0.3, top - 0.45, top - 0.25, -L / 2 - 0.05, -L / 2, LAMP, P_LAMP);
+  } else {
+    m.end(-L / 2 - 0.01, -0.5, 0.5, floor + 0.3, floor + 2.3, DARK, P_DARK);
+  }
+  m.end(L / 2 + 0.01, -0.5, 0.5, floor + 0.3, floor + 2.3, DARK, P_DARK, true);
+  for (const z of [-L / 2 - 0.35, L / 2]) m.box(-0.18, 0.18, 0.85, 1.05, z, z + 0.35, DARK, P_DARK);
+  return m.build();
+}
+
 /** Near models, indexed like CAR_KINDS. */
 export function buildCarModels(): THREE.BufferGeometry[] {
   return [
@@ -522,6 +590,8 @@ export function buildCarModels(): THREE.BufferGeometry[] {
     flatcar(),
     doubleStack(),
     autorack(),
+    bilevel(false),
+    bilevel(true),
   ];
 }
 
@@ -532,7 +602,7 @@ export function buildFarModels(): THREE.BufferGeometry[] {
     const hw = k.width / 2;
     const L = k.length / 2;
     m.box(-hw, hw, 1.0, k.height, -L, L, WHITE, P_BODY);
-    if (i <= CAR.hsCar) {
+    if (i <= CAR.hsCar || i >= CAR.bilevel) {
       m.sides(hw, -L + 1, L - 1, 1.95, 2.75, GLASS, P_GLASS, 0.02);
       m.sides(hw, -L + 0.5, L - 0.5, 1.15, 1.6, WHITE, P_STRIPE, 0.02);
     }

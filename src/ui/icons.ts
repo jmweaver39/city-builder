@@ -10,6 +10,7 @@ export const ICONS = {
   ramp: svg('<path d="M4 19c7 0 12-4 16-13"/><path d="m15 6 5 0 0 5"/>'),
   custom: svg('<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>'),
   intersections: svg('<path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="5"/>'),
+  junctionShape: svg('<path d="M9 3v4a2 2 0 0 1-2 2H3M15 3v4a2 2 0 0 0 2 2h4M9 21v-4a2 2 0 0 0-2-2H3M15 21v-4a2 2 0 0 1 2-2h4"/><circle cx="7" cy="7" r="1.4"/>'),
   control: svg('<rect x="8" y="2.5" width="8" height="15" rx="2.5"/><circle cx="12" cy="6.5" r="1.3"/><circle cx="12" cy="10" r="1.3"/><circle cx="12" cy="13.5" r="1.3"/><path d="M12 17.5V22"/>'),
   paint: svg('<path d="M15 4 20 9 10 19l-6 1 1-6z"/><path d="m13 6 5 5"/>'),
   traffic: svg('<path d="M5 13 7 7.5A2 2 0 0 1 9 6h6a2 2 0 0 1 2 1.5L19 13"/><rect x="3.5" y="13" width="17" height="5" rx="1.5"/><path d="M6.5 18v2M17.5 18v2M7 15.5h.01M17 15.5h.01"/>'),
@@ -52,6 +53,8 @@ export const ICONS = {
   office: svg('<rect x="6" y="3" width="12" height="18" rx="1"/><path d="M10 7h.01M14 7h.01M10 11h.01M14 11h.01M10 15h.01M14 15h.01"/>'),
   train: svg('<rect x="6" y="3" width="12" height="13" rx="3"/><path d="M6 10h12M9 20l-2 2M15 20l2 2M9 13h.01M15 13h.01M8 16l-1 4h10l-1-4"/>'),
   station: svg('<path d="M3 9 12 4l9 5"/><path d="M5 9v7M19 9v7M3 16h18M3 20h18"/>'),
+  wires: svg('<path d="M4 21V6M20 21V6M3 7h18M7 7l2 4h6l2-4"/><path d="M9 11v4M15 11v4"/>'),
+  noWires: svg('<path d="M4 21V6M20 21V6M3 7h18"/><path d="m8 11 8 8M16 11l-8 8"/>'),
   trainLine: svg('<circle cx="5" cy="17" r="2"/><circle cx="12" cy="7" r="2"/><circle cx="19" cy="15" r="2"/><path d="M6.4 15.6 10.7 8.6M13.6 8.2l4.2 5.4"/>'),
   // Traffic Control cards.
   signalLight: svg('<rect x="8" y="2.5" width="8" height="15" rx="2.5"/><circle cx="12" cy="6.5" r="1.3"/><circle cx="12" cy="10" r="1.3"/><circle cx="12" cy="13.5" r="1.3"/><path d="M12 17.5V22"/>'),
@@ -62,7 +65,26 @@ export const ICONS = {
   autoControl: svg('<path d="M5 19 10.5 5h3L19 19"/><path d="M7.5 13h9"/><path d="M19 3v4M17 5h4"/>'),
   roundabout: svg('<circle cx="12" cy="12" r="5.5"/><path d="M12 2v4.5M12 17.5V22M2 12h4.5M17.5 12H22"/><path d="m15.5 7.2 1.4 1.8-2.2.4"/>'),
   advanced: svg('<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>'),
+  quay: svg('<path d="M3 4v16h8V8"/><path d="M3 8h8"/><path d="M14 13c1.5 1.2 3-1.2 4.5 0S21 14 21 14M14 18c1.5 1.2 3-1.2 4.5 0S21 19 21 19"/>'),
   more: svg('<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>'),
+  // Modes that had their icons in other modules.
+  parallel: svg('<path d="M5 20C5 11 9 6 18 4"/><path d="M10 21c0-7 3-11 10-13" stroke-dasharray="2.5 2.5"/>'),
+  electrify: svg('<path d="M3 5h18"/><path d="M7 5v4M17 5v4"/><path d="M13 9l-3 6h4l-3 6"/>'),
+  grid: svg('<path d="M3 8h18M3 16h18M8 3v18M16 3v18"/>'),
+  // The markings editor's draw tools.
+  markLine: svg('<path d="M4 20 20 4"/><circle cx="4" cy="20" r="1.6" fill="currentColor"/><circle cx="20" cy="4" r="1.6" fill="currentColor"/>'),
+  markCrossing: svg('<path d="M5 4v16M9.5 4v16M14 4v16M18.5 4v16" stroke-width="2.4"/>'),
+  markStop: svg('<path d="M3 12h18" stroke-width="3.2"/><path d="M8 18v-3M12 18v-3M16 18v-3"/>'),
+  markArea: svg('<path d="M4 18 7 5l11 2 2 11z"/><path d="M6 13l6-7M8 18l9-10M13 18l6-7"/>'),
+  markErase: svg('<path d="M15 4l5 5-9 9H6l-2-2z"/><path d="M10 9l5 5M6 18h14"/>'),
+  // The seven tools, drawn as map symbols rather than generic glyphs.
+  toolBuild: svg('<path d="M3 16 16 3M8 21 21 8"/><path d="M9.5 14.5l1-1M13 11l1-1M16.5 7.5l1-1"/><circle cx="5.5" cy="18.5" r="1.6"/>'),
+  toolModify: svg('<path d="M4 3l11 6.5-4.6 1.4-1.9 4.6z"/><rect x="15.5" y="15.5" width="5" height="5" rx=".5"/><path d="M11 11l4.5 4.5"/>'),
+  toolJunction: svg('<path d="M9 2.5V9H2.5M15 2.5V9h6.5M9 21.5V15H2.5M15 21.5V15h6.5"/><path d="M12 4.5v2M12 17.5v2M4.5 12h2M17.5 12h2"/>'),
+  toolPaint: svg('<path d="M12 21V9"/><path d="M7.5 13 12 8.5l4.5 4.5"/><path d="M5 3.5h14"/>'),
+  toolZones: svg('<rect x="3.5" y="3.5" width="17" height="17" rx=".5"/><path d="M3.5 11.5l8-8M3.5 19.5l16-16M11.5 20.5l9-9"/>'),
+  toolTerrain: svg('<path d="M2.5 18c3-4 6-4 9-1.5s6.5 2.5 10-1.5"/><path d="M5.5 12.5c2-2.5 4-2.5 6-1s4.5 1.5 6.5-.5"/><path d="M9 7.5c1.2-1.4 2.4-1.4 3.6-.6s2.4.8 3.4-.3"/>'),
+  toolTransit: svg('<path d="M8.5 2.5 6.5 21.5M15.5 2.5l2 19"/><path d="M8 6.5h8M7.5 11h9M7 15.5h10M6.6 19.5h10.8"/>'),
 } as const;
 
 export type IconName = keyof typeof ICONS;

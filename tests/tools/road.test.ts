@@ -122,11 +122,16 @@ describe('Curved mode', () => {
     r.hover(100, 100, { ctrl: true });
     expect(r.tools.hud?.lines.join()).toMatch(/Radius/);
     r.click(100, 100, { ctrl: true });
-    expect(r.net.segments).toHaveLength(1);
-    const c = r.net.cubicOf(r.net.segments[0].id);
-    expect(c.p1.x).toBeCloseTo((100 * 2) / 3, 3);
-    expect(c.p1.z).toBeCloseTo(0, 6);
-    expect(c.p2.z).toBeCloseTo(100 / 3, 3);
+    // A fitted curve (core/curveFit.ts): spirals and an arc, in pieces joined plainly.
+    const ids = r.net.segments.map((s) => s.id);
+    expect(ids.length).toBeGreaterThan(1);
+    const first = r.net.cubicOf(ids[0]);
+    const last = r.net.cubicOf(ids[ids.length - 1]);
+    expect(first.p0.x).toBeCloseTo(0, 6);
+    expect(cubicTangentXZ(first, 0).x).toBeCloseTo(1, 6);
+    expect(cubicTangentXZ(last, 1).z).toBeCloseTo(1, 6);
+    expect(distXZ(last.p3, { x: 100, y: 0, z: 100 })).toBeLessThan(1e-6);
+    for (let i = 0; i + 1 < ids.length; i++) expect(r.net.nodeGeom(r.net.getSegment(ids[i])!.b)!.kind).toBe('plain');
   });
 
   it('right click steps back through control then start', () => {
@@ -167,7 +172,9 @@ describe('Freeform mode', () => {
       const b = cubicTangentXZ(r.net.cubicOf(ids[i + 1]), 0);
       expect(dotXZ(a, b)).toBeGreaterThan(0.9999);
     }
-    expect(ids).toHaveLength(3);
+    // Three clicks: a straight, then two fitted curves of one or more pieces each.
+    expect(ids.length).toBeGreaterThanOrEqual(3);
+    expect(r.net.nodes.filter((n) => r.net.nodeGeom(n.id)!.kind === 'junction')).toHaveLength(0);
   });
 
   it('continues from an existing dead end', () => {

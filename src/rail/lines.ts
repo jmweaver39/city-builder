@@ -3,9 +3,13 @@
  * track, how much platform a place has room for, and autoLine.
  */
 import type { RoadNetwork } from '../core/RoadNetwork';
-import { trackSpec, type RailLine, type RailStationKind, type TrainTypeId } from '../core/railTypes';
+import { segmentElectrification, trackSpec, type RailLine, type RailStationKind, type TrainTypeId } from '../core/railTypes';
 import type { Id, Vec3 } from '../core/types';
+import { closestPointOnCubic, cubicPoint, cubicTangentXZ, curvatureXZ } from '../core/bezier';
+import { surfaceLevel, terrainHeight } from '../core/terrain';
 import { TRAIN_TYPES, trainLength } from './consists';
+import { footprintsClash, ownTrack, placedStationFootprint, segmentFootprint, stationFootprint } from '../core/footprint';
+export { stationEntrances, type StationEntrance } from '../core/footprint';
 import { FOUL_DISTANCE } from './constants';
 import type { TrackGraph } from './TrackGraph';
 import type { TrainSim } from './TrainSim';
@@ -33,13 +37,92 @@ export function suggestTrainType(net: RoadNetwork, segmentId: Id): TrainTypeId {
   const def = net.roadTypeOf(segmentId);
   const spec = trackSpec(def.id);
   if (spec?.metro) return 'metro';
+  // No wires here: a diesel push-pull, as on an American commuter line.
+  const seg = net.getSegment(segmentId);
+  if (segmentElectrification(def, seg?.overrides) === 'none') return 'dieselCommuter';
   if (def.id === 'hsr-double') return 'highspeed';
   return 'emu';
 }
 
 /** Whether a station is under ground when placed here. */
 export function stationKindAt(pos: Vec3): RailStationKind {
-  return pos.y < -1.5 ? 'underground' : 'surface';
+  if (pos.y < surfaceLevel(pos.x, pos.z) - 1.5) return 'underground';
+  // On a viaduct: well clear of the ground under it.
+  return pos.y - terrainHeight(pos.x, pos.z) > 4 ? 'elevated' : 'surface';
+}
+
+export interface PlatformCheck {
+  problems: string[];
+  /** Tightest radius under the platform, metres. */
+  radius: number;
+}
+
+/** Smallest radius a platform may stand on: straight or gently curved track. */
+export const PLATFORM_MIN_RADIUS = 300;
+
+/**
+ * Whether a station fits here: gentle track under the platform, room for an island
+ * to spread, and nothing else (roads, other track, tunnels) inside its footprint.
+ * `reach` is how far the footprint extends either side of the centreline.
+ */
+export function checkPlatform(
+  net: RoadNetwork,
+  segmentId: Id,
+  t: number,
+  length: number,
+  reach: { left: number; right: number },
+  kind: RailStationKind,
+  island: boolean,
+  options: { ignoreStation?: Id } = {},
+): PlatformCheck {
+  const problems: string[] = [];
+  const c = net.cubicOf(segmentId);
+  const curve = net.curveOf(segmentId);
+  const L = curve.length;
+  const at = t * L;
+  // Radius under the platform from the curvature of the Bezier.
+  let radius = Infinity;
+  for (let s = at - length / 2; s <= at + length / 2; s += 10) {
+    const u = Math.max(0, Math.min(1, s / L));
+    const k = Math.abs(curvatureXZ(c, u));
+    if (k > 1e-9) radius = Math.min(radius, 1 / k);
+  }
+  if (radius < PLATFORM_MIN_RADIUS) problems.push(`Platforms need straight or gently curved track: ${Math.round(radius)} m radius here, ${PLATFORM_MIN_RADIUS} m at least`);
+  if (island && (at - length / 2 - 82 < 2 || at + length / 2 + 82 > L - 2)) {
+    problems.push(`An island needs ${Math.round(length + 164)} m of this track to spread round it`);
+  }
+  // Footprint against everything else nearby: plan boxes with a height range.
+  const mine = stationFootprint(net, segmentId, t, length, reach, kind);
+  const own = ownTrack(net, segmentId);
+  const what = kind === 'underground' ? 'station box' : kind === 'elevated' ? 'station deck' : 'platform';
+  let minX = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxZ = -Infinity;
+  for (const bx of mine.boxes) {
+    const r = bx.hl + bx.hw;
+    minX = Math.min(minX, bx.cx - r);
+    maxX = Math.max(maxX, bx.cx + r);
+    minZ = Math.min(minZ, bx.cz - r);
+    maxZ = Math.max(maxZ, bx.cz + r);
+  }
+  for (const st of net.rail.stations) {
+    if (st.id === options.ignoreStation) continue;
+    const other = placedStationFootprint(net, st);
+    if (other && footprintsClash(mine, other)) {
+      problems.push(`The ${what} would overlap ${st.name} station`);
+      break;
+    }
+  }
+  for (const id of net.segmentsInRegion({ minX: minX - 20, minZ: minZ - 20, maxX: maxX + 20, maxZ: maxZ + 20 }, true)) {
+    if (own.has(id)) continue;
+    const def = net.roadTypeOf(id);
+    if (footprintsClash(mine, segmentFootprint(net, id))) {
+      problems.push(`The ${what} would overlap ${def.category === 'rail' ? 'other track' : 'a road'}`);
+      break;
+    }
+  }
+  return { problems, radius };
 }
 
 /**
@@ -118,3 +201,4 @@ export function autoLine(net: RoadNetwork, trains: TrainSim, a: Id, b: Id, draft
   if (check.problem) return { id: null, problem: check.problem, warning: null };
   return { id: net.addLine(init), problem: null, warning: check.warning };
 }
+

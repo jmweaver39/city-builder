@@ -4,9 +4,34 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Cloverleaf</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   </head>
   <body>
     <div id="app"></div>
+    <div id="boot" role="status" aria-live="polite">
+      <div class="boot-card">
+        <svg class="boot-mark" viewBox="0 0 48 48" width="40" height="40" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><circle cx="24" cy="24" r="9"/><path d="M24 3v12M24 33v12M3 24h12M33 24h12"/></g></svg>
+        <div class="boot-name">Cloverleaf</div>
+        <div class="boot-bar"><i></i></div>
+        <div class="boot-note">Loading the road network</div>
+      </div>
+    </div>
+    <style>
+      html, body { margin: 0; height: 100%; background: #101a26; }
+      #boot { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: #101a26; color: #eef4fa;
+        font: 13px/1.4 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; transition: opacity 140ms ease-out; }
+      #boot.done { opacity: 0; pointer-events: none; }
+      .boot-card { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+      .boot-mark { color: #3fcfc6; }
+      .boot-name { font-size: 15px; font-weight: 600; letter-spacing: .02em; }
+      .boot-bar { width: 160px; height: 3px; border-radius: 1px; background: #24364c; overflow: hidden; }
+      .boot-bar i { display: block; width: 40%; height: 100%; border-radius: 1px; background: #3fcfc6; animation: boot 1.1s ease-in-out infinite; }
+      .boot-note { color: #93a8bf; font-size: 12px; }
+      @keyframes boot { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+      @media (prefers-reduced-motion: reduce) { .boot-bar i { animation: none; width: 100%; } }
+    </style>
     <script type="module" src="/src/app/main.ts"></script>
   </body>
 </html>

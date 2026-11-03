@@ -8,9 +8,9 @@ import { Panel } from './Panel';
 
 const WIDTH = 300;
 const HEIGHT = 92;
-const LINE = '#38bdf8';
-const GRID = 'rgba(150, 190, 235, 0.14)';
-const AXIS_INK = '#7c92ae';
+const LINE = '#3fcfc6';
+const GRID = 'rgba(188, 202, 218, 0.14)';
+const AXIS_INK = '#93a8bf';
 
 type HistoryPoint = { time: number; throughput: number; flow: number; active: number };
 
@@ -103,14 +103,14 @@ class Chart {
     let best = this.data[0];
     for (const p of this.data) if (Math.abs(X(p.time) - this.hoverX) < Math.abs(X(best.time) - this.hoverX)) best = p;
     const hx = X(best.time);
-    ctx.strokeStyle = 'rgba(233, 241, 251, 0.45)';
+    ctx.strokeStyle = 'rgba(238, 244, 250, 0.45)';
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(hx + 0.5, pad.top);
     ctx.lineTo(hx + 0.5, pad.top + h);
     ctx.stroke();
     ctx.fillStyle = LINE;
-    ctx.strokeStyle = '#12203a';
+    ctx.strokeStyle = '#21324a';
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(hx, Y(this.value(best)), 4, 0, Math.PI * 2);
@@ -168,5 +168,7 @@ export class StatsPanel {
     for (const c of this.charts) c.update(data);
     const s = sim.stats();
     this.note.textContent = `Spawned ${s.spawnedTotal.toLocaleString()}, arrived ${s.arrivedTotal.toLocaleString()}, removed stuck ${s.despawnedStuck.toLocaleString()}. Mean trip ${Math.round(s.meanTripSec)} s.`;
+    const peds = this.ui.peds;
+    if (peds) this.note.textContent += ` Pedestrians in view ${peds.count.toLocaleString()}, crossings ${peds.counts.crossed.toLocaleString()}, times traffic held ${peds.counts.held.toLocaleString()}.`;
   }
 }

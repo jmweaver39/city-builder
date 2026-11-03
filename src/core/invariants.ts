@@ -136,6 +136,13 @@ export function checkNetworkInvariants(net: RoadNetwork): string[] {
       }
     }
   }
+  for (const seg of net.segments) {
+    for (const m of seg.overrides.handMarkings ?? []) {
+      for (const a of m.kind === 'line' ? [m.from, m.to] : m.anchors) {
+        if (a.segmentId !== seg.id || (a.end !== 'a' && a.end !== 'b')) say(`marking ${m.id} on segment ${seg.id} has an anchor off its ends`);
+      }
+    }
+  }
   if (graph.byKey.size !== graph.lanes.length) say('byKey has duplicate keys');
   for (const id of graph.roadLanes.keys()) if (!segIds.has(id)) say(`roadLanes has stale segment ${id}`);
   for (const id of graph.connectorsAt.keys()) if (!nodeIds.has(id)) say(`connectorsAt has stale node ${id}`);

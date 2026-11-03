@@ -17,7 +17,7 @@ const ZONE_OFFSET = 1;
 /** A truck waiting at a stop line is this much wider, each side, than the car allowed for. */
 const WAITING_EXTRA = 0.4;
 /** Zone points along the other path: each covers its margins and a car's length. */
-const OTHER_SPACING = 8;
+const OTHER_SPACING = 10;
 /** How much of each exit lane a swinging tail is checked against. */
 const EXIT_REACH = 16;
 
@@ -111,6 +111,8 @@ function sweepBody(
   const SWEEP_LENGTH = body.length;
   const SWEEP_CLEARANCE = body.clearance;
   const all = body === CAR;
+  // A zone point covers its margins and a body length past itself.
+  const bucket = Math.max(SWEEP_LENGTH, 8);
   // Besides other connectors, the first stretch of each exit lane: a queue there sits
   // right beside where a long tail swings out of the junction.
   const exits = [...new Set(lanes.map((l) => l.toLane))];
@@ -180,7 +182,7 @@ function sweepBody(
           const at = (target.length * i) / (sample.count - 1);
           let pairs = seen.get(b);
           if (!pairs) seen.set(b, (pairs = new Map()));
-          const key = Math.floor(s / SWEEP_LENGTH) * 4096 + Math.floor(at / OTHER_SPACING);
+          const key = Math.floor(s / bucket) * 4096 + Math.floor(at / OTHER_SPACING);
           const hit = pairs.get(key);
           if (!hit) pairs.set(key, { aS: s, bS: at });
           else {

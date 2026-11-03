@@ -6,6 +6,7 @@ import {
   findRoundabouts,
   planRoundabout,
   removeRoundabout,
+  roundaboutIslands,
   updateRoundabout,
   type RoundaboutParams,
 } from '../../src/core/roundabout';
@@ -178,6 +179,34 @@ describe('roundabouts', () => {
     expect(middle).toBeDefined();
     expect(Math.hypot(middle!.pos.x, middle!.pos.z)).toBeLessThan(0.01);
     expectClean(net);
+  });
+
+  it('puts a central island in the ring and a splitter on every two-way arm, clear of the lanes', () => {
+    const { net, node } = crossing('avenue-4');
+    buildRoundabout(net, planRoundabout(net, v(0, 0), params({ radius: 34, lanes: 2 }), node));
+    const [rb] = findRoundabouts(net);
+    const islands = roundaboutIslands(net, rb);
+    const ringHalf = net.roadTypeOf(rb.segments[0]).halfWidth;
+    expect(islands.central.radius).toBeLessThan(rb.radius - ringHalf);
+    expect(islands.central.radius).toBeGreaterThan(rb.radius - ringHalf - 2);
+    expect(islands.splitters).toHaveLength(4);
+    const inside = (p: { x: number; z: number }, poly: { x: number; z: number }[]) => {
+      let hit = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const a = poly[i];
+        const b = poly[j];
+        if (a.z > p.z !== b.z > p.z && p.x < ((b.x - a.x) * (p.z - a.z)) / (b.z - a.z) + a.x) hit = !hit;
+      }
+      return hit;
+    };
+    // No vehicle path, on a connector or a road lane, runs through an island.
+    for (const lane of net.laneGraph.lanes) {
+      for (let i = 0; i < lane.pts.length; i += 3) {
+        const p = { x: lane.pts[i], z: lane.pts[i + 2] };
+        for (const poly of islands.splitters) expect(inside(p, poly), lane.key).toBe(false);
+        expect(Math.hypot(p.x, p.z)).toBeGreaterThan(islands.central.radius);
+      }
+    }
   });
 
   it('is one undo step', () => {

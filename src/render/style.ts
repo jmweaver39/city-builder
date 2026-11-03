@@ -79,6 +79,29 @@ export const PALETTE = {
   cloud: 0xffffff,
 } as const;
 
+/**
+ * Facade, roof and trim colours for buildings, sRGB hex, by material. Realistic
+ * and muted: the facade textures carry the detail, these set the colour.
+ */
+export const BUILDING_COLOURS = {
+  brick: [0x8a4a36, 0x9c5a40, 0x7a3e30, 0x6e4a3a, 0xa86a4a, 0xc2a27a, 0x8e5a48],
+  stone: [0xcfc6b2, 0xbdb5a2, 0xd9d2c2, 0xc4b89c, 0xb0a894],
+  concrete: [0xb5b2ab, 0xa7a59f, 0xc4c0b6, 0x9c9a94, 0xbab4a6],
+  stucco: [0xe6dccb, 0xd9c7a8, 0xe9e4da, 0xc9b79a, 0xd8cfc0, 0xb8b4a4, 0xe0c9b0],
+  siding: [0xe8e6df, 0xa9b7bf, 0xc7b896, 0x8a9a88, 0xd8d4c8, 0x9aa4ac],
+  glass: [0x5d7a8a, 0x6e8696, 0x7a6e60, 0x8f9aa2, 0x4f6a78, 0x6a7f7a],
+  roofTile: [0xa0523e, 0x8c4a3a, 0xb06a4c, 0x7a4636],
+  roofSlate: [0x4e535a, 0x5a5550, 0x45484c, 0x605c58],
+  flatRoof: [0x8e8d88, 0x6f6e6a, 0xc9c8c2, 0x9a958a, 0x7c7a74],
+  metal: [0xb8bcbe, 0x8c9498, 0xc4c0b4, 0x6a7a84, 0x9aa4a0, 0x7c6a5c],
+  trim: [0xe8e4da, 0xd6d0c2, 0x3a3c3e],
+  frame: [0xeeeeea, 0x2e3034, 0x5a5e62, 0x6a4e3a],
+  sign: [0x2a4a3a, 0x6a2a2a, 0x22324a, 0x1e1e20, 0xd8cfb8, 0x7a5a2a],
+  hvac: 0xb8bbbd,
+  tank: 0x6a5240,
+  door: 0x3a2c22,
+} as const;
+
 export type PaletteKey = keyof typeof PALETTE;
 
 /** Palette entry as linear RGB, for vertex colours. */
@@ -91,10 +114,13 @@ export function color(key: PaletteKey): THREE.Color {
   return new THREE.Color(PALETTE[key]);
 }
 
-/** Bright, slightly saturated body colours for vehicles. Linear RGB, 16 entries. */
+/**
+ * Car paint as real traffic has it: mostly white, silver, grey and black, then
+ * dark blues and reds, a few brighter colours. Linear RGB, 16 entries.
+ */
 export const BODY_COLOURS: RGB[] = [
-  0xf2f0ea, 0xd2d6da, 0x9aa0a6, 0x30343a, 0xd8382c, 0xec7a30, 0xf2c23a, 0x6aaa48, 0x2f9a6a, 0x34a8c4, 0x2f6ec8, 0x4a52b8, 0x8a4ab0, 0xe05a8c,
-  0x9a6a46, 0x1e4a7a,
+  0xeeeeea, 0xe4e4e0, 0xb8bcc0, 0x9aa0a6, 0x6a6e72, 0x2a2c30, 0x1a1b1e, 0xc4c6c8, 0x8a1e1e, 0xa8302a, 0x1e3456, 0x2a4a7a, 0x3a4a3a, 0x5a4a3a,
+  0xd8c8a0, 0x2f6ec8,
 ].map(hexRGB);
 
 /** Asphalt varies a little by road class, so the hierarchy reads from above. */

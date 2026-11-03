@@ -10,7 +10,8 @@ import {
   MANDATORY_PERIOD_STEPS,
 } from './constants';
 import { dropClaim } from './junctions';
-import { allowBit, tableOf } from './pathing';
+import { allowBit, pickNext, tableOf } from './pathing';
+import { LONG_BODY } from './constants';
 import type { World } from './world';
 
 const POLITENESS = 0.3;
@@ -23,6 +24,13 @@ const NO_DISCRETIONARY_DIST = 60;
 const MIN_LANE_ENTRY = 3;
 /** Two changes into one lane in one step must be at least this far apart. */
 const TAKEN_RANGE = 40;
+const DISCRETIONARY_MIN_SPEED = 4;
+/** Room kept from bodies on a lane sharing space, metres. */
+const SHARE_MARGIN = 6;
+/** A merge this close ahead is checked before changing into its lane. */
+const MERGE_LOOK = 150;
+const MERGE_BRAKE = 3;
+const CREEP_CLEARANCE = 0.6;
 /** A must-take driver matches traffic this close in the lane it needs, plus a margin. */
 const SEEK_RANGE = 60;
 const SEEK_MARGIN = 3.5;
@@ -36,7 +44,7 @@ let backU = -1;
 
 /** Road a vehicle needs ahead of it to change lanes at all, tight as that is. */
 export function laneChangeRoom(length: number): number {
-  return 10 + length;
+  return 6 + length * 0.5;
 }
 
 /** The vehicles around position `at` on lane `t`, for a body of length `length`. */
@@ -80,6 +88,58 @@ function lookAt(w: World, v: number, t: number, at: number, length: number): voi
     }
     if (eT[e] !== ENTRY_GHOST) break;
   }
+}
+
+/**
+ * Would a body of this length at `at` on `target` sit beside someone on a lane sharing
+ * its space? Lane lists of the target alone do not show them.
+ */
+function sharedOccupied(w: World, v: number, target: number, at: number, length: number): boolean {
+  const { g, bk, veh } = w;
+  const { shareStart, shareLane, shareFrom, shareTo, shareOffset } = g;
+  for (let q = shareStart[target]; q < shareStart[target + 1]; q++) {
+    if (at < shareFrom[q] - SHARE_MARGIN || at - length > shareTo[q] + SHARE_MARGIN) continue;
+    const other = shareLane[q];
+    for (let e = bk.start[other]; e < bk.start[other + 1]; e++) {
+      const u = bk.eV[e];
+      if (u === v || g.shareGap[q] >= veh.halfWidth[v] + veh.halfWidth[u] + 0.3) continue;
+      const front = bk.eS[e] - shareOffset[q];
+      if (front > at - length - SHARE_MARGIN && front - veh.len[u] < at + SHARE_MARGIN) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Would changing into `target` at `at` put this vehicle into a merge just ahead out of
+ * order with a body already on another feeder? Merge ordering cannot recover from that
+ * if it happens late: on converging paths the two bodies end up side by side.
+ */
+function mergeClash(w: World, v: number, target: number, at: number): boolean {
+  const { g, bk, veh } = w;
+  const c = pickNext(w, v, target);
+  if (c < 0 || !g.isConn[c]) return false;
+  const toEnd = g.len[target] - at + g.len[c];
+  if (toEnd > MERGE_LOOK) return false;
+  const x = g.toLane[c];
+  const sp = veh.v[v];
+  const stopping = (sp * sp) / (2 * MERGE_BRAKE);
+  for (let k = g.prevStart[x]; k < g.prevStart[x + 1]; k++) {
+    const d = g.prevList[k];
+    if (d === c || !g.isConn[d]) continue;
+    for (let e = bk.start[d]; e < bk.start[d + 1]; e++) {
+      const t = bk.eT[e];
+      if (t === ENTRY_REQUEST || t === ENTRY_GHOST) continue;
+      const u = bk.eV[e];
+      const theirs = g.len[d] - bk.eS[e];
+      const extra = veh.len[u] >= LONG_BODY || veh.len[v] >= LONG_BODY ? 5 : 0;
+      // Ahead of me at the merge: I must be able to drop in behind it, braking gently.
+      if (theirs <= toEnd && toEnd - theirs - veh.len[u] - extra < stopping + veh.minGap[v]) return true;
+      // Behind me: it must be able to drop in behind me.
+      if (theirs > toEnd && theirs - toEnd - veh.len[v] - extra < (veh.v[u] * veh.v[u]) / (2 * MERGE_BRAKE) + veh.minGap[u]) return true;
+    }
+  }
+  return false;
 }
 
 /** Has someone already moved in near here this step, from the other side? */
@@ -153,6 +213,7 @@ function tryMandatory(w: World, v: number, dir: number, urgency: number): void {
   if (justTaken(w, target, at)) return;
   const length = veh.len[v];
   if (g.len[target] - at < laneChangeRoom(length)) return;
+  if (sharedOccupied(w, v, target, at, length) || mergeClash(w, v, target, at)) return;
   lookAt(w, v, target, at, length);
   const sp = veh.v[v];
   const relaxed = 1 - urgency;
@@ -180,6 +241,8 @@ function tryDiscretionary(w: World, v: number): void {
   const l = veh.lane[v];
   const pos = veh.s[v];
   if (veh.lcCool[v] > 0 || g.len[l] - pos < NO_DISCRETIONARY_DIST || pos < veh.len[v] + MIN_LANE_ENTRY) return;
+  // Not for speed in a stopped queue: swapping lanes there only knots it up.
+  if (veh.v[v] < DISCRETIONARY_MIN_SPEED) return;
   const leftLane = g.left[l];
   const rightLane = g.right[l];
   if (leftLane < 0 && rightLane < 0) return;
@@ -201,6 +264,7 @@ function tryDiscretionary(w: World, v: number): void {
     if (!(table[base + target] <= here + LANE_CHANGE_COST_SEC * 0.34)) continue;
     const at = (pos * g.len[target]) / g.len[l];
     if (justTaken(w, target, at)) continue;
+    if (sharedOccupied(w, v, target, at, length) || mergeClash(w, v, target, at)) continue;
     lookAt(w, v, target, at, length);
     if (frontGap < 2.5 + Math.max(0, sp - frontV) * 1.2) continue;
     if (backGap < 3 + Math.max(0, backV - sp) * 1.5) continue;
@@ -221,11 +285,18 @@ function tryDiscretionary(w: World, v: number): void {
 
 export function laneChangePass(w: World): void {
   const { veh, g, tick } = w;
-  const { live, lane, needDir, needDist, needCount, needMust, reqLane, lcSec, seekV } = veh;
+  const { live, lane, needDir, needDist, needCount, needMust, reqLane, lcSec, seekV, lcPause } = veh;
   const count = veh.liveCount;
   for (let i = 0; i < count; i++) {
     const v = live[i];
     const l = lane[v];
+    // Creeping across at a standstill, the gap checked at the start may have closed:
+    // pause the slide until the body fits again, rather than nose into a neighbour.
+    lcPause[v] = 0;
+    if (lcSec[v] > 0 && veh.v[v] < 1) {
+      lookAt(w, v, l, veh.s[v], veh.len[v]);
+      if (frontGap < CREEP_CLEARANCE || backGap < CREEP_CLEARANCE) lcPause[v] = 1;
+    }
     if (g.isConn[l]) {
       reqLane[v] = -1;
       seekV[v] = Infinity;

@@ -3,6 +3,9 @@ import { LANE_CHANGE_SEC } from './constants';
 import type { CompiledGraph } from './compiled';
 import type { VehicleStore } from './vehicles';
 
+/** Most a lane change may turn a body, as this over its length: 0.5 m of swing at each end. */
+const MAX_NUDGE_LENGTH = 1;
+
 let px = 0;
 let py = 0;
 let pz = 0;
@@ -78,7 +81,13 @@ export function placeVehicle(g: CompiledGraph, veh: VehicleStore, k: number): vo
       cz += ux * off;
       // Nose towards the target lane: the slope of the path across it. This must depend
       // only on state the safety pass restores, never on speed.
-      h += (veh.latStart[k] * 6 * t * (1 - t)) / veh.lcLen[k];
+      // Capped by body length: on a tight change a long body's ends would otherwise swing
+      // into the next lane. Then it slides across more than it turns.
+      let nudge = (veh.latStart[k] * 6 * t * (1 - t)) / veh.lcLen[k];
+      const cap = MAX_NUDGE_LENGTH / veh.len[k];
+      if (nudge > cap) nudge = cap;
+      else if (nudge < -cap) nudge = -cap;
+      h += nudge;
     }
   }
   veh.wx[k] = cx;

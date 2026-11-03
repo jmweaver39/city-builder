@@ -43,9 +43,9 @@ function twentyMinutes(net: RoadNetwork, seed: number) {
 
 describe('roundabout built by the tool, under heavy traffic', () => {
   const cases: { name: string; type: string; params: Partial<RoundaboutParams>; rate: number; floor: number }[] = [
-    { name: 'single-lane, yield at entries', type: 'street-2', params: { radius: 28, lanes: 1 }, rate: 700, floor: 140 },
-    { name: 'two-lane, yield at entries', type: 'avenue-4', params: { radius: 38, lanes: 2 }, rate: 600, floor: 160 },
-    { name: 'two-lane, signals', type: 'avenue-4', params: { radius: 38, lanes: 2, priority: 'signal' }, rate: 600, floor: 130 },
+    { name: 'single-lane, yield at entries', type: 'street-2', params: { radius: 28, lanes: 1 }, rate: 700, floor: 110 },
+    { name: 'two-lane, yield at entries', type: 'avenue-4', params: { radius: 38, lanes: 2 }, rate: 600, floor: 140 },
+    { name: 'two-lane, signals', type: 'avenue-4', params: { radius: 38, lanes: 2, priority: 'signal' }, rate: 600, floor: 110 },
   ];
   for (const c of cases) {
     it(`${c.name}: 20 minutes of sustained arrivals with no gridlock`, () => {

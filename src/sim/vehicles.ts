@@ -20,10 +20,10 @@ const FLOAT_FIELDS = [
 const INT_FIELDS = [
   'id', 'lane', 'prev1', 'prev2', 'ptIdx', 'dest', 'source', 'nextLane', 'permit',
   'claimNext', 'claimPrev', 'lcFrom', 'reqLane', 'noiseSeed', 'vlTick', 'readyTick', 'stratTick', 'seen', 'enterTick',
-  'spawnTick', 'lane0', 'prev10', 'prev20', 'lcFrom0', 'gridNext',
+  'spawnTick', 'lane0', 'prev10', 'prev20', 'lcFrom0', 'gridNext', 'guardFor',
 ] as const;
 
-const BYTE_FIELDS = ['alive', 'type', 'color', 'needMust', 'needCount', 'denied', 'held'] as const;
+const BYTE_FIELDS = ['alive', 'type', 'color', 'needMust', 'needCount', 'denied', 'held', 'claimWait', 'lcPause'] as const;
 const SBYTE_FIELDS = ['needDir', 'blink'] as const;
 
 type FloatField = (typeof FLOAT_FIELDS)[number];

@@ -29,6 +29,7 @@ import type { NetworkChange } from '../core/RoadNetwork';
 import type { ToolMark } from '../render/api';
 import { castRay, chooseHit, isJunctionNode, metresPerPixel, pickNode } from './pick';
 import { Tool } from './Tool';
+import { MOD_KEY } from './platform';
 import { COLORS, type ToolId, type ToolKey, type ToolPointer } from './types';
 
 /** Wheel travel per metre of radius. A mouse notch is about 100. */
@@ -78,9 +79,14 @@ export class RoundaboutTool extends Tool {
     const { net, view, settings } = this.ctx;
     const marks: ToolMark[] = [];
     const sel = this.selection;
+    // A thin dashed outline just outside the ring: no fill over a roundabout being edited.
     const ringMark = (rb: Roundabout, color: string) => {
-      const half = totalHalfWidth(net.roadTypeOf(rb.segments[0]));
-      marks.push({ kind: 'ring', pos: rb.centre, color, radius: rb.radius + half + 1.5 });
+      const r = rb.radius + totalHalfWidth(net.roadTypeOf(rb.segments[0])) + 2;
+      const points = Array.from({ length: 73 }, (_, i) => {
+        const a = (i / 72) * Math.PI * 2;
+        return { x: rb.centre.x + Math.cos(a) * r, y: rb.centre.y, z: rb.centre.z + Math.sin(a) * r };
+      });
+      marks.push({ kind: 'line', points, color, width: 0.5, dashed: true });
     };
     if (sel) ringMark(sel, COLORS.neutral);
     view.setPreview([]);
@@ -128,7 +134,7 @@ export class RoundaboutTool extends Tool {
         x: e.x,
         y: e.y,
         lines: ['Roundabout', `${Math.round(p.params.radius)} m radius, ${lanes}`, what],
-        notes: p.ok ? ['Click to build. Wheel changes radius, Ctrl+wheel zooms'] : p.reasons,
+        notes: p.ok ? [`Click to build. Wheel changes radius, ${MOD_KEY}+wheel zooms`] : p.reasons,
         tone: p.ok ? 'ok' : 'error',
       });
       return;

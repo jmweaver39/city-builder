@@ -11,6 +11,7 @@ import {
   pathPoints,
   resolveDecal,
   roadPathBetween,
+  straightPathBetween,
   rotationFacing,
   visibleSpan,
   type Decal,
@@ -129,7 +130,7 @@ describe('Paths along a road', () => {
     expect(pts[pts.length - 1].x).toBeCloseTo(300, 6);
   });
 
-  it('goes straight on through a junction and refuses a turn', () => {
+  it('goes straight on through a junction, and turns there when it must', () => {
     const net = new RoadNetwork();
     net.drawRoad({ start: free(-100, 0), end: free(100, 0), roadType: 'street-4' });
     const r = net.drawRoad({ start: free(0, -100), end: free(0, 100), roadType: 'street-4' });
@@ -138,7 +139,10 @@ describe('Paths along a road', () => {
     const at = (x: number, z: number) => arms.find((a) => a.dir.x * x + a.dir.z * z > 0.9)!.segmentId;
     expect(nextAlongRoad(net, at(1, 0), node)).toBe(at(-1, 0));
     expect(roadPathBetween(net, { segmentId: at(1, 0), t: 0.5 }, { segmentId: at(-1, 0), t: 0.5 })).not.toBeNull();
-    expect(roadPathBetween(net, { segmentId: at(1, 0), t: 0.5 }, { segmentId: at(0, 1), t: 0.5 })).toBeNull();
+    expect(straightPathBetween(net, { segmentId: at(1, 0), t: 0.5 }, { segmentId: at(0, 1), t: 0.5 })).toBeNull();
+    // Two arms of one junction always join, turning at it.
+    const turn = roadPathBetween(net, { segmentId: at(1, 0), t: 0.5 }, { segmentId: at(0, 1), t: 0.5 })!;
+    expect(turn.map((p) => p.segmentId)).toEqual([at(1, 0), at(0, 1)]);
   });
 
   it('is null for roads that do not connect', () => {

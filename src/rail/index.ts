@@ -8,3 +8,4 @@ export * from './TrackPath';
 export * from './TrainSim';
 export * from './lines';
 export * from './demo';
+export * from './footprint';

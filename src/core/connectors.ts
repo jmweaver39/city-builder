@@ -627,7 +627,7 @@ export function connectorCubic(from: Pick<LaneEnd, 'pos' | 'tan'>, to: Pick<Lane
   if (Math.abs(denom) > 0.05) {
     // Corner where the two lane lines meet: p0 + d0 u = p3 - d3 v.
     const u = (dx * d3.z - dz * d3.x) / denom;
-    const v = (dx * d0.z - dz * d0.x) / denom;
+    const v = (d0.x * dz - d0.z * dx) / denom;
     if (u > 0 && v > 0 && u < chord * 4 && v < chord * 4) {
       // The floor stops a lopsided corner bunching all its turn at one end.
       h0 = Math.max(0.6 * u, 0.3 * chord);
@@ -691,9 +691,10 @@ export function connectorKey(nodeId: Id, link: LaneLinkSpec): string {
 }
 
 /** Build the connector for a link, or null if the two ends coincide. */
-export function buildConnector(nodeId: Id, link: LaneLinkSpec): ConnectorProto | null {
+export function buildConnector(nodeId: Id, link: LaneLinkSpec, cubic?: Cubic): ConnectorProto | null {
   const { from, to, turn } = link;
-  const sampled = sampleConnector(connectorCubic(from, to));
+  // `cubic` replaces the usual curve, as when a shaped junction's kerb makes a turn swing wide.
+  const sampled = sampleConnector(cubic ?? connectorCubic(from, to));
   if (!sampled) return null;
   let speed = Math.min(from.speed, to.speed);
   const rail = from.kind === 'rail';

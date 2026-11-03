@@ -7,7 +7,7 @@ import * as THREE from 'three';
 import type { Id, NodeArm, NodeGeom, Vec3 } from '../core/types';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { sidewalkOn } from '../core/roadTypes';
-import { terrainHeight } from '../core/terrain';
+import { groundHeight } from '../core/terrainMods';
 import type { SurfBuf, SurfStyle } from './batch';
 import {
   BIAS_JUNCTION,
@@ -25,6 +25,8 @@ import {
 } from './constants';
 import { surfaceColour, type RoadOutputs } from './roads';
 import { addPierAt } from './structures';
+import { buildJunctionIslands, cornerKerbs } from './junctionShape';
+import { kerbLeftOf, kerbRightOf } from '../core/junctionShape';
 
 type Pt = { x: number; y: number; z: number };
 
@@ -291,7 +293,7 @@ function buildDeadEnd(net: RoadNetwork, g: NodeGeom, slot: number, out: RoadOutp
   };
   const inner = arc(H);
   fillPolygon(out.surf, inner, ROAD_LIFT, { color: surfaceColour(net.getSegment(arm.segmentId), net.roadTypeOf(arm.segmentId)), kind: KIND_JUNCTION, slot, bias: 0 });
-  const clearance = y - terrainHeight(arm.centre.x, arm.centre.z);
+  const clearance = y - groundHeight(net, arm.centre.x, arm.centre.z);
   const kerb = W > 0 ? KERB_HEIGHT : 0;
   buildCorner(out.surf, inner, arc(H + W), kerb, kerb, { slot, clearance, ground: y - clearance });
   if (clearance > 0.08) {
@@ -316,7 +318,7 @@ export function buildJunction(net: RoadNetwork, id: Id, slot: number, out: RoadO
   const surf = out.surf;
   fillPolygon(surf, g.outline, ROAD_LIFT, { color: junctionColour(net, g), kind: KIND_JUNCTION, slot, bias: BIAS_JUNCTION });
 
-  const ground = terrainHeight(node.pos.x, node.pos.z);
+  const ground = groundHeight(net, node.pos.x, node.pos.z);
   const clearance = node.pos.y - ground;
   const n = g.arms.length;
   const edges = g.arms.map((a) => armEdges(net, a));
@@ -324,14 +326,16 @@ export function buildJunction(net: RoadNetwork, id: Id, slot: number, out: RoadO
   for (let i = 0; i < n; i++) {
     const a = edges[i];
     const b = edges[(i + 1) % n];
-    const innerChain = walk(g.outline, findPoint(g.outline, a.arm.leftEdge), findPoint(g.outline, b.arm.rightEdge));
+    const innerChain = walk(g.outline, findPoint(g.outline, kerbLeftOf(a.arm)), findPoint(g.outline, kerbRightOf(b.arm)));
     const outerChain = walk(g.outerOutline, findPoint(g.outerOutline, a.outerLeft), findPoint(g.outerOutline, b.outerRight));
     if (!innerChain || !outerChain) {
       failed = true;
       continue;
     }
-    buildCorner(surf, innerChain, outerChain, a.walkLeft > 0 ? KERB_HEIGHT : 0, b.walkRight > 0 ? KERB_HEIGHT : 0, { slot, clearance, ground });
+    const [kerbA, kerbB] = cornerKerbs(net, id, a.arm, b.arm, a.walkLeft > 0 ? KERB_HEIGHT : 0, b.walkRight > 0 ? KERB_HEIGHT : 0);
+    buildCorner(surf, innerChain, outerChain, kerbA, kerbB, { slot, clearance, ground });
   }
+  buildJunctionIslands(net, id, slot, surf);
   // Hull fallback: no corners to follow, so lay the sidewalk flat under the road.
   if ((failed || g.outlineSimplified) && edges.some((e) => e.sidewalk > 0)) {
     fillPolygon(surf, g.outerOutline, ROAD_LIFT - 0.012, { color: COL.sidewalk, kind: KIND_SIDEWALK, slot, bias: 0 });

@@ -345,7 +345,9 @@ function singleCurve(end: { x: number; z: number }, sigma: 1 | -1, sweep: number
   if (trail) options.push({ t0: 0, t1: trail.t, R: trail.R });
   for (const o of options) {
     if (!(o.R > 1e-6) || o.t0 < -1e-6 || o.t1 < -1e-6) continue;
-    if (best && best.radius >= o.R) continue;
+    // A bend takes the largest radius that fits. A loop could grow without limit on
+    // ever longer straights, so it takes the compact one, with no straight on one side.
+    if (best && (sweep > Math.PI ? best.radius <= o.R : best.radius >= o.R)) continue;
     const els = [lineEl(Math.max(0, o.t0)), ...scaleElements(unit, o.R), lineEl(Math.max(0, o.t1))];
     best = { kind: sweep > Math.PI ? 'loop' : 'curve', elements: els, radius: o.R, sweep: sigma * sweep };
   }

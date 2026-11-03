@@ -12,6 +12,7 @@ import type { NearestSegment, RoadNetwork } from '../core/RoadNetwork';
 import { resolveDecal } from '../core/roadPaint';
 import { totalHalfWidth } from '../core/roadTypes';
 import { ELEVATION_STEP, terrainHeight } from '../core/terrain';
+import { groundHeight } from '../core/terrainMods';
 import type { Decal, Id, TrafficEndpoint, Vec3 } from '../core/types';
 import type { ToolContext, ToolPointer } from './types';
 
@@ -139,8 +140,10 @@ function isUnderground(ctx: ToolContext): boolean {
   return ctx.view.getUnderground?.() ?? false;
 }
 
-function hiddenTunnel(p: Vec3, underground: boolean): boolean {
-  return !underground && p.y - terrainHeight(p.x, p.z) < -TUNNEL_DEPTH;
+/** Below the ground as reshaped by cuts and trenches, so a road in an open trench stays clickable. */
+function hiddenTunnel(p: Vec3, underground: boolean, net?: RoadNetwork): boolean {
+  if (underground) return false;
+  return p.y - (net ? groundHeight(net, p.x, p.z) : terrainHeight(p.x, p.z)) < -TUNNEL_DEPTH;
 }
 
 /** Ids near the ray's ground track between the highest and lowest roads. */
@@ -190,7 +193,7 @@ function castSegment(net: RoadNetwork, id: Id, ray: Ray, slack: number, undergro
   for (let i = 0; i + 1 < st.length; i++) {
     const p0 = st[i].pos;
     const p1 = st[i + 1].pos;
-    if (hiddenTunnel(p0, underground) && hiddenTunnel(p1, underground)) continue;
+    if (hiddenTunnel(p0, underground, net) && hiddenTunnel(p1, underground, net)) continue;
     const ax = p1.x - p0.x;
     const az = p1.z - p0.z;
     const len = Math.hypot(ax, az);
@@ -235,7 +238,7 @@ function castNode(net: RoadNetwork, id: Id, ray: Ray, slack: number, underground
   const node = net.getNode(id);
   const geom = net.nodeGeom(id);
   if (!node || !geom || geom.kind === 'empty') return null;
-  if (hiddenTunnel(node.pos, underground)) return null;
+  if (hiddenTunnel(node.pos, underground, net)) return null;
   const hit = rayAtY(ray, node.pos.y);
   if (!hit) return null;
   let miss: number;
@@ -373,7 +376,7 @@ export function nodesNearRay(ctx: ToolContext, e: Pick<ToolPointer, 'x' | 'y'>, 
   const underground = isUnderground(ctx);
   for (const id of candidates(ctx.net, ray).nodes) {
     const node = ctx.net.getNode(id)!;
-    if (hiddenTunnel(node.pos, underground)) continue;
+    if (hiddenTunnel(node.pos, underground, ctx.net)) continue;
     const hit = rayAtY(ray, node.pos.y);
     if (!hit) continue;
     const d = distXZ(hit.point, node.pos);

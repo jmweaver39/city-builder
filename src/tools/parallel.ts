@@ -13,7 +13,6 @@ import { distXZ } from '../core/math';
 import type { RoadAnchor, RoadNetwork } from '../core/RoadNetwork';
 import { isOneWay, totalHalfWidth } from '../core/roadTypes';
 import type { Id, Vec3 } from '../core/types';
-import { resolveEndAnchor } from './guides';
 
 /** Largest plan distance between a fitted offset and the true offset, metres. */
 export const PARALLEL_TOLERANCE = 0.03;
@@ -297,4 +296,90 @@ export function buildParallel(net: RoadNetwork, plan: ParallelPlan): Id[] {
 /** Length of a chain, metres. */
 export function chainLength(net: RoadNetwork, chain: readonly ChainStep[]): number {
   return chain.reduce((sum, s) => sum + cubicLength(net.cubicOf(s.segmentId), 32), 0);
+}
+
+/**
+ * The existing node or road a new road's end lands on, or a free point. Within a
+ * road's half width counts, so a road drawn up to another joins it.
+ */
+export function resolveEndAnchor(net: RoadNetwork, p: Vec3, roadType: string, ignore?: ReadonlySet<Id>): RoadAnchor {
+  const near = net.nearestNode(p, 3);
+  const node = near ? net.getNode(near.nodeId) : undefined;
+  if (node && Math.abs(node.pos.y - p.y) < 1.5) return { kind: 'node', id: node.id };
+  void roadType;
+  let best: { id: Id; t: number; d: number } | null = null;
+  for (const id of net.segmentsInRegion({ minX: p.x - 30, minZ: p.z - 30, maxX: p.x + 30, maxZ: p.z + 30 }, true)) {
+    if (ignore?.has(id)) continue;
+    const c = net.cubicOf(id);
+    const hit = closestPointOnCubic(c, p);
+    if (Math.abs(hit.point.y - p.y) > 1.5) continue;
+    const tol = totalHalfWidth(net.roadTypeOf(id)) + 1;
+    if (hit.distance > tol || (best && hit.distance >= best.d)) continue;
+    best = { id, t: hit.t, d: hit.distance };
+  }
+  if (best) {
+    const seg = net.getSegment(best.id)!;
+    const len = net.segmentGeom(best.id)?.fullLength ?? 0;
+    if (best.t * len < 6) return { kind: 'node', id: seg.a };
+    if ((1 - best.t) * len < 6) return { kind: 'node', id: seg.b };
+    return { kind: 'segment', id: best.id, t: best.t };
+  }
+  return { kind: 'free', pos: { ...p } };
+}
+
+/**
+ * One cubic through ordered points, leaving along `t0` and arriving along `t3`
+ * (handles by least squares at chord-length parameters), with its worst error.
+ */
+export function fitThrough(points: readonly Vec3[], t0: Vec3, t3: Vec3): { cubic: Cubic; error: number } {
+  const a = points[0];
+  const b = points[points.length - 1];
+  const cum = [0];
+  for (let i = 1; i < points.length; i++) cum.push(cum[i - 1] + distXZ(points[i - 1], points[i]));
+  const total = Math.max(cum[cum.length - 1], 1e-9);
+  let params = cum.map((s) => s / total);
+  const chord = distXZ(a, b);
+  const dot = t0.x * t3.x + t0.z * t3.z;
+  const solve = (us: number[]): Cubic => {
+    let a11 = 0, a12 = 0, a22 = 0, r1 = 0, r2 = 0;
+    for (let i = 1; i < points.length - 1; i++) {
+      const u = us[i];
+      const q = points[i];
+      const v = 1 - u;
+      const b0 = v * v * v, b1 = 3 * u * v * v, b2 = 3 * u * u * v, b3 = u * u * u;
+      const rx = q.x - a.x * (b0 + b1) - b.x * (b2 + b3);
+      const rz = q.z - a.z * (b0 + b1) - b.z * (b2 + b3);
+      a11 += b1 * b1;
+      a12 -= b1 * b2 * dot;
+      a22 += b2 * b2;
+      r1 += b1 * (t0.x * rx + t0.z * rz);
+      r2 -= b2 * (t3.x * rx + t3.z * rz);
+    }
+    const det = a11 * a22 - a12 * a12;
+    let h0 = chord / 3;
+    let h3 = chord / 3;
+    if (Math.abs(det) > 1e-12) {
+      h0 = (r1 * a22 - r2 * a12) / det;
+      h3 = (a11 * r2 - a12 * r1) / det;
+    }
+    if (!(h0 > 0) || !(h3 > 0) || h0 > chord * 2 || h3 > chord * 2) {
+      h0 = chord / 3;
+      h3 = chord / 3;
+    }
+    return {
+      p0: { ...a },
+      p1: { x: a.x + t0.x * h0, y: a.y, z: a.z + t0.z * h0 },
+      p2: { x: b.x - t3.x * h3, y: b.y, z: b.z - t3.z * h3 },
+      p3: { ...b },
+    };
+  };
+  let cubic = solve(params);
+  // Correct the parameters to each point's nearest place on the fit, then refit.
+  for (let iter = 0; iter < 4; iter++) {
+    params = points.map((p, i) => (i === 0 ? 0 : i === points.length - 1 ? 1 : closestPointOnCubic(cubic, p).t));
+    cubic = solve(params);
+  }
+  let error = 0;
+  for (const p of points) error = Math.max(error, closestPointOnCubic(cubic, p).distance);
+  return { cubic, error };
 }

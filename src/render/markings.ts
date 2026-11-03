@@ -8,13 +8,14 @@ import { effectiveLanes, effectiveMarkings } from '../core/roadTypes';
 import { effectiveControl } from '../core/signals';
 import { PaintBuf, type LinePoint } from './batch';
 import { paintLaneSymbols } from './laneSymbols';
+import { isAutoOff } from '../core/autoMarkings';
 import { isRampJunction, overlapClip } from './gore';
 import { terrainHeight } from '../core/terrain';
 import { LINE_WIDTH, PAINT_COL, ROAD_LIFT, hexRGB, strokesOf, type RGB } from './constants';
 
-const CROSSWALK_DEPTH = 3;
-const CROSSWALK_GAP = 0.5;
-const STOP_WIDTH = 0.45;
+export const CROSSWALK_DEPTH = 3;
+export const CROSSWALK_GAP = 0.5;
+export const STOP_WIDTH = 0.45;
 const STOP_GAP = 0.9;
 const ARROW_BACK = 7.5;
 
@@ -172,7 +173,7 @@ interface EndPlan {
   controlled: boolean;
 }
 
-const TEETH_DEPTH = 0.95;
+export const TEETH_DEPTH = 0.95;
 
 interface ArmControl {
   crosswalk: CrosswalkStyle;
@@ -431,6 +432,14 @@ export function armEndLayout(net: RoadNetwork, segId: Id, end: -1 | 1): ArmEndLa
     const arrowS = lineS + inward * ARROW_BACK;
     for (const { l, i } of incoming) if (l.kind !== 'bike') arrows.push({ pos: at(arrowS, l.offset), laneIndex: i });
   }
+  // Single automatic markings the user took away (core/autoMarkings.ts).
+  const ctl = net.getNode(plan.node)?.control;
+  if (ctl?.autoOff) {
+    if (stop && isAutoOff(ctl, { kind: 'stop', segmentId: segId })) stop = null;
+    const kept = arrows.filter((a) => !isAutoOff(ctl, { kind: 'arrow', segmentId: segId, lane: a.laneIndex }));
+    arrows.length = 0;
+    arrows.push(...kept);
+  }
   return { cutS, setback: plan.setback, lineEnds, stop, crosswalk, arrows };
 }
 
@@ -527,6 +536,10 @@ const MAX_GUIDE_TURN = (20 * Math.PI) / 180;
 export interface GuideLine {
   pts: LinePoint[];
   color: RGB;
+  /** Which guide this is, to take it away by itself: 'L' and 'R' edges, 'M0'... between lanes. */
+  from: Id;
+  to: Id;
+  part: string;
 }
 
 /** The painted line, if any, at a lateral position on a road. */
@@ -627,7 +640,7 @@ export function junctionGuides(net: RoadNetwork, nodeId: Id): GuideLine[] {
       const l0 = Math.hypot(din.x, din.z) || 1;
       const drift = Math.abs((din.x * (p1.z - p0.z) - din.z * (p1.x - p0.x)) / l0);
       if (!typeChange && drift < 0.3) return;
-      out.push({ pts, color: PAINT_COL[a.color] });
+      out.push({ pts, color: PAINT_COL[a.color], from: fromSeg, to: toSeg, part: side < 0 ? 'L' : 'R' });
     };
     edge(list[0], -1);
     edge(list[list.length - 1], 1);
@@ -639,11 +652,12 @@ export function junctionGuides(net: RoadNetwork, nodeId: Id): GuideLine[] {
         const pa = resampleTrack(connectorTrack(a.pts), 24);
         const pb = resampleTrack(connectorTrack(b.pts), 24);
         const mid = pa.map((p, i) => ({ x: (p.x + pb[i].x) / 2, y: (p.y + pb[i].y) / 2, z: (p.z + pb[i].z) / 2 }));
-        out.push({ pts: trackLine(mid, 0, endDir(a.fromLane, true), endDir(a.toLane, false)), color: PAINT_COL.white });
+        out.push({ pts: trackLine(mid, 0, endDir(a.fromLane, true), endDir(a.toLane, false)), color: PAINT_COL.white, from: fromSeg, to: toSeg, part: `M${k}` });
       }
     }
   }
-  return out;
+  if (!node.control.autoOff) return out;
+  return out.filter((gl) => !isAutoOff(node.control, { kind: 'guide', from: gl.from, to: gl.to, part: gl.part }));
 }
 
 /**
@@ -656,7 +670,7 @@ export function junctionOutline(net: RoadNetwork, nodeId: Id): LinePoint[][] {
   const poly = g.outline;
   const n = poly.length;
   const near = (a: Vec3, b: Vec3) => Math.hypot(a.x - b.x, a.z - b.z) < 0.05;
-  const armAt = (p: Vec3) => g.arms.find((a) => near(a.leftEdge, p) || near(a.rightEdge, p));
+  const armAt = (p: Vec3) => g.arms.find((a) => near(a.kerbLeft ?? a.leftEdge, p) || near(a.kerbRight ?? a.rightEdge, p));
   const kerbless = (segId: Id) => net.roadTypeOf(segId).category !== 'rail';
   const out: LinePoint[][] = [];
   let run: Vec3[] = [];

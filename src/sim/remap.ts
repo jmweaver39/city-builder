@@ -132,6 +132,7 @@ export function remapVehicles(w: World, oldG: CompiledGraph, oldGraph: LaneGraph
     veh.prev1[v] = carry(veh.prev1[v]);
     veh.prev2[v] = carry(veh.prev2[v]);
     veh.permit[v] = -1;
+    veh.claimWait[v] = 0;
     veh.claimNext[v] = -1;
     veh.claimPrev[v] = -1;
   }

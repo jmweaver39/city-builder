@@ -39,30 +39,32 @@ function cross(rg: Rig = r, roadType = 'street-2'): number {
 describe('Bulldoze', () => {
   beforeEach(() => r.tools.setTool('bulldoze'));
 
-  it('hover highlights and click deletes one road', () => {
+  it('hover previews the arm in red and a click deletes that arm, junction to dead end', () => {
     cross();
     r.hover(50, 0);
-    expect(r.view.highlight).toMatchObject({ segments: [expect.any(Number)] });
+    expect(r.view.previews).toHaveLength(1);
+    expect(r.view.previews[0].state).toBe('error');
     const before = r.net.segments.length;
     r.click(50, 0);
     expect(r.net.segments).toHaveLength(before - 1);
   });
 
-  it('a drag sweeps many roads as one undo step', () => {
+  it('a drag along a road through a junction is one undo step', () => {
     cross();
     const sig = r.net.signature();
     r.history.clear();
-    r.drag([[50, 0], [50, 50], [0, 50], [-50, 50], [-50, 0]]);
-    expect(r.net.segments).toHaveLength(1);
+    r.drag([[-50, 0], [0, 0], [50, 0]]);
+    expect(r.net.segments.length).toBeGreaterThan(0);
     expect(r.history.size).toBe(1);
     r.history.undo();
     expect(r.net.signature()).toBe(sig);
   });
 
-  it('fast drags do not skip roads between pointer events', () => {
+  it('a drag across a road, not along it, removes nothing', () => {
     r.net.drawRoad({ start: { kind: 'free', pos: { x: 0, y: 0, z: -50 } }, end: { kind: 'free', pos: { x: 0, y: 0, z: 50 } }, roadType: 'street-2' });
     r.drag([[-80, 0], [80, 0]]);
-    expect(r.net.segments).toHaveLength(0);
+    expect(r.net.segments).toHaveLength(1);
+    expect(r.net.curveOf(r.net.segments[0].id).length).toBeCloseTo(100, 6);
   });
 
   it('deletes endpoints and decals under it', () => {
@@ -88,12 +90,16 @@ describe('Roads stacked at a grade separation', () => {
 
   it('bulldoze takes the upper road first, then the one beneath it', () => {
     const { low, high } = stack();
+    const level = (y: number) => r.net.segments.filter((s) => Math.abs(r.net.cubicOf(s.id).p0.y - y) < 1).reduce((t, s) => t + r.net.curveOf(s.id).length, 0);
     r.tools.setTool('bulldoze');
     r.click(1, 1);
-    expect(r.net.getSegment(high)).toBeUndefined();
+    // A section of the 600 m bridge road goes; the road below is untouched.
+    expect(level(12)).toBeCloseTo(540, 0);
     expect(r.net.getSegment(low)).toBeDefined();
+    expect(r.net.curveOf(low).length).toBeCloseTo(200, 6);
+    void high;
     r.click(1, 1);
-    expect(r.net.getSegment(low)).toBeUndefined();
+    expect(level(0)).toBeCloseTo(140, 0);
   });
 
   it('paint lands on the bridge deck, not on the road below', () => {
@@ -386,13 +392,23 @@ describe('Node markings tool', () => {
   const dot = (i: number) => nodeAnchors(r.net, r.tools.nodeMarkings.node!)[i];
   const clickDot = (i: number) => r.click(dot(i).pos.x, dot(i).pos.z);
 
-  it('enters a junction, or any node, and shows anchors', () => {
+  it('enters a junction, or any node, and shows anchors only once you go to draw', () => {
     const j = cross();
     r.click(0, 0);
     expect(r.tools.nodeMarkings.node).toBe(j);
     expect(r.inspected.at(-1)).toEqual({ kind: 'nodeMarkings', id: j });
-    const points = r.view.marks.filter((m) => m.kind === 'point').length;
-    expect(points).toBe(nodeAnchors(r.net, j).length + outlineAnchors(r.net, j).length);
+    const points = () => r.view.marks.filter((m) => m.kind === 'point').length;
+    // Away from every arm: markings outlined, no anchors.
+    r.hover(40, 40);
+    expect(points()).toBe(0);
+    // Near an arm, that arm's anchors.
+    const a = nodeAnchors(r.net, j)[1];
+    r.hover(a.pos.x, a.pos.z);
+    expect(points()).toBeGreaterThan(0);
+    // Drawing: every anchor.
+    r.click(a.pos.x, a.pos.z);
+    r.hover(40, 40);
+    expect(points()).toBe(nodeAnchors(r.net, j).length + outlineAnchors(r.net, j).length);
   });
 
   it('also enters a plain joint', () => {

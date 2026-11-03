@@ -2,6 +2,12 @@
 import type { ToolManager } from '../tools/ToolManager';
 import type { ToastKind } from '../tools/types';
 import { el } from './dom';
+import { formatCombo } from './keymap';
+
+/** A key hint as shown: Mac glyphs on a Mac. Lists such as 'Z X C' stay as they are. */
+export function displayKey(hint: string): string {
+  return hint.includes(' ') ? hint : formatCombo(hint);
+}
 
 export class Toasts {
   private readonly root = el('div', { class: 'toasts', attrs: { role: 'status', 'aria-live': 'polite' } });
@@ -47,7 +53,7 @@ export function installTooltips(): void {
     }
     // Name and hotkey on one line, an optional description under them.
     tip.replaceChildren(
-      el('div', { class: 'tip-head' }, el('span', { class: 'tip-name', text: target.dataset.tip ?? '' }), target.dataset.key ? el('kbd', { text: target.dataset.key }) : null),
+      el('div', { class: 'tip-head' }, el('span', { class: 'tip-name', text: target.dataset.tip ?? '' }), target.dataset.key ? el('kbd', { text: displayKey(target.dataset.key) }) : null),
       ...(target.dataset.desc ? [el('div', { class: 'tip-desc', text: target.dataset.desc })] : []),
     );
     tip.style.display = 'block';

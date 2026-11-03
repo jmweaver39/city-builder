@@ -8,6 +8,7 @@ import type { RoadNetwork } from './RoadNetwork';
 import { visibleSpan } from './roadPaint';
 import { totalHalfWidth } from './roadTypes';
 import { isWater, MAP_HALF_SIZE, terrainHeight } from './terrain';
+import { terrainModsFor } from './terrainMods';
 import type { Id, Vec3, ZoneAnchor, ZoneDensity, ZoneKind, ZoneRegion, ZoneSettings } from './types';
 
 /** Sampling grid for zoned area, in metres. */
@@ -79,6 +80,8 @@ function bounds(poly: readonly Vec3[]): { minX: number; minZ: number; maxX: numb
 
 /** True where a road, with a margin, covers the ground. */
 export function onRoad(net: RoadNetwork, x: number, z: number, margin: number): boolean {
+  // Embankments, walls and cuts beside a road take their ground too.
+  if (terrainModsFor(net).inFootprint(x, z, margin)) return true;
   const reach = 40;
   for (const id of net.segmentsInRegion({ minX: x - reach, minZ: z - reach, maxX: x + reach, maxZ: z + reach }, true)) {
     const hit = closestPointOnCubic(net.cubicOf(id), { x, y: 0, z });

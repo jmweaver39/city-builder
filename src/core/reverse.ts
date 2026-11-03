@@ -9,7 +9,9 @@ import type {
   Id,
   LaneLink,
   MarkingAnchor,
+  MarkingPointSetting,
   MovementKey,
+  NodeMarking,
   MovementState,
   RoadNode,
   RoadPaintRef,
@@ -46,13 +48,58 @@ function nameOf(net: RoadNetwork, id: Id): string {
   return net.getSegment(id)?.overrides.name || net.roadTypeOf(id).name;
 }
 
-/** Boundaries count across a-to-b, so swapping the ends mirrors them. */
-export function mirrorMarkings(node: RoadNode, id: Id, count: number): void {
-  if (!node.control.markings) return;
-  const mirror = (a: MarkingAnchor): MarkingAnchor => (a.segmentId === id ? { segmentId: id, boundary: count - 1 - a.boundary } : a);
-  node.control.markings = node.control.markings.map((m) =>
-    m.kind === 'line' ? { ...m, from: mirror(m.from), to: mirror(m.to) } : { ...m, anchors: m.anchors.map(mirror) },
+/** Boundaries count across a-to-b, so swapping the ends mirrors them. Kerb and row anchors keep their places. */
+function mirrorAnchor(a: MarkingAnchor, id: Id, count: number, ends = false): MarkingAnchor {
+  if (a.segmentId !== id || a.corner !== undefined) return a;
+  const out: MarkingAnchor = { ...a, boundary: count - 1 - a.boundary };
+  if (ends && a.end) out.end = a.end === 'a' ? 'b' : 'a';
+  return out;
+}
+
+function mirrorPoint(p: MarkingPointSetting, id: Id, count: number, ends = false): MarkingPointSetting {
+  if (p.segmentId !== id) return p;
+  const out: MarkingPointSetting = { ...p, boundary: count - 1 - p.boundary };
+  // At a node, left and right are as seen from the arm, which turning the road does not change.
+  // Along a segment they are seen from a to b, which it does.
+  if (ends) {
+    if (p.offset) out.offset = -p.offset;
+    if (p.place) out.place = p.place === 'left' ? 'right' : 'left';
+    if (p.end) out.end = p.end === 'a' ? 'b' : 'a';
+  }
+  return out;
+}
+
+function mirrorList(list: NodeMarking[], id: Id, count: number, ends: boolean): NodeMarking[] {
+  return list.map((m) =>
+    m.kind === 'line'
+      ? { ...m, from: mirrorAnchor(m.from, id, count, ends), to: mirrorAnchor(m.to, id, count, ends) }
+      : { ...m, anchors: m.anchors.map((a) => mirrorAnchor(a, id, count, ends)) },
   );
+}
+
+/**
+ * Mirror what a node holds on one of its arms when that road turns round: marking
+ * anchors, point settings, and the lane of any arrow taken away. `lanes` are the
+ * road's lanes, the same before and after since only the ends swap.
+ */
+export function mirrorMarkings(node: RoadNode, id: Id, count: number, lanes: readonly { offset: number }[] = []): void {
+  const c = node.control;
+  if (c.markings) c.markings = mirrorList(c.markings, id, count, false);
+  if (c.markingPoints) c.markingPoints = c.markingPoints.map((p) => mirrorPoint(p, id, count));
+  if (c.autoOff) {
+    c.autoOff = c.autoOff.map((r) => {
+      if (r.kind !== 'arrow' || r.segmentId !== id) return r;
+      const old = lanes[r.lane];
+      const lane = old ? lanes.findIndex((l) => Math.abs(l.offset + old.offset) < 0.01) : -1;
+      return { ...r, lane: lane < 0 ? r.lane : lane };
+    });
+  }
+}
+
+/** Mirror a segment's own markings when it turns round: its ends swap too. */
+export function mirrorSegmentMarkings(overrides: SegmentOverrides, id: Id, count: number): void {
+  if (overrides.handMarkings) overrides.handMarkings = mirrorList(overrides.handMarkings, id, count, true);
+  if (overrides.markingPoints) overrides.markingPoints = overrides.markingPoints.map((p) => mirrorPoint(p, id, count, true));
 }
 
 /** Mirror paint on one segment. Walking order stays the same in the world. */

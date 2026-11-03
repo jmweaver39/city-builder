@@ -14,6 +14,7 @@ export class Panel {
 
   constructor(host: HTMLElement, title: string, opts: { wide?: boolean; left?: number; top?: number } = {}) {
     this.titleEl = el('div', { class: 'inspector-title', text: title });
+    this.kind = title;
     const close = el('button', {
       class: 'icon-btn',
       tip: 'Close',
@@ -23,12 +24,14 @@ export class Panel {
     });
     close.style.minWidth = '26px';
     close.style.height = '26px';
-    const head = el('div', { class: 'inspector-head' }, this.titleEl, close);
+    const head = el('div', { class: 'inspector-head' }, this.kindEl, this.titleEl, close);
     this.body = el('div', { class: 'inspector-body' });
-    this.root = el('div', { class: `panel inspector ${opts.wide ? 'wide' : ''}` }, head, this.body);
-    const width = opts.wide ? 350 : 300;
-    const left = opts.left ?? Math.max(60, window.innerWidth - width - 16 - cascade * 24);
-    const top = opts.top ?? 66 + cascade * 24;
+    this.root = el('div', { class: `panel inspector ${opts.wide ? 'wide' : ''}` }, head, this.pictureEl, this.body);
+    // Matches .inspector widths in style.css; narrow windows shrink them to fit.
+    const width = Math.min(opts.wide ? 360 : 320, window.innerWidth - 8);
+    const narrow = window.innerWidth < 560;
+    const left = opts.left ?? (narrow ? 4 : Math.max(60, window.innerWidth - width - 16 - cascade * 24));
+    const top = opts.top ?? (narrow ? 56 : 64 + cascade * 24);
     cascade = (cascade + 1) % 5;
     this.root.style.left = `${left}px`;
     this.root.style.top = `${top}px`;
@@ -59,7 +62,21 @@ export class Panel {
     this.root.style.top = `${Math.max(0, Math.min(window.innerHeight - 40, top))}px`;
   }
 
+  /** Every inspector names what it shows the same way: a kind tag, then the name. */
+  private readonly kindEl = el('span', { class: 'inspector-kind' });
+  private kind: string;
+
+  /** A picture leads every inspector that has one: road, junction, train. Survives body refreshes. */
+  private readonly pictureEl = el('div', { class: 'inspector-picture-slot' });
+
+  setPicture(picture: Node | null): void {
+    this.pictureEl.replaceChildren(...(picture ? [el('div', { class: 'inspector-picture' }, picture)] : []));
+  }
+
   setTitle(title: string): void {
+    // The title a panel opened with is its kind ("Road", "Junction"); a later
+    // name ("Main Street") shows after it.
+    this.kindEl.textContent = title === this.kind ? '' : this.kind;
     this.titleEl.textContent = title;
   }
 

@@ -22,8 +22,11 @@ export function visibleSpan(net: RoadNetwork, segmentId: Id): { lo: number; hi: 
   return { lo: st[0].t, hi: st[st.length - 1].t };
 }
 
-/** Points along one piece at a lateral offset measured right of the walking direction. */
-export function piecePoints(net: RoadNetwork, piece: RoadPaintPiece, lateral: number): Vec3[] {
+/**
+ * Points along one piece at a lateral offset measured right of the walking
+ * direction. With `lateralEnd` the offset moves evenly from one to the other.
+ */
+export function piecePoints(net: RoadNetwork, piece: RoadPaintPiece, lateral: number, lateralEnd = lateral): Vec3[] {
   const span = visibleSpan(net, piece.segmentId);
   if (!span) return [];
   const forward = piece.t0 <= piece.t1;
@@ -33,10 +36,50 @@ export function piecePoints(net: RoadNetwork, piece: RoadPaintPiece, lateral: nu
   const c = net.cubicOf(piece.segmentId);
   const length = (net.segmentGeom(piece.segmentId)?.fullLength ?? 0) * (hi - lo);
   const n = clamp(Math.ceil(length / SPACING), 2, MAX_SAMPLES);
-  const offset = forward ? lateral : -lateral;
   const out: Vec3[] = [];
-  for (let i = 0; i <= n; i++) out.push(offsetPoint(c, lo + ((hi - lo) * i) / n, offset));
-  return forward ? out : out.reverse();
+  for (let i = 0; i <= n; i++) {
+    // i counts along the walk, whichever way the piece runs.
+    const f = i / n;
+    const along = lateral + (lateralEnd - lateral) * f;
+    const t = forward ? lo + (hi - lo) * f : hi - (hi - lo) * f;
+    out.push(offsetPoint(c, t, forward ? along : -along));
+  }
+  return out;
+}
+
+/** Visible length of a piece. */
+function pieceLength(net: RoadNetwork, piece: RoadPaintPiece): number {
+  const span = visibleSpan(net, piece.segmentId);
+  if (!span) return 0;
+  const lo = Math.max(Math.min(piece.t0, piece.t1), span.lo);
+  const hi = Math.min(Math.max(piece.t0, piece.t1), span.hi);
+  return hi > lo ? (net.segmentGeom(piece.segmentId)?.fullLength ?? 0) * (hi - lo) : 0;
+}
+
+/** A smooth bridge from `from` to `to`, leaving and arriving along the two given directions. */
+function smoothBridge(from: Vec3, dirFrom: Vec3, to: Vec3, dirTo: Vec3): Vec3[] {
+  const h = 0.42 * Math.hypot(to.x - from.x, to.z - from.z);
+  const p1 = { x: from.x + dirFrom.x * h, y: from.y, z: from.z + dirFrom.z * h };
+  const p2 = { x: to.x - dirTo.x * h, y: to.y, z: to.z - dirTo.z * h };
+  const out: Vec3[] = [];
+  const n = 12;
+  for (let i = 1; i < n; i++) {
+    const t = i / n;
+    const u = 1 - t;
+    out.push({
+      x: u * u * u * from.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * to.x,
+      y: from.y + (to.y - from.y) * t,
+      z: u * u * u * from.z + 3 * u * u * t * p1.z + 3 * u * t * t * p2.z + t * t * t * to.z,
+    });
+  }
+  return out;
+}
+
+function unitXZ(a: Vec3, b: Vec3): Vec3 {
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  const l = Math.hypot(dx, dz) || 1;
+  return { x: dx / l, y: 0, z: dz / l };
 }
 
 /** The node two consecutive pieces of a path meet at. */
@@ -49,13 +92,20 @@ function sharedNode(net: RoadNetwork, a: RoadPaintPiece, b: RoadPaintPiece): Id 
 }
 
 /**
- * A line along every piece at one lateral offset. Where it passes through a
- * junction it follows the lane path there, not a straight bridge.
+ * A line along every piece at one lateral offset, or moving evenly from `lateral`
+ * to `lateralEnd`. Where it passes through a junction it follows the lane path
+ * there, or a smooth curve tangent to both roads where no lane joins them.
  */
-export function pathPoints(net: RoadNetwork, pieces: readonly RoadPaintPiece[], lateral: number): Vec3[] {
+export function pathPoints(net: RoadNetwork, pieces: readonly RoadPaintPiece[], lateral: number, lateralEnd = lateral): Vec3[] {
   const out: Vec3[] = [];
+  const lengths = pieces.map((p) => pieceLength(net, p));
+  const total = lengths.reduce((a, b) => a + b, 0) || 1;
+  let walked = 0;
   pieces.forEach((piece, i) => {
-    const pts = piecePoints(net, piece, lateral);
+    const l0 = lateral + (lateralEnd - lateral) * (walked / total);
+    walked += lengths[i];
+    const l1 = lateral + (lateralEnd - lateral) * (walked / total);
+    const pts = piecePoints(net, piece, l0, l1);
     const last = out[out.length - 1];
     const first = pts[0];
     if (last && first) {
@@ -63,6 +113,9 @@ export function pathPoints(net: RoadNetwork, pieces: readonly RoadPaintPiece[], 
       const node = gap > 0.5 ? sharedNode(net, pieces[i - 1], piece) : null;
       const guide = node === null ? null : connectorGuide(net, node, last, first, pieces[i - 1].segmentId, piece.segmentId);
       if (guide) out.push(...alongGuide(guide, last, first).slice(1, -1));
+      else if (node !== null && out.length >= 2 && pts.length >= 2) {
+        out.push(...smoothBridge(last, unitXZ(out[out.length - 2], last), first, unitXZ(first, pts[1])));
+      }
     }
     // Pieces meeting at a plain joint share a point.
     const joined = last && first && Math.hypot(last.x - first.x, last.z - first.z) < 0.01;
@@ -108,7 +161,7 @@ export function resolveDecal(net: RoadNetwork, d: Decal): Decal {
   const ref = d.road;
   if (!ref) return d;
   if (STAMP_KINDS.has(d.kind)) return resolveStamp(net, d, ref);
-  const line = pathPoints(net, ref.pieces, ref.offset);
+  const line = pathPoints(net, ref.pieces, ref.offset, ref.offsetEnd ?? ref.offset);
   if (ref.offset2 === undefined) return { ...d, points: line };
   return { ...d, points: [...line, ...pathPoints(net, ref.pieces, ref.offset2).reverse()] };
 }
@@ -145,10 +198,63 @@ export interface RoadSpot {
 }
 
 /**
- * The pieces walking along the road from one spot to another, through plain joints
- * and straight on through junctions. Null when they are not on the same road.
+ * The pieces walking along the road from one spot to another: straight on along
+ * the road first, through plain joints and junctions; failing that, the shortest
+ * way turning at junctions, so two arms of one junction always join. Null only when
+ * the two spots are not connected within a few segments.
  */
 export function roadPathBetween(net: RoadNetwork, a: RoadSpot, b: RoadSpot): RoadPaintPiece[] | null {
+  return straightPathBetween(net, a, b) ?? turningPathBetween(net, a, b);
+}
+
+/** Segments a turning path may cross before giving up. */
+const TURN_SEARCH = 8;
+
+/** The fewest segments from a to b, any turn allowed, as pieces in walking order. */
+function turningPathBetween(net: RoadNetwork, a: RoadSpot, b: RoadSpot): RoadPaintPiece[] | null {
+  const sa = net.getSegment(a.segmentId);
+  if (!sa || !net.getSegment(b.segmentId)) return null;
+  // A state is a segment entered at a node; start by leaving a from either end.
+  type Step = { seg: Id; exitNode: Id; prev: Step | null; depth: number };
+  const queue: Step[] = [
+    { seg: a.segmentId, exitNode: sa.b, prev: null, depth: 0 },
+    { seg: a.segmentId, exitNode: sa.a, prev: null, depth: 0 },
+  ];
+  const seen = new Set<string>(queue.map((q) => `${q.seg}:${q.exitNode}`));
+  while (queue.length) {
+    const cur = queue.shift()!;
+    if (cur.depth >= TURN_SEARCH) continue;
+    for (const next of net.getNode(cur.exitNode)?.segments ?? []) {
+      if (next === cur.seg) continue;
+      const seg = net.getSegment(next)!;
+      const far = seg.a === cur.exitNode ? seg.b : seg.a;
+      const step: Step = { seg: next, exitNode: far, prev: cur, depth: cur.depth + 1 };
+      if (next === b.segmentId) return piecesOf(net, step, a, b);
+      const key = `${next}:${far}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      queue.push(step);
+    }
+  }
+  return null;
+}
+
+function piecesOf(net: RoadNetwork, last: { seg: Id; exitNode: Id; prev: unknown }, a: RoadSpot, b: RoadSpot): RoadPaintPiece[] {
+  type Step = { seg: Id; exitNode: Id; prev: Step | null };
+  const chain: Step[] = [];
+  for (let s: Step | null = last as Step; s; s = s.prev) chain.unshift(s);
+  return chain.map((step, i) => {
+    const seg = net.getSegment(step.seg)!;
+    const leavingAtB = step.exitNode === seg.b;
+    if (i === 0) return { segmentId: step.seg, t0: a.t, t1: leavingAtB ? 1 : 0 };
+    const entry = leavingAtB ? 0 : 1;
+    if (i === chain.length - 1) return { segmentId: step.seg, t0: entry, t1: b.t };
+    return { segmentId: step.seg, t0: entry, t1: leavingAtB ? 1 : 0 };
+  });
+}
+
+/** Straight on along the road only: through plain joints and straight on through junctions. */
+export function straightPathBetween(net: RoadNetwork, a: RoadSpot, b: RoadSpot): RoadPaintPiece[] | null {
   if (a.segmentId === b.segmentId) return [{ segmentId: a.segmentId, t0: a.t, t1: b.t }];
   for (const exitAtB of [true, false]) {
     const pieces: RoadPaintPiece[] = [];

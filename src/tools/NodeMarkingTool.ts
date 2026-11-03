@@ -1,15 +1,23 @@
 /**
- * Node Markings: annotate one node by clicking anchors on its arms. Lines between
- * arms take a computed curve, tangent to the lanes at both ends. Nothing is drawn
- * or shaped by hand, and everything is stored by arm and boundary, not by position.
+ * Junction markings editor. Click a junction (or a plain stretch of road) and every
+ * marking on it, automatic and hand-placed, is outlined and can be hovered, picked
+ * and deleted. A draw tool is always armed (Line by default), and its anchors
+ * appear on the arm under the cursor as soon as you go to draw. Lines go between
+ * any two anchors, on one arm or across the junction; crosswalks and stop lines go
+ * across an arm with one click; areas go round anchors. A selected marking has
+ * handles: drag a line's end to another anchor, a crosswalk along its arm or by its
+ * edges, an area's corners between anchors. Everything is stored by arm and
+ * boundary, never by position, so it follows the roads.
  */
 import { distXZ } from '../core/math';
+import { lineStyleInfo, isPathStyle, LINE_STYLE_INFO, fillPatch, stylePatch, styleOf, fillOf } from '../core/markingStyle';
+import { applyTemplate, captureTemplate, fitTemplate, type TemplateFit } from '../core/markingTemplates';
 import {
   acrossOneArm,
   anchorCurve,
-  armFrames,
   armRow,
   fillerPolygon,
+  framesOf,
   lanePath,
   markingPath,
   nodeAnchors,
@@ -17,22 +25,42 @@ import {
   outlinePath,
   resolveAnchor,
   sameAnchor,
+  sameHost,
   sampleCurve,
   type AnchorPoint,
+  type ArmFrame,
 } from '../core/nodeMarkings';
-import type { NodeLineMarking } from '../core/types';
+import { effectiveLanes } from '../core/roadTypes';
 import type { NetworkChange, RoadNetwork } from '../core/RoadNetwork';
-import type { Id, MarkingAnchor, NodeLineStyle, NodeMarking, Vec3 } from '../core/types';
+import type {
+  Id,
+  LineStyleSpec,
+  MarkingAnchor,
+  MarkingHost,
+  MarkingPointSetting,
+  MarkingPreset,
+  MarkingTemplate,
+  NodeFillerMarking,
+  NodeLineMarking,
+  NodeLineStyle,
+  NodeMarking,
+  Vec3,
+} from '../core/types';
 import type { ToolMark } from '../render/api';
-import { nodeReach, pickNode } from './pick';
+import type { AutoItem } from '../render/autoItems';
+import { cachedAutoItems, convertAutoItem, removeAutoItem, restoreAutoItem, userMarkingAt } from './markingOps';
+import { autoItemAt } from '../render/autoItems';
+import { nodeReach, pickNode, pickRoad } from './pick';
 import { Tool } from './Tool';
-import { COLORS, type ToolId, type ToolKey, type ToolPointer } from './types';
+import { COLORS, type MarkingDraw, type ToolId, type ToolKey, type ToolPointer } from './types';
 
 const ANCHOR_REACH = 1.4;
-const PICK_LINE = 1.2;
+const HANDLE_REACH = 1.1;
 /** How far back along an arm a row of anchors can be laid. */
 const ROW_REACH = 40;
 const ROW_STEP = 0.5;
+/** Anchors show on an arm once the cursor is this close to its cut line or a row on it. */
+const SHOW_REACH = 7;
 /**
  * Distances back from the cut line where the automatic paint sits: the middle of a
  * crosswalk and its stop line, from src/render/markings.ts. Rows catch on them so
@@ -40,58 +68,79 @@ const ROW_STEP = 0.5;
  */
 const AUTO_STOPS = [0.5 + 3 / 2, 0.5 + 3 + 0.9 + 0.45 / 2];
 const STOP_CATCH = 0.6;
+const CROSSWALK_BACK = AUTO_STOPS[0];
+const STOP_BACK = AUTO_STOPS[1];
 
-export const NODE_LINE_STYLES: readonly { value: NodeLineStyle; label: string }[] = [
-  { value: 'solid', label: 'Solid' },
-  { value: 'dashed', label: 'Dashed' },
-  { value: 'double', label: 'Double' },
-  { value: 'solidDashed', label: 'Solid and dashed' },
-  { value: 'dotted', label: 'Dotted' },
-  { value: 'stopLine', label: 'Stop line' },
-  { value: 'crosswalkZebra', label: 'Crosswalk, zebra' },
-  { value: 'crosswalkLadder', label: 'Crosswalk, ladder' },
-  { value: 'crosswalkLines', label: 'Crosswalk, lines' },
-];
+/** The visual language: selected in the accent colour, hovered in a light outline, automatic paint with a quiet badge. */
+export const MARK_COLORS = {
+  selected: COLORS.snap,
+  hover: '#f4f7fb',
+  user: 'rgba(255,255,255,0.55)',
+  auto: '#9aa4b2',
+  badge: '#9aa4b2',
+  handle: COLORS.snap,
+  anchor: COLORS.neutral,
+  enter: '#7ee0a5',
+  exit: '#8fb8ff',
+  kerb: COLORS.warn,
+};
 
-function pointInPolygon(p: Vec3, poly: readonly Vec3[]): boolean {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const a = poly[i];
-    const b = poly[j];
-    if (a.z > p.z !== b.z > p.z && p.x < ((b.x - a.x) * (p.z - a.z)) / (b.z - a.z) + a.x) inside = !inside;
-  }
-  return inside;
-}
+/** Line styles offered for lines between anchors, in panel order. Kept for older imports. */
+export const NODE_LINE_STYLES: readonly { value: NodeLineStyle; label: string }[] = LINE_STYLE_INFO.filter((s) => s.value !== 'empty').map((s) => ({ value: s.value, label: s.label }));
 
-/** Points no further apart than a metre, so picking can test distance to points. */
-function dense(path: readonly Vec3[]): Vec3[] {
-  const out: Vec3[] = [];
-  for (let i = 0; i + 1 < path.length; i++) {
-    const a = path[i];
-    const b = path[i + 1];
-    const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.z - a.z)));
-    for (let k = 0; k < n; k++) out.push({ x: a.x + ((b.x - a.x) * k) / n, y: a.y, z: a.z + ((b.z - a.z) * k) / n });
-  }
-  if (path.length) out.push(path[path.length - 1]);
-  return out;
+type Drag =
+  | { kind: 'end'; id: Id; which: 'from' | 'to' }
+  | { kind: 'corner'; id: Id; index: number }
+  | { kind: 'across'; id: Id; segmentId: Id; end?: 'a' | 'b' }
+  | { kind: 'depth'; id: Id; segmentId: Id; end?: 'a' | 'b' };
+
+interface Handle {
+  pos: Vec3;
+  drag: Drag;
 }
 
 export class NodeMarkingTool extends Tool {
   readonly id: ToolId = 'nodeMarkings';
-  private nodeId: Id | null = null;
-  private selectedId: Id | null = null;
+  private hostRef: MarkingHost | null = null;
+  private selectedIds: Id[] = [];
+  private autoKey: string | null = null;
   private first: MarkingAnchor | null = null;
   private corners: MarkingAnchor[] = [];
   private hover: AnchorPoint | null = null;
   /** The row of anchors across an arm under the cursor, if any. */
   private row: AnchorPoint[] = [];
+  private rowFrame: { segmentId: Id; end?: 'a' | 'b'; back: number } | null = null;
+  private hoverUser: Id | null = null;
+  private hoverAuto: AutoItem | null = null;
+  private drag: Drag | null = null;
+  private dragMoved = false;
+  /** Copied markings, as a template. The UI keeps it across sessions through `onClipboard`. */
+  clipboard: MarkingTemplate | null = null;
+  onClipboard: ((tpl: MarkingTemplate) => void) | null = null;
+  /** The template last applied here and the fits it had, for Rotate and Mirror. */
+  private lastFit: { tpl: MarkingTemplate; fits: TemplateFit[]; index: number } | null = null;
 
+  /** The node being edited, when it is a node. */
   get node(): Id | null {
-    return this.nodeId;
+    return this.hostRef?.kind === 'node' ? this.hostRef.id : null;
+  }
+
+  get host(): MarkingHost | null {
+    return this.hostRef;
   }
 
   get selected(): Id | null {
-    return this.selectedId;
+    return this.selectedIds[0] ?? null;
+  }
+
+  get selection(): readonly Id[] {
+    return this.selectedIds;
+  }
+
+  /** The key of the automatic marking selected, if one is. */
+  get selectedAuto(): AutoItem | null {
+    if (this.node === null || !this.autoKey) return null;
+    return cachedAutoItems(this.ctx.net, this.node).find((i) => i.key === this.autoKey) ?? null;
   }
 
   get pendingCorners(): number {
@@ -102,44 +151,81 @@ export class NodeMarkingTool extends Tool {
     return this.first;
   }
 
+  get templateFit(): { fits: TemplateFit[]; index: number } | null {
+    return this.lastFit ? { fits: this.lastFit.fits, index: this.lastFit.index } : null;
+  }
+
+  get draw(): MarkingDraw {
+    return this.ctx.settings.nodeMarking.draw;
+  }
+
   private get markings(): readonly NodeMarking[] {
-    return this.nodeId === null ? [] : (this.ctx.net.getNode(this.nodeId)?.control.markings ?? []);
+    return this.hostRef ? this.ctx.net.markingsOf(this.hostRef) : [];
   }
 
-  /** Anchors at this node: cut lines, the outline, and the row under the cursor. */
+  private get drawing(): boolean {
+    return this.first !== null || this.corners.length > 0;
+  }
+
+  private get anchorDraw(): boolean {
+    const d = this.draw;
+    return d === 'line' || d === 'filler';
+  }
+
+  // -------------------------------------------------------------------------
+  // Anchors
+  // -------------------------------------------------------------------------
+
+  /** Anchors of the host: cut lines, the kerb outline at a node, and the row under the cursor. */
   private allAnchors(): AnchorPoint[] {
-    if (this.nodeId === null) return [];
+    if (!this.hostRef) return [];
     const { net } = this.ctx;
-    return [...nodeAnchors(net, this.nodeId), ...outlineAnchors(net, this.nodeId), ...this.row];
+    const out = [...nodeAnchors(net, this.hostRef), ...this.row];
+    if (this.hostRef.kind === 'node') out.push(...outlineAnchors(net, this.hostRef.id));
+    return out;
   }
 
-  /** A row across whichever arm the cursor is over, back from its cut line. */
-  private updateRow(e: ToolPointer): void {
+  /** Anchors worth showing now: all of them while drawing, or those near the cursor once it goes to draw. */
+  private shownAnchors(raw: Vec3 | null): AnchorPoint[] {
+    if (!this.anchorDraw && !this.drag) return [];
+    const all = this.allAnchors();
+    if (this.drawing || this.drag) return all;
+    if (!raw) return [];
+    // The arm under the cursor: any of its anchors close by brings in the whole arm.
+    const near = new Set<string>();
+    for (const a of all) {
+      if (distXZ(a.pos, raw) <= SHOW_REACH) near.add(`${a.anchor.segmentId}:${a.anchor.end ?? ''}:${a.anchor.corner === undefined ? 'cut' : 'kerb'}`);
+    }
+    return all.filter((a) => near.has(`${a.anchor.segmentId}:${a.anchor.end ?? ''}:${a.anchor.corner === undefined ? 'cut' : 'kerb'}`));
+  }
+
+  /** The row across whichever arm the cursor is over, back from its cut line. */
+  private updateRow(raw: Vec3 | null): void {
     this.row = [];
-    if (this.nodeId === null) return;
-    const { net, view } = this.ctx;
-    for (const frame of armFrames(net, this.nodeId)) {
-      const raw = view.pickPlane(e.x, e.y, frame.pos.y);
-      if (!raw) continue;
-      const back = -((raw.x - frame.pos.x) * frame.inward.x + (raw.z - frame.pos.z) * frame.inward.z);
+    this.rowFrame = null;
+    if (!this.hostRef || !raw) return;
+    const { net } = this.ctx;
+    const segHost = this.hostRef.kind === 'segment';
+    for (const frame of framesOf(net, this.hostRef)) {
+      const back = (raw.x - frame.pos.x) * frame.backDir.x + (raw.z - frame.pos.z) * frame.backDir.z;
       const across = (raw.x - frame.pos.x) * frame.right.x + (raw.z - frame.pos.z) * frame.right.z;
       const half = Math.max(...frame.offsets.map(Math.abs));
-      if (back < 0.75 || back > ROW_REACH || Math.abs(across) > half + 1) continue;
+      const reach = segHost ? (net.segmentGeom(frame.segmentId)?.length ?? 0) / 2 : ROW_REACH;
+      if (back < 0.75 || back > reach || Math.abs(across) > half + 1) continue;
       let at = Math.round(back / ROW_STEP) * ROW_STEP;
-      for (const stop of AUTO_STOPS) if (Math.abs(back - stop) < STOP_CATCH) at = stop;
-      this.row = armRow(net, this.nodeId, frame.segmentId, at);
+      if (!segHost) for (const stop of AUTO_STOPS) if (Math.abs(back - stop) < STOP_CATCH) at = stop;
+      this.row = armRow(net, this.hostRef, frame.segmentId, at, frame.end);
+      this.rowFrame = { segmentId: frame.segmentId, end: frame.end, back: at };
       return;
     }
   }
 
-  private anchorAt(e: ToolPointer): AnchorPoint | null {
-    if (this.nodeId === null) return null;
-    const { view } = this.ctx;
+  private anchorAt(raw: Vec3 | null): AnchorPoint | null {
+    if (!this.hostRef || !raw) return null;
     let best: AnchorPoint | null = null;
     let bestD = ANCHOR_REACH;
     for (const a of this.allAnchors()) {
-      const raw = view.pickPlane(e.x, e.y, a.pos.y);
-      if (!raw) continue;
+      if (a.off) continue;
       const d = distXZ(raw, a.pos);
       if (d <= bestD) {
         best = a;
@@ -149,111 +235,286 @@ export class NodeMarkingTool extends Tool {
     return best;
   }
 
-  private markingAt(e: ToolPointer): Id | null {
-    if (this.nodeId === null) return null;
+  private ground(e: Pick<ToolPointer, 'x' | 'y'>): Vec3 | null {
     const { net, view } = this.ctx;
-    const y = net.getNode(this.nodeId)?.pos.y ?? 0;
-    const raw = view.pickPlane(e.x, e.y, y);
-    if (!raw) return null;
-    for (const m of [...this.markings].reverse()) {
-      if (m.kind === 'filler') {
-        const poly = fillerPolygon(net, this.nodeId, m);
-        if (poly && pointInPolygon(raw, poly)) return m.id;
-        continue;
-      }
-      const path = markingPath(net, this.nodeId, m);
-      if (path && dense(path).some((p) => distXZ(p, raw) <= PICK_LINE)) return m.id;
-    }
-    return null;
+    const y = this.hostRef?.kind === 'node' ? (net.getNode(this.hostRef.id)?.pos.y ?? 0) : this.hostRef ? net.cubicOf(this.hostRef.id).p0.y : 0;
+    return view.pickPlane(e.x, e.y, y);
+  }
+
+  private frameOf(segmentId: Id, end?: 'a' | 'b'): ArmFrame | undefined {
+    return this.hostRef ? framesOf(this.ctx.net, this.hostRef).find((f) => f.segmentId === segmentId && f.end === end) : undefined;
+  }
+
+  // -------------------------------------------------------------------------
+  // Paths and styles of new markings
+  // -------------------------------------------------------------------------
+
+  /** The look a new line gets from the settings. */
+  lineSpec(): LineStyleSpec {
+    const s = this.ctx.settings.nodeMarking;
+    return { ...s.lineExtra, style: s.style, color: s.color, width: s.width };
   }
 
   /** The path a new line between two anchors takes. */
-  private pathFor(a: MarkingAnchor, b: MarkingAnchor): Pick<NodeLineMarking, 'straight' | 'path'> {
+  private pathFor(a: MarkingAnchor, b: MarkingAnchor, style: NodeLineStyle = this.ctx.settings.nodeMarking.style): Pick<NodeLineMarking, 'straight' | 'path'> {
     const { net, settings } = this.ctx;
-    const lineLike = ['solid', 'dashed', 'double', 'solidDashed', 'dotted'].includes(settings.nodeMarking.style);
-    if (this.nodeId !== null && lineLike) {
-      if (outlinePath(net, this.nodeId, a, b)) return { straight: false, path: 'outline' };
-      if (settings.nodeMarking.followLanes && a.segmentId !== b.segmentId && lanePath(net, this.nodeId, a, b)) {
-        return { straight: false, path: 'lanes' };
-      }
+    const host = this.hostRef;
+    if (host?.kind === 'node' && isPathStyle(style)) {
+      if (outlinePath(net, host.id, a, b)) return { straight: false, path: 'outline' };
+      if (settings.nodeMarking.followLanes && !acrossOneArm(a, b) && lanePath(net, host.id, a, b)) return { straight: false, path: 'lanes' };
     }
-    return { straight: this.isStraight(a, b) };
+    return { straight: acrossOneArm(a, b) || !settings.nodeMarking.curved || !isPathStyle(style) };
   }
 
-  /** Both anchors on one arm make a line across it, which is never a curve. */
-  private isStraight(a: MarkingAnchor, b: MarkingAnchor): boolean {
-    const { nodeMarking } = this.ctx.settings;
-    return acrossOneArm(a, b) || !nodeMarking.curved || !['solid', 'dashed', 'double', 'solidDashed', 'dotted'].includes(nodeMarking.style);
+  private previewPath(first: MarkingAnchor, hover: AnchorPoint): Vec3[] {
+    const { net } = this.ctx;
+    const host = this.hostRef!;
+    const p = resolveAnchor(net, host, first)!;
+    const choice = this.pathFor(first, hover.anchor);
+    const path = markingPath(net, host, { from: first, to: hover.anchor, ...choice });
+    return path ?? sampleCurve(anchorCurve(p, hover, choice.straight), 1);
+  }
+
+  /** Boundaries of an arm spanning the lanes that run into the junction: kerb to centre line. */
+  private incomingSpan(frame: ArmFrame): [number, number] {
+    const { net } = this.ctx;
+    const seg = net.getSegment(frame.segmentId)!;
+    const lanes = effectiveLanes(net.roadTypeOf(frame.segmentId), seg.overrides);
+    // Lanes heading into the host: towards a when the arm's back runs towards b.
+    const inDir = this.hostRef?.kind === 'segment' ? 1 : frame.backSign === 1 ? -1 : 1;
+    const inc = lanes.filter((l) => l.dir === inDir && l.kind !== 'bike');
+    if (!inc.length) return [0, frame.offsets.length - 1];
+    const lo = Math.min(...inc.map((l) => l.offset - l.width / 2));
+    const hi = Math.max(...inc.map((l) => l.offset + l.width / 2));
+    const nearest = (x: number) => {
+      let best = 0;
+      frame.offsets.forEach((o, i) => {
+        if (Math.abs(o - x) < Math.abs(frame.offsets[best] - x)) best = i;
+      });
+      return best;
+    };
+    return [nearest(lo), nearest(hi)];
+  }
+
+  /** The anchors a one-click crosswalk or stop line takes on the arm under the cursor. */
+  private acrossAnchors(kind: 'crosswalk' | 'stop'): { from: MarkingAnchor; to: MarkingAnchor } | null {
+    const rf = this.rowFrame;
+    if (!rf) return null;
+    const frame = this.frameOf(rf.segmentId, rf.end);
+    if (!frame) return null;
+    const s = this.ctx.settings.nodeMarking;
+    const depth = kind === 'crosswalk' ? s.crosswalk.width : s.stop.width;
+    let back = rf.back;
+    // Near the junction, catch on where the automatic paint would be.
+    if (this.hostRef?.kind === 'node') {
+      const auto = kind === 'crosswalk' ? CROSSWALK_BACK : STOP_BACK;
+      if (Math.abs(back - auto) < 1.2) back = auto;
+    }
+    back = Math.max(back, depth / 2 + 0.1);
+    const [lo, hi] = kind === 'crosswalk' ? [0, frame.offsets.length - 1] : this.incomingSpan(frame);
+    const end = frame.end ? { end: frame.end } : {};
+    return {
+      from: { segmentId: frame.segmentId, boundary: lo, back, ...end },
+      to: { segmentId: frame.segmentId, boundary: hi, back, ...end },
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Handles
+  // -------------------------------------------------------------------------
+
+  private handles(): Handle[] {
+    if (!this.hostRef || this.selectedIds.length !== 1) return [];
+    const { net } = this.ctx;
+    const m = this.markings.find((x) => x.id === this.selectedIds[0]);
+    if (!m) return [];
+    const host = this.hostRef;
+    if (m.kind === 'filler') {
+      return m.anchors.flatMap((a, index) => {
+        const p = resolveAnchor(net, host, a);
+        return p ? [{ pos: p.pos, drag: { kind: 'corner', id: m.id, index } as Drag }] : [];
+      });
+    }
+    const p = resolveAnchor(net, host, m.from);
+    const q = resolveAnchor(net, host, m.to);
+    if (!p || !q) return [];
+    const family = lineStyleInfo(m.style).family;
+    if (acrossOneArm(m.from, m.to) && (family === 'crosswalk' || family === 'stop' || family === 'teeth')) {
+      const frame = this.frameOf(m.from.segmentId, m.from.end);
+      if (frame) {
+        const mid = { x: (p.pos.x + q.pos.x) / 2, y: p.pos.y, z: (p.pos.z + q.pos.z) / 2 };
+        const out: Handle[] = [
+          { pos: p.pos, drag: { kind: 'end', id: m.id, which: 'from' } },
+          { pos: q.pos, drag: { kind: 'end', id: m.id, which: 'to' } },
+          { pos: mid, drag: { kind: 'across', id: m.id, segmentId: frame.segmentId, end: frame.end } },
+        ];
+        if (family === 'crosswalk') {
+          const h = m.width / 2;
+          out.push({ pos: { x: mid.x + frame.backDir.x * h, y: mid.y, z: mid.z + frame.backDir.z * h }, drag: { kind: 'depth', id: m.id, segmentId: frame.segmentId, end: frame.end } });
+          out.push({ pos: { x: mid.x - frame.backDir.x * h, y: mid.y, z: mid.z - frame.backDir.z * h }, drag: { kind: 'depth', id: m.id, segmentId: frame.segmentId, end: frame.end } });
+        }
+        return out;
+      }
+    }
+    return [
+      { pos: p.pos, drag: { kind: 'end', id: m.id, which: 'from' } },
+      { pos: q.pos, drag: { kind: 'end', id: m.id, which: 'to' } },
+    ];
+  }
+
+  private handleAt(raw: Vec3 | null): Handle | null {
+    if (!raw) return null;
+    let best: Handle | null = null;
+    let bestD = HANDLE_REACH;
+    for (const h of this.handles()) {
+      const d = distXZ(raw, h.pos);
+      if (d <= bestD) {
+        best = h;
+        bestD = d;
+      }
+    }
+    return best;
+  }
+
+  // -------------------------------------------------------------------------
+  // Showing
+  // -------------------------------------------------------------------------
+
+  private outlineOf(m: NodeMarking): Vec3[] | null {
+    const { net } = this.ctx;
+    const host = this.hostRef!;
+    if (m.kind === 'filler') {
+      const poly = fillerPolygon(net, host, m);
+      return poly ? [...poly, poly[0]] : null;
+    }
+    return markingPath(net, host, m);
   }
 
   private show(e: ToolPointer | null): void {
     const { net, view, settings } = this.ctx;
     const marks: ToolMark[] = [];
-    const nodeId = this.nodeId;
-    if (nodeId !== null) {
-      for (const a of this.allAnchors()) {
+    const host = this.hostRef;
+    const raw = e ? this.ground(e) : null;
+    if (host) {
+      // Every marking outlined, so the whole junction reads at a glance.
+      for (const m of this.markings) {
+        const pts = this.outlineOf(m);
+        if (!pts || pts.length < 2) continue;
+        const sel = this.selectedIds.includes(m.id);
+        const hot = this.hoverUser === m.id;
+        marks.push({ kind: 'line', points: pts, color: sel ? MARK_COLORS.selected : hot ? MARK_COLORS.hover : MARK_COLORS.user, width: sel ? Math.max(0.35, m.width + 0.2) : hot ? 0.3 : 0.12 });
+      }
+      if (host.kind === 'node') {
+        for (const it of cachedAutoItems(net, host.id)) {
+          if (it.outline.length < 2) continue;
+          const pts = it.closed ? [...it.outline, it.outline[0]] : it.outline;
+          const sel = it.key === this.autoKey;
+          const hot = this.hoverAuto?.key === it.key;
+          marks.push({ kind: 'line', points: pts, color: sel ? MARK_COLORS.selected : hot ? MARK_COLORS.hover : MARK_COLORS.auto, width: sel ? 0.3 : hot ? 0.25 : 0.08, dashed: !sel && !hot });
+          // The badge: a small ring marks paint that is automatic.
+          const c = it.outline.reduce((acc, p) => ({ x: acc.x + p.x / it.outline.length, y: p.y, z: acc.z + p.z / it.outline.length }), { x: 0, y: 0, z: 0 });
+          marks.push({ kind: 'ring', pos: c, color: MARK_COLORS.badge, radius: 0.25 });
+        }
+      }
+      for (const a of this.shownAnchors(raw)) {
         const hot = this.hover && sameAnchor(this.hover.anchor, a.anchor);
-        const color = hot ? COLORS.ok : a.anchor.corner !== undefined ? COLORS.warn : a.edge ? COLORS.snap : COLORS.neutral;
+        const color = hot ? COLORS.ok : a.off ? '#555b66' : a.anchor.corner !== undefined ? MARK_COLORS.kerb : a.flow === 'enter' ? MARK_COLORS.enter : a.flow === 'exit' ? MARK_COLORS.exit : MARK_COLORS.anchor;
         marks.push({ kind: 'point', pos: a.pos, color, radius: hot ? 0.6 : a.anchor.corner !== undefined ? 0.3 : 0.4 });
       }
-      const selected = this.markings.find((m) => m.id === this.selectedId);
-      if (selected?.kind === 'line') {
-        const path = markingPath(net, nodeId, selected);
-        if (path) marks.push({ kind: 'line', points: path, color: COLORS.ok, width: Math.max(0.35, selected.width + 0.2) });
-      } else if (selected?.kind === 'filler') {
-        const poly = fillerPolygon(net, nodeId, selected);
-        if (poly) marks.push({ kind: 'line', points: [...poly, poly[0]], color: COLORS.ok, width: 0.3 });
-      }
+      for (const h of this.handles()) marks.push({ kind: 'ring', pos: h.pos, color: MARK_COLORS.handle, radius: 0.7 });
       if (this.first) {
-        const p = resolveAnchor(net, nodeId, this.first);
+        const p = resolveAnchor(net, host, this.first);
         if (p) {
           marks.push({ kind: 'ring', pos: p.pos, color: COLORS.ok, radius: 0.9 });
           if (this.hover && !sameAnchor(this.hover.anchor, this.first)) {
             const path = this.previewPath(this.first, this.hover);
-            marks.push({ kind: 'line', points: path, color: settings.nodeMarking.color, width: 0.3, dashed: settings.nodeMarking.style === 'dashed' });
+            marks.push({ kind: 'line', points: path, color: settings.nodeMarking.color, width: 0.3, dashed: settings.nodeMarking.style !== 'solid' });
           }
         }
       }
       if (this.corners.length) {
         const pts: Vec3[] = [];
         for (const a of this.corners) {
-          const p = resolveAnchor(net, nodeId, a);
+          const p = resolveAnchor(net, host, a);
           if (p) pts.push(p.pos);
         }
         if (this.hover) pts.push(this.hover.pos);
         for (const p of pts) marks.push({ kind: 'ring', pos: p, color: COLORS.ok, radius: 0.7 });
         if (pts.length > 1) marks.push({ kind: 'line', points: pts.length > 2 ? [...pts, pts[0]] : pts, color: settings.nodeMarking.color, width: 0.3, dashed: true });
       }
-      // No tint on the node being edited, so the markings stay visible.
+      // One-click crosswalk or stop line: a ghost across the arm.
+      if ((this.draw === 'crosswalk' || this.draw === 'stop') && !this.drag) {
+        const across = this.acrossAnchors(this.draw);
+        const p = across && resolveAnchor(net, host, across.from);
+        const q = across && resolveAnchor(net, host, across.to);
+        if (p && q) {
+          const depth = this.draw === 'crosswalk' ? settings.nodeMarking.crosswalk.width : settings.nodeMarking.stop.width;
+          const frame = this.frameOf(across!.from.segmentId, across!.from.end)!;
+          const h = depth / 2;
+          const off = (v: Vec3, k: number) => ({ x: v.x + frame.backDir.x * h * k, y: v.y, z: v.z + frame.backDir.z * h * k });
+          marks.push({ kind: 'line', points: [off(p.pos, 1), off(q.pos, 1), off(q.pos, -1), off(p.pos, -1), off(p.pos, 1)], color: COLORS.ok, width: 0.2 });
+        }
+      }
       view.setHighlight(null);
     }
     this.ctx.setMarks(marks);
     if (!e) return;
-    let note = 'Click a node';
-    if (nodeId !== null) {
-      if (settings.nodeMarking.mode === 'filler') {
-        note = this.corners.length >= 3 ? 'Click the first anchor or press Enter to close' : 'Click anchors around the area';
-      } else {
-        note = this.first ? 'Click the second anchor' : 'Click the first anchor, or a marking to edit it';
-      }
-    }
-    this.ctx.setHud({ x: e.x, y: e.y, lines: ['Node markings'], notes: [note], tone: 'ok' });
+    this.ctx.setHud({ x: e.x, y: e.y, lines: [this.hudTitle()], notes: [this.hudNote()], tone: 'ok' });
   }
 
-  private previewPath(first: MarkingAnchor, hover: AnchorPoint): Vec3[] {
-    const { net } = this.ctx;
-    const p = resolveAnchor(net, this.nodeId!, first)!;
-    const choice = this.pathFor(first, hover.anchor);
-    if (choice.path === 'outline') return outlinePath(net, this.nodeId!, first, hover.anchor) ?? [p.pos, hover.pos];
-    if (choice.path === 'lanes') return lanePath(net, this.nodeId!, first, hover.anchor) ?? [p.pos, hover.pos];
-    return sampleCurve(anchorCurve(p, hover, choice.straight), 1);
+  private hudTitle(): string {
+    const names: Record<MarkingDraw, string> = { select: 'Pick', line: 'Line', crosswalk: 'Crosswalk', stop: 'Stop line', filler: 'Area', erase: 'Eraser' };
+    return this.hostRef ? `Markings: ${names[this.draw]}` : 'Markings';
+  }
+
+  private hudNote(): string {
+    if (!this.hostRef) return 'Click a junction, or a stretch of road';
+    if (this.drag) return 'Drop it on an anchor';
+    if (this.hoverAuto && !this.hover) return this.draw === 'erase' ? `Click to remove: ${this.hoverAuto.label}` : `${this.hoverAuto.label} (automatic). Click to pick it`;
+    if (this.hoverUser !== null && !this.hover) return this.draw === 'erase' ? 'Click to remove this marking' : 'Click to pick it; drag its handles to change it';
+    switch (this.draw) {
+      case 'select':
+        return 'Click a marking to pick it';
+      case 'erase':
+        return 'Click a marking to remove it';
+      case 'crosswalk':
+        return 'Click on an arm to lay a crosswalk across it';
+      case 'stop':
+        return 'Click on an arm to lay a stop line across its incoming lanes';
+      case 'filler':
+        return this.corners.length >= 3 ? 'Click the first anchor or press Enter to close' : 'Click anchors around the area';
+      default:
+        return this.first ? 'Click the second anchor, on any arm' : 'Click an anchor to start a line, or a marking to pick it';
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Pointer
+  // -------------------------------------------------------------------------
+
+  private updateHover(e: ToolPointer): Vec3 | null {
+    const raw = this.ground(e);
+    this.updateRow(raw);
+    this.hover = this.anchorDraw || this.drag ? this.anchorAt(raw) : null;
+    this.hoverUser = null;
+    this.hoverAuto = null;
+    if (this.hostRef && raw && !this.hover && !this.drag) {
+      this.hoverUser = userMarkingAt(this.ctx.net, this.hostRef, raw);
+      if (this.hoverUser === null && this.hostRef.kind === 'node') this.hoverAuto = autoItemAt(cachedAutoItems(this.ctx.net, this.hostRef.id), raw);
+    }
+    return raw;
   }
 
   pointerMove(e: ToolPointer): void {
     this.pointer = e;
-    this.updateRow(e);
-    this.hover = this.anchorAt(e);
-    if (this.nodeId === null) {
+    const raw = this.updateHover(e);
+    if (this.drag && raw) {
+      this.dragMoved = true;
+      // The anchor under the cursor while dragging, even outside the drawing tools.
+      this.hover = this.anchorAt(raw);
+      this.dragTo(raw);
+    }
+    if (!this.hostRef) {
       const hover = pickNode(this.ctx, e);
       this.ctx.view.setHighlight(hover === null ? null : { nodes: [hover], color: COLORS.snap });
     }
@@ -261,11 +522,21 @@ export class NodeMarkingTool extends Tool {
   }
 
   open(id: Id): void {
-    this.nodeId = id;
+    this.openHost({ kind: 'node', id });
+  }
+
+  openSegment(id: Id): void {
+    this.openHost({ kind: 'segment', id });
+  }
+
+  openHost(host: MarkingHost): void {
+    this.hostRef = host;
     this.first = null;
     this.corners = [];
-    this.selectedId = null;
-    this.ctx.inspect({ kind: 'nodeMarkings', id });
+    this.selectedIds = [];
+    this.autoKey = null;
+    this.lastFit = null;
+    this.ctx.inspect(host.kind === 'node' ? { kind: 'nodeMarkings', id: host.id } : { kind: 'segmentMarkings', id: host.id });
     this.show(this.pointer);
     this.ctx.changed();
   }
@@ -274,28 +545,134 @@ export class NodeMarkingTool extends Tool {
     if (e.button !== 0) return;
     this.pointer = e;
     const { net, settings } = this.ctx;
-    this.updateRow(e);
-    this.hover = this.anchorAt(e);
-    const anchor = this.hover;
-    if (anchor) {
-      if (settings.nodeMarking.mode === 'filler') this.clickCorner(anchor.anchor);
-      else this.clickLine(anchor.anchor);
-      this.show(e);
-      this.ctx.changed();
-      return;
+    const raw = this.updateHover(e);
+    if (this.hostRef) {
+      const handle = this.handleAt(raw);
+      if (handle && !this.drawing) {
+        this.drag = handle.drag;
+        this.dragMoved = false;
+        this.ctx.history.begin('Change marking');
+        this.show(e);
+        return;
+      }
+      const draw = settings.nodeMarking.draw;
+      if (draw === 'erase') {
+        if (this.hoverUser !== null) this.remove(this.hoverUser);
+        else if (this.hoverAuto) this.removeAuto(this.hoverAuto);
+        this.show(e);
+        return;
+      }
+      if ((draw === 'crosswalk' || draw === 'stop') && this.hoverUser === null && !this.hoverAuto) {
+        if (this.placeAcross(draw)) return;
+      }
+      if (this.hover && this.anchorDraw) {
+        if (draw === 'filler') this.clickCorner(this.hover.anchor);
+        else this.clickLine(this.hover.anchor);
+        this.show(e);
+        this.ctx.changed();
+        return;
+      }
+      if (this.hoverUser !== null) {
+        this.select(this.hoverUser, e.shift || e.ctrl);
+        return;
+      }
+      if (this.hoverAuto) {
+        this.selectAuto(this.hoverAuto.key);
+        return;
+      }
+      const near = this.hostRef.kind === 'node' ? net.getNode(this.hostRef.id) : null;
+      const insideCurrent =
+        (near && raw && (pickNode(this.ctx, e, (n) => n === near.id) !== null || distXZ(raw, near.pos) <= nodeReach(net, near.id) * 2)) ||
+        (this.hostRef.kind === 'segment' && pickRoad(this.ctx, e)?.segmentId === this.hostRef.id);
+      if (insideCurrent) {
+        if (this.selectedIds.length || this.autoKey) this.select(null);
+        return;
+      }
     }
-    const marking = this.markingAt(e);
-    if (marking !== null) {
-      this.select(marking);
-      return;
-    }
-    const near = this.nodeId === null ? null : net.getNode(this.nodeId);
-    const raw = near ? this.ctx.view.pickPlane(e.x, e.y, near.pos.y) : null;
-    const insideCurrent =
-      near && raw && (pickNode(this.ctx, e, (n) => n === near.id) !== null || distXZ(raw, near.pos) <= nodeReach(net, near.id) * 2);
-    if (insideCurrent) return;
     const id = pickNode(this.ctx, e);
-    if (id !== null && id !== this.nodeId) this.open(id);
+    if (id !== null && id !== this.node) {
+      this.open(id);
+      return;
+    }
+    // A plain stretch of road takes markings too.
+    if (id === null) {
+      const road = pickRoad(this.ctx, e);
+      if (road && !(this.hostRef?.kind === 'segment' && this.hostRef.id === road.segmentId)) this.openSegment(road.segmentId);
+    }
+  }
+
+  pointerUp(e: ToolPointer): void {
+    if (!this.drag) return;
+    const moved = this.dragMoved;
+    this.drag = null;
+    if (moved) this.ctx.history.end();
+    else {
+      // A click on a handle that did not move is a click on what lies under it, often an anchor.
+      this.ctx.history.abort();
+      if (this.hover && this.anchorDraw) {
+        if (this.draw === 'filler') this.clickCorner(this.hover.anchor);
+        else this.clickLine(this.hover.anchor);
+      }
+    }
+    this.show(e);
+    this.ctx.changed();
+  }
+
+  private dragTo(raw: Vec3): void {
+    const d = this.drag!;
+    const { net } = this.ctx;
+    const host = this.hostRef!;
+    const m = this.markings.find((x) => x.id === d.id);
+    if (!m) return;
+    if (d.kind === 'end' && m.kind === 'line' && this.hover) {
+      const other = d.which === 'from' ? m.to : m.from;
+      if (sameAnchor(this.hover.anchor, other)) return;
+      const next = d.which === 'from' ? { from: this.hover.anchor } : { to: this.hover.anchor };
+      const from = d.which === 'from' ? this.hover.anchor : m.from;
+      const to = d.which === 'to' ? this.hover.anchor : m.to;
+      const cur = d.which === 'from' ? m.from : m.to;
+      if (sameAnchor(cur, this.hover.anchor)) return;
+      const route = this.pathFor(from, to, m.style);
+      // Clear a path that no longer applies, as when the end leaves the kerb.
+      net.updateMarking(host, m.id, { ...next, straight: route.straight, path: route.path });
+    } else if (d.kind === 'corner' && m.kind === 'filler' && this.hover) {
+      if (m.anchors.some((a, i) => i !== d.index && sameAnchor(a, this.hover!.anchor))) return;
+      if (sameAnchor(m.anchors[d.index], this.hover.anchor)) return;
+      const anchors = m.anchors.map((a, i) => (i === d.index ? this.hover!.anchor : a));
+      net.updateMarking(host, m.id, { anchors });
+    } else if ((d.kind === 'across' || d.kind === 'depth') && m.kind === 'line') {
+      const frame = this.frameOf(d.segmentId, d.end);
+      if (!frame) return;
+      const back = (raw.x - frame.pos.x) * frame.backDir.x + (raw.z - frame.pos.z) * frame.backDir.z;
+      if (d.kind === 'across') {
+        const b = Math.round(Math.max(m.width / 2 + 0.1, back) * 20) / 20;
+        if (Math.abs((m.from.back ?? 0) - b) < 1e-6) return;
+        net.updateMarking(host, m.id, { from: { ...m.from, back: b }, to: { ...m.to, back: b } });
+      } else {
+        const centre = m.from.back ?? 0;
+        const width = Math.round(Math.max(0.5, Math.abs(back - centre) * 2) * 20) / 20;
+        if (Math.abs(width - m.width) < 1e-6) return;
+        net.updateMarking(host, m.id, { width });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Placing
+  // -------------------------------------------------------------------------
+
+  private placeAcross(kind: 'crosswalk' | 'stop'): boolean {
+    const across = this.acrossAnchors(kind);
+    if (!across || !this.hostRef) return false;
+    const s = this.ctx.settings.nodeMarking;
+    const spec = kind === 'crosswalk' ? s.crosswalk : s.stop;
+    this.ctx.history.hint(kind === 'crosswalk' ? 'Add crosswalk' : 'Add stop line');
+    const id = this.ctx.net.addMarking(this.hostRef, { kind: 'line', ...stylePatch(spec), style: spec.style, color: spec.color, width: spec.width, from: across.from, to: across.to, straight: true } as Omit<NodeLineMarking, 'id'>);
+    this.selectedIds = [id];
+    this.autoKey = null;
+    this.show(this.pointer);
+    this.ctx.changed();
+    return true;
   }
 
   private clickLine(anchor: MarkingAnchor): void {
@@ -307,18 +684,19 @@ export class NodeMarkingTool extends Tool {
       this.first = null;
       return;
     }
-    const { net, settings, history } = this.ctx;
-    const { style, color, width } = settings.nodeMarking;
+    const { net, history } = this.ctx;
+    const spec = this.lineSpec();
     history.hint('Add marking');
-    this.selectedId = net.addNodeMarking(this.nodeId!, {
-      kind: 'line',
-      from: this.first,
-      to: anchor,
-      style,
-      color,
-      width,
-      ...this.pathFor(this.first, anchor),
-    });
+    this.selectedIds = [
+      net.addMarking(this.hostRef!, {
+        kind: 'line',
+        ...cleanSpec(spec),
+        from: this.first,
+        to: anchor,
+        ...this.pathFor(this.first, anchor, spec.style),
+      } as Omit<NodeLineMarking, 'id'>),
+    ];
+    this.autoKey = null;
     this.first = null;
   }
 
@@ -333,72 +711,399 @@ export class NodeMarkingTool extends Tool {
 
   /** Finish the area being clicked. Returns false with fewer than three corners. */
   closeFiller(): boolean {
-    if (this.nodeId === null || this.corners.length < 3) return false;
+    if (!this.hostRef || this.corners.length < 3) return false;
     const { net, settings, history } = this.ctx;
-    const { fill, color, fillWidth } = settings.nodeMarking;
+    const { fill, color, fillWidth, fillExtra } = settings.nodeMarking;
     history.hint('Add filler');
-    this.selectedId = net.addNodeMarking(this.nodeId, { kind: 'filler', anchors: this.corners, fill, color, width: fillWidth });
+    const init = { kind: 'filler' as const, anchors: this.corners, fill, color, width: fillWidth, ...dropEmpty(fillExtra) };
+    this.selectedIds = [net.addMarking(this.hostRef, init)];
+    this.autoKey = null;
     this.corners = [];
     this.show(this.pointer);
     this.ctx.changed();
     return true;
   }
 
-  select(id: Id | null): void {
-    this.selectedId = id;
+  // -------------------------------------------------------------------------
+  // Selection and editing
+  // -------------------------------------------------------------------------
+
+  setDraw(draw: MarkingDraw): void {
+    const s = this.ctx.settings.nodeMarking;
+    s.draw = draw;
+    s.mode = draw === 'filler' ? 'filler' : 'line';
+    this.first = null;
+    this.corners = [];
     this.show(this.pointer);
     this.ctx.changed();
   }
 
-  /** Remove the selected marking, or `id`. */
-  remove(id: Id | null = this.selectedId): void {
-    if (this.nodeId === null || id === null) return;
-    this.ctx.history.hint('Delete marking');
-    this.ctx.net.removeNodeMarking(this.nodeId, id);
-    if (this.selectedId === id) this.selectedId = null;
+  /** Pick a marking. With `additive`, add it to the selection or take it out. */
+  select(id: Id | null, additive = false): void {
+    this.autoKey = null;
+    if (id === null) this.selectedIds = [];
+    else if (additive) this.selectedIds = this.selectedIds.includes(id) ? this.selectedIds.filter((x) => x !== id) : [...this.selectedIds, id];
+    else this.selectedIds = [id];
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  selectAuto(key: string | null): void {
+    this.selectedIds = [];
+    this.autoKey = key;
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  selectAll(): void {
+    this.selectedIds = this.markings.map((m) => m.id);
+    this.autoKey = null;
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  /** Step the selection through the markings. */
+  cycle(step: 1 | -1): void {
+    const list = this.markings;
+    if (!list.length) return;
+    const at = list.findIndex((m) => m.id === this.selected);
+    // From nothing, Tab starts at the first and Shift+Tab at the last.
+    const next = at < 0 ? (step > 0 ? list[0] : list[list.length - 1]) : list[(at + step + list.length) % list.length];
+    this.select(next.id);
+  }
+
+  /** Remove the selection, or `id`. */
+  remove(id: Id | null = null): void {
+    if (!this.hostRef) return;
+    const ids = id !== null ? [id] : [...this.selectedIds];
+    if (!ids.length) {
+      const auto = this.selectedAuto;
+      if (auto) this.removeAuto(auto);
+      return;
+    }
+    const host = this.hostRef;
+    this.ctx.history.hint(ids.length > 1 ? 'Delete markings' : 'Delete marking');
+    this.ctx.net.batch(() => {
+      for (const x of ids) if (this.ctx.net.markingsOf(host).some((m) => m.id === x)) this.ctx.net.removeMarking(host, x);
+    });
+    this.selectedIds = this.selectedIds.filter((x) => !ids.includes(x));
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  /** Copies of the selection, beside the originals in the list. */
+  duplicate(): void {
+    if (!this.hostRef || !this.selectedIds.length) return;
+    const host = this.hostRef;
+    const chosen = this.markings.filter((m) => this.selectedIds.includes(m.id));
+    this.ctx.history.hint('Duplicate markings');
+    const copies = this.ctx.net.freshMarkingIds(chosen);
+    // A copy sits on the same anchors; nudge lines back along their arm so both show.
+    for (const c of copies) {
+      if (c.kind === 'line' && acrossOneArm(c.from, c.to) && !isPathStyle(c.style)) {
+        const shift = Math.max(c.width, 1) + 0.5;
+        c.from = { ...c.from, back: (c.from.back ?? 0) + shift };
+        c.to = { ...c.to, back: (c.to.back ?? 0) + shift };
+      }
+    }
+    this.ctx.net.setMarkings(host, [...this.markings, ...copies]);
+    this.selectedIds = copies.map((c) => c.id);
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  /** Edit the selected markings of a kind. Repeated edits merge, as a slider's do. */
+  update(patch: Partial<Omit<NodeLineMarking, 'id' | 'kind'>> | Partial<Omit<NodeFillerMarking, 'id' | 'kind'>>, key: string): void {
+    if (!this.hostRef || !this.selectedIds.length) return;
+    const host = this.hostRef;
+    const lineKeys = ['style', 'straight', 'path', 'dash', 'space', 'gap', 'offset', 'align', 'border', 'rules', 'from', 'to'];
+    const fillKeys = ['fill', 'angle', 'step', 'anchors', 'noOutline'];
+    const keys = Object.keys(patch);
+    const forLines = !keys.some((k) => fillKeys.includes(k));
+    const forFills = !keys.some((k) => lineKeys.includes(k));
+    this.ctx.history.hint('Edit marking', `marking-${this.selectedIds.join(',')}-${key}`);
+    this.ctx.net.batch(() => {
+      for (const id of this.selectedIds) {
+        const m = this.ctx.net.markingsOf(host).find((x) => x.id === id);
+        if (!m || (m.kind === 'line' && !forLines) || (m.kind === 'filler' && !forFills)) continue;
+        this.ctx.net.updateMarking(host, id, patch);
+      }
+    });
+    this.show(this.pointer);
+  }
+
+  /** Give the selection a preset's look; with nothing selected, make it the look of new markings. */
+  applyPreset(preset: MarkingPreset): void {
+    const s = this.ctx.settings.nodeMarking;
+    if (!this.selectedIds.length) {
+      if (preset.kind === 'line') {
+        const fam = lineStyleInfo(preset.style.style).family;
+        if (fam === 'crosswalk') {
+          s.crosswalk = { ...preset.style };
+          this.setDraw('crosswalk');
+        } else if (fam === 'stop' || fam === 'teeth') {
+          s.stop = { ...preset.style };
+          this.setDraw('stop');
+        } else {
+          s.style = preset.style.style;
+          s.color = preset.style.color;
+          s.width = preset.style.width;
+          const { style: _s, color: _c, width: _w, ...extra } = preset.style;
+          s.lineExtra = extra;
+          this.setDraw('line');
+        }
+      } else {
+        s.fill = preset.style.fill;
+        s.color = preset.style.color;
+        s.fillWidth = preset.style.width;
+        const { fill: _f, color: _c, width: _w, ...extra } = preset.style;
+        s.fillExtra = extra;
+        this.setDraw('filler');
+      }
+      return;
+    }
+    this.ctx.net.batch(() => {
+      if (preset.kind === 'line') this.update(stylePatch(preset.style), `preset-${preset.id}`);
+      else this.update(fillPatch(preset.style), `preset-${preset.id}`);
+      // A preset in use travels with the map.
+      if (!preset.id.startsWith('builtin-')) this.ctx.net.saveToLibrary({ preset });
+    });
+    this.ctx.changed();
+  }
+
+  /** The look of the single selected marking, to save as a preset. */
+  selectedLook(): MarkingPreset['style'] | null {
+    const m = this.markings.find((x) => x.id === this.selected);
+    if (!m) return null;
+    return m.kind === 'line' ? styleOf(m) : fillOf(m);
+  }
+
+  // -------------------------------------------------------------------------
+  // Points
+  // -------------------------------------------------------------------------
+
+  /** Change one point's settings. */
+  setPoint(setting: MarkingPointSetting): void {
+    if (!this.hostRef) return;
+    this.ctx.history.hint('Move point', `point-${setting.segmentId}-${setting.boundary}-${setting.end ?? ''}`);
+    this.ctx.net.setMarkingPoint(this.hostRef, setting);
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  pointSetting(segmentId: Id, boundary: number, end?: 'a' | 'b'): MarkingPointSetting {
+    const found = this.hostRef ? this.ctx.net.pointsOf(this.hostRef).find((p) => p.segmentId === segmentId && p.boundary === boundary && p.end === end) : undefined;
+    return found ? { ...found } : { segmentId, boundary, ...(end ? { end } : {}) };
+  }
+
+  /** Nudge the point under the cursor sideways. */
+  private nudgeHovered(step: number): boolean {
+    const a = this.hover?.anchor;
+    if (!a || a.corner !== undefined) return false;
+    const cur = this.pointSetting(a.segmentId, a.boundary, a.end);
+    this.setPoint({ ...cur, offset: Math.round(((cur.offset ?? 0) + step) * 100) / 100 });
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Automatic markings
+  // -------------------------------------------------------------------------
+
+  removeAuto(item: AutoItem): void {
+    if (this.node === null) return;
+    this.ctx.history.hint(`Remove ${item.label.toLowerCase()}`);
+    removeAutoItem(this.ctx.net, this.node, item.ref);
+    if (this.autoKey === item.key) this.autoKey = null;
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  restoreAuto(item: AutoItem): void {
+    if (this.node === null) return;
+    this.ctx.history.hint(`Bring back ${item.label.toLowerCase()}`);
+    restoreAutoItem(this.ctx.net, this.node, item.ref);
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  restoreAllAuto(): void {
+    if (this.node === null) return;
+    this.ctx.history.hint('Bring back automatic markings');
+    this.ctx.net.restoreAutoMarkings(this.node);
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  /** Turn the selected automatic marking into an editable one. */
+  convertAuto(item: AutoItem | null = this.selectedAuto): boolean {
+    if (this.node === null || !item) return false;
+    this.ctx.history.hint(`Make ${item.label.toLowerCase()} editable`);
+    const out = convertAutoItem(this.ctx.net, this.node, item);
+    if (!out) return false;
+    this.autoKey = null;
+    this.selectedIds = out.marking !== undefined ? [out.marking] : [];
+    if (out.decal !== undefined) this.ctx.toast('The arrow is now road paint: edit it with the Paint tool.', 'info');
+    this.show(this.pointer);
+    this.ctx.changed();
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Copy, paste, templates
+  // -------------------------------------------------------------------------
+
+  copy(): boolean {
+    if (!this.hostRef) return false;
+    this.clipboard = captureTemplate(this.ctx.net, this.hostRef, 'Copied markings', 'clipboard');
+    this.onClipboard?.(this.clipboard);
+    this.ctx.toast(`Copied ${this.markings.length} marking${this.markings.length === 1 ? '' : 's'}.`, 'info');
+    return true;
+  }
+
+  paste(): boolean {
+    if (!this.hostRef || !this.clipboard) return false;
+    return this.useTemplate(this.clipboard, 'Paste markings', false);
+  }
+
+  /** Put a template here, best fit first. Says when another fit is about as good. */
+  useTemplate(tpl: MarkingTemplate, label = `Apply ${tpl.name}`, keepInMap = true): boolean {
+    if (!this.hostRef) return false;
+    const fits = fitTemplate(this.ctx.net, this.hostRef, tpl);
+    if (!fits.length) {
+      this.ctx.toast(tpl.host === this.hostRef.kind ? `${tpl.name} is for a junction with ${tpl.arms.length} arms.` : `${tpl.name} is for a ${tpl.host === 'node' ? 'junction' : 'stretch of road'}.`, 'warning');
+      return false;
+    }
+    this.ctx.history.hint(label);
+    const host = this.hostRef;
+    // One undo step: the markings, and the template kept in the map so it travels with it.
+    this.ctx.net.batch(() => {
+      applyTemplate(this.ctx.net, host, tpl, fits[0]);
+      if (keepInMap) this.ctx.net.saveToLibrary({ template: tpl });
+    });
+    this.lastFit = { tpl, fits, index: 0 };
+    this.selectedIds = [];
+    this.autoKey = null;
+    if (fits.length > 1 && fits[1].score - fits[0].score < 0.2) this.ctx.toast('More than one way round fits. Use Rotate or Mirror to choose.', 'info');
+    this.show(this.pointer);
+    this.ctx.changed();
+    return true;
+  }
+
+  /** Turn the last applied template to the next arm, or mirror it. */
+  refit(change: 'rotate' | 'mirror'): void {
+    const last = this.lastFit;
+    if (!last || !this.hostRef) return;
+    const cur = last.fits[last.index];
+    const n = last.tpl.arms.length;
+    const want = change === 'rotate' ? { shift: (cur.shift + 1) % n, mirror: cur.mirror } : { shift: cur.shift, mirror: !cur.mirror };
+    const index = last.fits.findIndex((f) => f.shift === want.shift && f.mirror === want.mirror);
+    if (index < 0) return;
+    this.ctx.history.hint(change === 'rotate' ? 'Rotate template' : 'Mirror template');
+    applyTemplate(this.ctx.net, this.hostRef, last.tpl, last.fits[index]);
+    this.lastFit = { ...last, index };
     this.show(this.pointer);
     this.ctx.changed();
   }
 
   clearAll(): void {
-    if (this.nodeId === null) return;
+    if (!this.hostRef) return;
     this.ctx.history.hint('Clear markings');
-    this.ctx.net.clearNodeMarkings(this.nodeId);
-    this.selectedId = null;
+    this.ctx.net.setMarkings(this.hostRef, []);
+    this.selectedIds = [];
     this.show(this.pointer);
     this.ctx.changed();
   }
 
   setHideAuto(hide: boolean): void {
-    if (this.nodeId === null) return;
+    if (this.node === null) return;
     this.ctx.history.hint('Toggle automatic markings');
-    this.ctx.net.setHideAutoMarkings(this.nodeId, hide);
+    this.ctx.net.setHideAutoMarkings(this.node, hide);
     this.ctx.changed();
   }
 
-  /** Edit the selected marking. Repeated edits merge, as a slider's do. */
-  update(patch: Parameters<RoadNetwork['updateNodeMarking']>[2], key: string): void {
-    if (this.nodeId === null || this.selectedId === null) return;
-    this.ctx.history.hint('Edit marking', `marking-${this.selectedId}-${key}`);
-    this.ctx.net.updateNodeMarking(this.nodeId, this.selectedId, patch);
-    this.show(this.pointer);
+  // -------------------------------------------------------------------------
+  // Keys
+  // -------------------------------------------------------------------------
+
+  /** Step the style of the selection, or of the armed draw tool, within its kind. */
+  private stepStyle(step: 1 | -1): void {
+    const sel = this.markings.find((m) => m.id === this.selected);
+    const s = this.ctx.settings.nodeMarking;
+    const cur: NodeLineStyle = sel?.kind === 'line' ? sel.style : this.draw === 'crosswalk' ? s.crosswalk.style : this.draw === 'stop' ? s.stop.style : s.style;
+    const fam = lineStyleInfo(cur).family;
+    const list = LINE_STYLE_INFO.filter((x) => (fam === 'teeth' || fam === 'stop' ? x.family === 'stop' || x.family === 'teeth' : x.family === fam) && x.value !== 'empty');
+    const at = list.findIndex((x) => x.value === cur);
+    const next = list[(at + step + list.length) % list.length];
+    if (sel?.kind === 'line') this.update({ style: next.value, ...next.defaults }, 'style');
+    else if (this.draw === 'crosswalk') s.crosswalk = { ...s.crosswalk, style: next.value, ...next.defaults };
+    else if (this.draw === 'stop') s.stop = { ...s.stop, style: next.value, ...next.defaults };
+    else {
+      s.style = next.value;
+      s.width = next.defaults.width;
+      const { width: _w, ...extra } = next.defaults;
+      s.lineExtra = extra;
+    }
+    this.ctx.changed();
+  }
+
+  private stepWidth(factor: number): void {
+    const sel = this.markings.find((m) => m.id === this.selected);
+    if (sel) this.update({ width: Math.max(0.05, Math.round(sel.width * factor * 100) / 100) }, 'width');
+    else {
+      const s = this.ctx.settings.nodeMarking;
+      s.width = Math.max(0.05, Math.round(s.width * factor * 100) / 100);
+    }
+    this.ctx.changed();
   }
 
   keyDown(e: ToolKey): boolean {
-    if (e.key === 'Enter') return this.closeFiller();
-    if ((e.key === 'Delete' || e.key === 'Backspace') && this.selectedId !== null) {
+    if (!this.hostRef || e.ctrl) return false;
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (k === 'Enter') return this.closeFiller();
+    if ((k === 'Delete' || k === 'Backspace') && (this.selectedIds.length || this.autoKey)) {
       this.remove();
+      return true;
+    }
+    const draws: Record<string, MarkingDraw> = { v: 'select', l: 'line', c: 'crosswalk', x: 'stop', f: 'filler', e: 'erase' };
+    if (!e.alt && !e.shift && draws[k]) {
+      this.setDraw(draws[k]);
+      return true;
+    }
+    if (k === 'Tab') {
+      this.cycle(e.shift ? -1 : 1);
+      return true;
+    }
+    if (k === '[' || k === ']') {
+      this.stepStyle(k === ']' ? 1 : -1);
+      return true;
+    }
+    if (k === '-' || k === '=') {
+      this.stepWidth(k === '=' ? 1.1 : 1 / 1.1);
+      return true;
+    }
+    if (k === 'ArrowLeft' || k === 'ArrowRight') return this.nudgeHovered((k === 'ArrowRight' ? 1 : -1) * (e.shift ? 0.25 : 0.05));
+    if (k === 'ArrowUp' || k === 'ArrowDown') {
+      const m = this.markings.find((x) => x.id === this.selected);
+      if (m?.kind !== 'line' || !acrossOneArm(m.from, m.to)) return false;
+      const step = (k === 'ArrowUp' ? 1 : -1) * (e.shift ? 1 : 0.25);
+      const b = Math.max(m.width / 2 + 0.1, (m.from.back ?? 0) + step);
+      this.update({ from: { ...m.from, back: b }, to: { ...m.to, back: b } }, 'back');
       return true;
     }
     return false;
   }
 
   back(): boolean {
-    if (this.first) this.first = null;
+    if (this.drag) {
+      this.drag = null;
+      this.ctx.history.abort();
+    } else if (this.first) this.first = null;
     else if (this.corners.length) this.corners.pop();
-    else if (this.selectedId !== null) this.selectedId = null;
-    else if (this.nodeId !== null) {
-      this.nodeId = null;
+    else if (this.selectedIds.length || this.autoKey) {
+      this.selectedIds = [];
+      this.autoKey = null;
+    } else if (this.hostRef) {
+      this.hostRef = null;
       this.ctx.inspect(null);
       this.ctx.view.setHighlight(null);
     } else return false;
@@ -412,30 +1117,68 @@ export class NodeMarkingTool extends Tool {
   }
 
   settingsChanged(): void {
-    if (this.ctx.settings.nodeMarking.mode === 'filler') this.first = null;
+    const s = this.ctx.settings.nodeMarking;
+    // The older switch between lines and areas still works.
+    if (s.mode === 'filler' && s.draw !== 'filler') s.draw = 'filler';
+    if (s.mode === 'line' && s.draw === 'filler') s.draw = 'line';
+    if (s.draw === 'filler') this.first = null;
     else this.corners = [];
     this.show(this.pointer);
   }
 
   networkChanged(_change: NetworkChange): void {
     const { net } = this.ctx;
-    if (this.nodeId !== null && !net.getNode(this.nodeId)) {
-      this.nodeId = null;
+    const host = this.hostRef;
+    if (host && !(host.kind === 'node' ? net.getNode(host.id) : net.getSegment(host.id))) {
+      this.hostRef = null;
       this.ctx.inspect(null);
     }
-    if (this.selectedId !== null && !this.markings.some((m) => m.id === this.selectedId)) this.selectedId = null;
-    const live = (a: MarkingAnchor) => this.nodeId !== null && !!resolveAnchor(net, this.nodeId, a);
+    this.selectedIds = this.selectedIds.filter((id) => this.markings.some((m) => m.id === id));
+    if (this.autoKey && !this.selectedAuto) this.autoKey = null;
+    const live = (a: MarkingAnchor) => !!this.hostRef && !!resolveAnchor(net, this.hostRef, a);
     if (this.first && !live(this.first)) this.first = null;
     this.corners = this.corners.filter(live);
+    if (this.lastFit && this.hostRef && !sameHost(this.hostRef, host ?? this.hostRef)) this.lastFit = null;
     this.show(this.pointer);
   }
 
   deactivate(): void {
-    this.nodeId = null;
-    this.selectedId = null;
+    if (this.drag) {
+      this.drag = null;
+      this.ctx.history.end();
+    }
+    this.hostRef = null;
+    this.selectedIds = [];
+    this.autoKey = null;
     this.first = null;
     this.corners = [];
     this.hover = null;
     this.ctx.inspect(null);
   }
+}
+
+/** A style without unset fields, for a new marking. */
+function cleanSpec(spec: LineStyleSpec): LineStyleSpec {
+  const out = { ...spec } as Record<string, unknown>;
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+  return out as unknown as LineStyleSpec;
+}
+
+function dropEmpty<T extends object>(o: T): Partial<T> {
+  const out = { ...o } as Record<string, unknown>;
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+  return out as Partial<T>;
+}
+
+/** Read-only helper for panels: the markings of a host grouped by the arm they start on. */
+export function markingsByArm(net: RoadNetwork, host: MarkingHost): Map<string, NodeMarking[]> {
+  const out = new Map<string, NodeMarking[]>();
+  for (const m of net.markingsOf(host)) {
+    const a = m.kind === 'line' ? m.from : m.anchors[0];
+    const key = m.kind === 'filler' ? 'areas' : `${a.segmentId}:${a.end ?? ''}`;
+    const list = out.get(key) ?? [];
+    list.push(m);
+    out.set(key, list);
+  }
+  return out;
 }

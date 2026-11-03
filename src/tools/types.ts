@@ -3,13 +3,16 @@
  * ToolContext, so all of their logic runs headless under Vitest with a fake view.
  */
 import type { Cubic } from '../core/bezier';
-import type { CrosswalkStyle, DecalKind, EndpointKind, Id, LineStyle, NodeFillStyle, NodeLineStyle, PaintColor, Vec3, ZoneDensity, ZoneKind } from '../core/types';
+import type { CrosswalkStyle, DecalKind, EndpointKind, Id, LineStyle, LineStyleSpec, NodeFillStyle, NodeFillerMarking, NodeLineStyle, PaintColor, Vec3, ZoneDensity, ZoneKind } from '../core/types';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import type { RendererApi, RendererExtras, ToolMark } from '../render/api';
 import { defaultGrid, type GridSettings } from './grid';
+import { defaultGuideToggles, type GuideToggles } from './guides';
+import { defaultParallelSettings, type ParallelSettings } from './parallel';
 import type { ControlKind } from './junctionControl';
 import { DEFAULT_ROUNDABOUT, type RoundaboutParams } from '../core/roundabout';
 import type { SimApi } from '../sim/api';
+import { defaultWallSettings, type WallToolSettings } from './wallOps';
 
 export type ToolId =
   | 'select'
@@ -22,13 +25,17 @@ export type ToolId =
   | 'traffic'
   | 'template'
   | 'nodeMarkings'
+  | 'junctionShape'
   | 'reverse'
-  | 'gridBlock'
+  | 'parallel'
   | 'gridAlign'
   | 'zone'
   | 'roundabout'
   | 'station'
-  | 'line';
+  | 'line'
+  | 'electrify'
+  | 'quay'
+  | 'terrain';
 
 export type DrawMode = 'straight' | 'curved' | 'freeform' | 'upgrade';
 
@@ -74,9 +81,12 @@ export type InspectTarget =
   | { kind: 'endpoint'; id: Id }
   | { kind: 'vehicle'; id: number }
   | { kind: 'nodeMarkings'; id: Id }
+  /** Hand-placed markings along one segment, between its ends. */
+  | { kind: 'segmentMarkings'; id: Id }
   | { kind: 'zone'; id: Id }
   | { kind: 'train'; id: number }
-  | { kind: 'station'; id: Id };
+  | { kind: 'station'; id: Id }
+  | { kind: 'junctionShape'; id: Id };
 
 export type Tone = 'ok' | 'warning' | 'error';
 
@@ -112,8 +122,20 @@ export interface ZoneToolSettings {
   excludeFast: boolean;
 }
 
+/** The junction marking editor's draw tools. 'line' is armed by default; 'select' only picks. */
+export type MarkingDraw = 'select' | 'line' | 'crosswalk' | 'stop' | 'filler' | 'erase';
+
 export interface NodeMarkingSettings {
+  /** Kept in step with `draw`: 'filler' when drawing an area, 'line' otherwise. */
   mode: 'line' | 'filler';
+  draw: MarkingDraw;
+  /** Look of new lines beyond style, colour and width: dashes, gap, offset, side, own colour. */
+  lineExtra: Omit<Partial<LineStyleSpec>, 'style' | 'color' | 'width'>;
+  /** Look of crosswalks and of stop lines or teeth laid with their draw tools. */
+  crosswalk: LineStyleSpec;
+  stop: LineStyleSpec;
+  /** Look of new areas beyond fill, colour and stripe width. */
+  fillExtra: Pick<NodeFillerMarking, 'hex' | 'angle' | 'step' | 'offset' | 'noOutline'>;
   style: NodeLineStyle;
   fill: NodeFillStyle;
   color: PaintColor;
@@ -153,9 +175,15 @@ export interface EditorSettings {
   template: TemplateSettings;
   /** Optional drawing grid. Off by default, so roads stay free. */
   grid: GridSettings;
+  /** Smart guide types the road tool snaps to (guides.ts). */
+  guides: GuideToggles;
+  /** Parallel Road tool options. */
+  parallel: ParallelSettings;
   /** The Traffic Control card a click applies. 'inspect' opens the detailed editor instead. */
   junctionControl: ControlKind | 'inspect';
   roundabout: RoundaboutParams;
+  /** Structure, walls, sound barriers and quays (wallOps.ts). */
+  walls: WallToolSettings;
 }
 
 export function defaultSettings(): EditorSettings {
@@ -170,12 +198,29 @@ export function defaultSettings(): EditorSettings {
     reverseWholeRoad: false,
     paint: { kind: 'line', lineStyle: 'solid', color: 'white', width: 0.2, text: 'SLOW' },
     zone: { kind: 'residential', mode: 'block', density: 'medium', depth: 40, setback: 2, snap: true, snapDistance: 8, excludeFast: true },
-    nodeMarking: { mode: 'line', style: 'solid', fill: 'hatch', color: 'white', width: 0.16, fillWidth: 0.25, curved: true, followLanes: false },
+    nodeMarking: {
+      mode: 'line',
+      draw: 'line',
+      style: 'solid',
+      fill: 'hatch',
+      color: 'white',
+      width: 0.16,
+      fillWidth: 0.25,
+      curved: true,
+      followLanes: false,
+      lineExtra: {},
+      crosswalk: { style: 'crosswalkZebra', color: 'white', width: 3, dash: 0.5, space: 0.5 },
+      stop: { style: 'stopLine', color: 'white', width: 0.45 },
+      fillExtra: {},
+    },
     trafficKind: 'gateway',
     template: { id: null, params: {}, rotation: 0, elevation: 0, roadType: null },
     grid: defaultGrid(),
+    guides: defaultGuideToggles(),
+    parallel: defaultParallelSettings(),
     junctionControl: 'inspect',
     roundabout: { ...DEFAULT_ROUNDABOUT },
+    walls: defaultWallSettings(),
   };
 }
 

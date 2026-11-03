@@ -6,6 +6,7 @@ import * as THREE from 'three';
 import { MAP_HALF_SIZE, RIVER_DEPTH, WATER_LEVEL, riverCentreZ, terrainHeight } from '../core/terrain';
 import type { Shared } from './materials';
 import { PALETTE, type PaletteKey } from './style';
+import { TERRAIN_EDIT_GLSL, useTerrainEditUniforms, type EditSurfaces } from './terrainEdits';
 
 /** A palette colour as a linear GLSL vec3 literal. */
 function glslColour(key: PaletteKey): string {
@@ -61,6 +62,25 @@ function displayHeight(h: number): number {
   return h <= knee ? h : knee + 260 * (1 - Math.exp(-(h - knee) / 260));
 }
 
+/**
+ * Rocky ridges raised on the far hills, display only, so the horizon reads as
+ * mountains. Nothing inside the map or its first 500 m. Matches tRidge in GLSL.
+ */
+export function mountainRidge(x: number, z: number): number {
+  const out = Math.max(Math.abs(x), Math.abs(z)) - MAP_HALF_SIZE;
+  if (out <= 500) return 0;
+  const amp = THREE.MathUtils.smoothstep(out, 500, 2600) * 420;
+  const a1 = 1 - Math.abs(Math.sin(x * 0.0021 + 1.7 * Math.sin(z * 0.0013)) * Math.cos(z * 0.0017 + 0.9 * Math.sin(x * 0.0011)));
+  const a2 = 1 - Math.abs(Math.sin((x + z) * 0.0047 + 2.3) * Math.cos((x - z) * 0.0039 + 0.7));
+  const a3 = 1 - Math.abs(Math.sin(x * 0.011 + z * 0.007 + 1.1));
+  return amp * (a1 * a1 * 0.6 + a2 * a2 * 0.3 + a3 * a3 * 0.1);
+}
+
+/** Height of the ground as drawn: the terrain, capped far out, with the mountains. */
+export function displayGround(x: number, z: number): number {
+  return displayHeight(terrainHeight(x, z)) + mountainRidge(x, z);
+}
+
 function buildGround(): THREE.BufferGeometry {
   const rows = rowOffsets();
   const cols = columnOffsets();
@@ -74,12 +94,15 @@ function buildGround(): THREE.BufferGeometry {
     for (let i = 0; i < nx; i++) {
       const x = cols[i];
       const z = rowZ(rows[j], x);
-      const y = displayHeight(terrainHeight(x, z));
+      const y = displayGround(x, z);
       pos[k * 3] = x;
       pos[k * 3 + 1] = y;
       pos[k * 3 + 2] = z;
-      const dx = terrainHeight(x + e, z) - terrainHeight(x - e, z);
-      const dz = terrainHeight(x, z + e) - terrainHeight(x, z - e);
+      // Far out, sample wider so the normals follow the ridges the mesh can show.
+      const far = Math.max(Math.abs(x), Math.abs(z)) > MAP_HALF_SIZE + 400;
+      const w = far ? 30 : e;
+      const dx = ((far ? displayGround(x + w, z) - displayGround(x - w, z) : terrainHeight(x + e, z) - terrainHeight(x - e, z)) * e) / w;
+      const dz = ((far ? displayGround(x, z + w) - displayGround(x, z - w) : terrainHeight(x, z + e) - terrainHeight(x, z - e)) * e) / w;
       const l = Math.hypot(dx, 2 * e, dz);
       nor[k * 3] = -dx / l;
       nor[k * 3 + 1] = (2 * e) / l;
@@ -114,20 +137,31 @@ function buildGround(): THREE.BufferGeometry {
 /**
  * Terrain height in GLSL, a straight port of core/terrain.ts plus the display cap,
  * so the camera patch can be displaced on the GPU and match the base mesh.
+ * Landscaping (tEdit, render/terrainEdits.ts) applies inside the map, as on the CPU.
  */
 const HEIGHT_GLSL = /* glsl */ `
+${TERRAIN_EDIT_GLSL}
 float tRiverZ(float x) { return 420.0 + 170.0 * sin(x / 470.0 + 0.6) + 80.0 * sin(x / 183.0 + 2.1) + 24.0 * sin(x / 71.0 + 4.2); }
 float tRiverSlope(float x) { return (170.0 / 470.0) * cos(x / 470.0 + 0.6) + (80.0 / 183.0) * cos(x / 183.0 + 2.1) + (24.0 / 71.0) * cos(x / 71.0 + 4.2); }
+float tRidge(vec2 p, float out_) {
+  if (out_ <= 500.0) return 0.0;
+  float amp = smoothstep(500.0, 2600.0, out_) * 420.0;
+  float a1 = 1.0 - abs(sin(p.x * 0.0021 + 1.7 * sin(p.y * 0.0013)) * cos(p.y * 0.0017 + 0.9 * sin(p.x * 0.0011)));
+  float a2 = 1.0 - abs(sin((p.x + p.y) * 0.0047 + 2.3) * cos((p.x - p.y) * 0.0039 + 0.7));
+  float a3 = 1.0 - abs(sin(p.x * 0.011 + p.y * 0.007 + 1.1));
+  return amp * (a1 * a1 * 0.6 + a2 * a2 * 0.3 + a3 * a3 * 0.1);
+}
 float tHeight(vec2 p) {
   float m = tRiverSlope(p.x);
   float d = abs(p.y - tRiverZ(p.x)) / sqrt(1.0 + m * m);
   float channel = ${RIVER_DEPTH.toFixed(1)} * (smoothstep(20.0, 40.0, d) - 1.0);
   float out_ = max(abs(p.x), abs(p.y)) - ${MAP_HALF_SIZE.toFixed(1)};
-  if (out_ <= 0.0) return channel;
+  if (out_ <= 0.0) return channel + tEdit(p);
   float rise = (out_ * out_) / (out_ + 260.0);
   float roll = 1.0 + 0.22 * sin(p.x / 310.0 + 1.3) * cos(p.y / 270.0 + 0.4) + 0.12 * sin((p.x + p.y) / 130.0 + 2.2);
   float h = channel + 0.32 * rise * roll * smoothstep(40.0, 220.0, d);
-  return h <= 340.0 ? h : 340.0 + 260.0 * (1.0 - exp(-(h - 340.0) / 260.0));
+  h = h <= 340.0 ? h : 340.0 + 260.0 * (1.0 - exp(-(h - 340.0) / 260.0));
+  return h + tRidge(p, out_);
 }
 `;
 
@@ -136,7 +170,7 @@ float tHeight(vec2 p) {
  * detail that fades in as the camera comes close and macro variation far out,
  * every scale rotated and warped so no tiling lines up.
  */
-const GROUND_COLOUR_GLSL = /* glsl */ `
+export const GROUND_COLOUR_GLSL = /* glsl */ `
 // Dry summer grassland seen from above: olive and khaki, dense fine speckle,
 // mottled darker patches, faint field plots and diagonal boundary strips.
 vec3 groundColour(vec2 p, float h, float slope, float dist) {
@@ -205,7 +239,11 @@ vec3 groundColour(vec2 p, float h, float slope, float dist) {
   float hill = smoothstep(2.0, 40.0, h);
   c = mix(c, ${glslColour('hill')} * (0.95 + 0.1 * broad), hill * 0.6);
   float rock = smoothstep(0.22, 0.4, slope + (mott - 0.5) * 0.1) * hill + smoothstep(240.0, 360.0, h + (broad - 0.5) * 80.0);
-  c = mix(c, mix(${glslColour('rock')}, ${glslColour('rockDark')}, mott), clamp(rock, 0.0, 1.0));
+  // Mountain rock: tilted strata, darker in gullies, pale on the crags.
+  float strata = 0.5 + 0.5 * sin(h * 0.09 + p.x * 0.004 + broad * 6.0);
+  vec3 rockC = mix(${glslColour('rock')}, ${glslColour('rockDark')}, mott * 0.7 + strata * 0.3);
+  rockC *= 0.88 + 0.24 * smoothstep(0.3, 0.8, texture2D(uNoise, p1 / 900.0).g);
+  c = mix(c, rockC, clamp(rock, 0.0, 1.0));
   return c;
 }
 `;
@@ -215,7 +253,7 @@ vec3 groundColour(vec2 p, float h, float slope, float dist) {
  * resolution grid, displaced on the GPU. Without it, it is the base mesh, which
  * leaves a hole where the patch draws.
  */
-function groundMaterial(shared: Shared, patch: boolean, patchRect: { value: THREE.Vector4 }, patchOrigin: { value: THREE.Vector2 }): THREE.MeshStandardMaterial {
+function groundMaterial(shared: Shared, patch: boolean, patchRect: { value: THREE.Vector4 }, patchOrigin: { value: THREE.Vector2 }, editTiles = false): THREE.MeshStandardMaterial {
   const m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, metalness: 0 });
   m.stencilWrite = true;
   m.stencilFunc = THREE.NotEqualStencilFunc;
@@ -228,6 +266,7 @@ function groundMaterial(shared: Shared, patch: boolean, patchRect: { value: THRE
     s.uniforms.uUnder = shared.uUnder;
     s.uniforms.uPatchRect = patchRect;
     s.uniforms.uPatchOrigin = patchOrigin;
+    useTerrainEditUniforms(s);
     s.vertexShader = s.vertexShader.replace(
       '#include <common>',
       `#include <common>\nvarying vec3 vWorld;\nvarying float vSlope;\nuniform vec2 uPatchOrigin;\n${HEIGHT_GLSL}`,
@@ -259,6 +298,7 @@ uniform vec4 uPatchRect;
 varying vec3 vWorld;
 varying float vSlope;
 const float MAP_EDGE = ${MAP_HALF_SIZE.toFixed(1)};
+${TERRAIN_EDIT_GLSL}
 ${GROUND_COLOUR_GLSL}
 `,
       )
@@ -266,7 +306,8 @@ ${GROUND_COLOUR_GLSL}
         '#include <color_fragment>',
         /* glsl */ `#include <color_fragment>
 {
-  ${patch ? '' : 'if (vWorld.x > uPatchRect.x && vWorld.x < uPatchRect.z && vWorld.z > uPatchRect.y && vWorld.z < uPatchRect.w) discard;'}
+  ${patch && !editTiles ? '' : 'if (vWorld.x > uPatchRect.x && vWorld.x < uPatchRect.z && vWorld.z > uPatchRect.y && vWorld.z < uPatchRect.w) discard;'}
+  ${patch ? '' : 'if (tEditTile(vWorld.xz) > 0.5) discard;'}
   vec3 c = groundColour(vWorld.xz, vWorld.y, vSlope, length(vViewPosition));
   float out_ = max(abs(vWorld.x), abs(vWorld.z)) - MAP_EDGE;
   if (out_ > 0.0) c *= 0.95;
@@ -282,7 +323,7 @@ ${GROUND_COLOUR_GLSL}
 `,
       );
   };
-  m.customProgramCacheKey = () => (patch ? 'cl-ground-patch-hc' : 'cl-ground-base-hc');
+  m.customProgramCacheKey = () => (editTiles ? 'cl-ground-edit-hc' : patch ? 'cl-ground-patch-hc' : 'cl-ground-base-hc');
   return m;
 }
 
@@ -378,8 +419,14 @@ function buildWater(): THREE.BufferGeometry {
   return geo;
 }
 
-export class Terrain {
+export class Terrain implements EditSurfaces {
   readonly group = new THREE.Group();
+  /** Landscaped tiles at 2 m, displaced on the GPU (render/terrainEdits.ts). */
+  private editTiles: THREE.Mesh | null = null;
+  private editMat: THREE.MeshStandardMaterial;
+  /** Ground dug below the water table. */
+  private flood: THREE.Mesh | null = null;
+  private underground = false;
   private ground: THREE.Mesh;
   private groundMat: THREE.MeshStandardMaterial;
   private patch: THREE.Mesh | null = null;
@@ -394,6 +441,7 @@ export class Terrain {
   constructor(private readonly shared: Shared) {
     this.groundMat = groundMaterial(shared, false, this.patchRect, this.patchOrigin);
     this.patchMat = groundMaterial(shared, true, this.patchRect, this.patchOrigin);
+    this.editMat = groundMaterial(shared, true, this.patchRect, { value: new THREE.Vector2() }, true);
     this.ground = new THREE.Mesh(buildGround(), this.groundMat);
     this.ground.receiveShadow = true;
     this.ground.renderOrder = -5;
@@ -485,8 +533,43 @@ export class Terrain {
     this.patchRect.value.set(ox - h, oz - h, ox + h, oz + h);
   }
 
+  /** Replace the landscaped tiles' grid, or remove it with null. */
+  setEditTiles(geo: THREE.BufferGeometry | null): void {
+    if (this.editTiles) {
+      this.group.remove(this.editTiles);
+      this.editTiles.geometry.dispose();
+      this.editTiles = null;
+    }
+    if (!geo) return;
+    const m = new THREE.Mesh(geo, this.editMat);
+    m.frustumCulled = false;
+    m.receiveShadow = true;
+    m.renderOrder = this.underground ? 3 : -5;
+    m.matrixAutoUpdate = false;
+    this.editTiles = m;
+    this.group.add(m);
+  }
+
+  /** Replace the flooded ground's water, or remove it with null. */
+  setFlood(geo: THREE.BufferGeometry | null): void {
+    if (this.flood) {
+      this.group.remove(this.flood);
+      this.flood.geometry.dispose();
+      this.flood = null;
+    }
+    if (!geo) return;
+    const m = new THREE.Mesh(geo, this.waterMat);
+    m.renderOrder = 1;
+    m.matrixAutoUpdate = false;
+    m.frustumCulled = false;
+    this.flood = m;
+    this.group.add(m);
+  }
+
   setUnderground(on: boolean): void {
-    for (const m of [this.groundMat, this.patchMat]) {
+    this.underground = on;
+    if (this.editTiles) this.editTiles.renderOrder = on ? 3 : -5;
+    for (const m of [this.groundMat, this.patchMat, this.editMat]) {
       m.transparent = on;
       m.opacity = on ? 0.28 : 1;
       m.depthWrite = !on;
@@ -503,6 +586,9 @@ export class Terrain {
     this.groundMat.dispose();
     this.patch?.geometry.dispose();
     this.patchMat.dispose();
+    this.editTiles?.geometry.dispose();
+    this.editMat.dispose();
+    this.flood?.geometry.dispose();
     this.water.geometry.dispose();
     this.waterMat.dispose();
   }

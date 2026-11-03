@@ -1,10 +1,12 @@
 /**
  * Render sandbox. Builds a sample town through the real RoadNetwork and drives
  * it with FakeSim. Open /render-sandbox.html. Query options: n (vehicle count),
- * stress=1 (adds a street grid to reach 500 segments), hours (time of day).
+ * stress=1 (adds a street grid to reach 500 segments), city=1 (a zoned downtown
+ * grid in the far west, view 'city'), hours (time of day).
  */
 import { RoadNetwork, type RoadAnchor } from '../core/RoadNetwork';
-import type { Id, Vec3 } from '../core/types';
+import type { Id, Vec3, ZoneDensity, ZoneKind } from '../core/types';
+import { DEFAULT_ZONE_SETTINGS } from '../core/zones';
 import { FakeSim } from './fakeSim';
 import { Renderer } from './Renderer';
 import type { CameraPose, OverlayMode, RoadPreview, ToolMark } from './api';
@@ -236,6 +238,46 @@ function buildStress(net: RoadNetwork): void {
   }
 }
 
+/**
+ * A downtown grid with zoned blocks: towers in the middle, mid-rise around them,
+ * houses and industry at the edges. Centred on (-700, 0, 1350).
+ */
+function buildCity(net: RoadNetwork): void {
+  const n = 6;
+  const step = 96;
+  const x0 = -700 - (n * step) / 2;
+  const z0 = 1350 - (n * step) / 2;
+  for (let i = 0; i <= n; i++) {
+    const kind = i === 0 || i === n || i === n / 2 ? 'avenue-4' : 'street-2';
+    net.drawRoad({ start: free(v(x0 + i * step, 0, z0 - 20)), end: free(v(x0 + i * step, 0, z0 + n * step + 20)), roadType: kind });
+    net.drawRoad({ start: free(v(x0 - 20, 0, z0 + i * step)), end: free(v(x0 + n * step + 20, 0, z0 + i * step)), roadType: kind });
+  }
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const ring = Math.max(Math.abs(i - (n - 1) / 2), Math.abs(j - (n - 1) / 2));
+      let kind: ZoneKind;
+      let density: ZoneDensity;
+      if (ring < 1) [kind, density] = ['office', 'high'];
+      else if (ring < 2) [kind, density] = (i + j) % 2 ? ['commercial', 'high'] : ['residential', 'high'];
+      else if (i === 0 && j < 2) [kind, density] = ['industrial', 'medium'];
+      else [kind, density] = (i + j) % 3 === 0 ? ['commercial', 'medium'] : (i + j) % 3 === 1 ? ['residential', 'medium'] : ['residential', 'low'];
+      const m = 9;
+      const ax = x0 + i * step + m;
+      const az = z0 + j * step + m;
+      const b = step - m * 2;
+      net.addZone({
+        kind,
+        density,
+        enabled: true,
+        name: `${kind} ${i},${j}`,
+        polygon: [v(ax, 0, az), v(ax + b, 0, az), v(ax + b, 0, az + b), v(ax, 0, az + b)],
+        source: 'shape',
+        settings: { ...DEFAULT_ZONE_SETTINGS },
+      });
+    }
+  }
+}
+
 function main(): void {
   const q = new URLSearchParams(location.search);
   // The dev server is shared, so other people's edits would reload the page mid-measurement.
@@ -251,6 +293,7 @@ function main(): void {
   net.batch(() => {
     buildTown(net);
     if (stress) buildStress(net);
+    if (q.get('city') === '1') buildCity(net);
   });
   const t1 = performance.now();
   const sim = new FakeSim(net, count);
@@ -323,6 +366,9 @@ function main(): void {
     hug: { target: v(-760, 0, -685), distance: 130, yaw: 0.7, pitch: 0.65 },
     slope: { target: v(-1000, 6, -1000), distance: 120, yaw: 0.8, pitch: 0.42 },
     map: { target: v(0, 0, 0), distance: 5200, yaw: 0, pitch: 1.1 },
+    city: { target: v(-700, 0, 1350), distance: 520, yaw: 0.6, pitch: 0.75 },
+    cityStreet: { target: v(-700, 8, 1350), distance: 60, yaw: 0.6, pitch: 0.18 },
+    cityTop: { target: v(-700, 0, 1350), distance: 700, yaw: 0, pitch: 1.3 },
   };
 
   const demoPreview = (): RoadPreview[] => [

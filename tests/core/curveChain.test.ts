@@ -129,13 +129,27 @@ describe('placing a fitted chain', () => {
 describe('Smooth curve', () => {
   it('refits a lopsided loop, keeping ends and end tangents', () => {
     const net = new RoadNetwork();
-    const r = net.drawRoad({ start: free(0, 0), end: free(-40, 40), c1: v(140, 0), c2: v(-110, 160), roadType: 'ramp-1' });
+    // The ends of a round 270 degree loop, joined by one lopsided cubic as the old
+    // Freeform mode drew it: long handle at the start, short at the end.
+    const ideal = fitCurve({ start: v(0, 0), startDir: v(1, 0), end: v(-70, -70), spirals: false });
+    const endDir = cubicTangentXZ(ideal.cubics.at(-1)!, 1);
+    const r = net.drawRoad({
+      start: free(0, 0),
+      end: free(-70, -70),
+      c1: v(190, 0),
+      c2: v(-70 - endDir.x * 50, -70 - endDir.z * 50),
+      roadType: 'ramp-1',
+    });
     const id = r.segments[0];
     const before = net.cubicOf(id);
+    const tightBefore = net.segmentGeom(id)!.minRadius;
     const [na, nb] = [net.getSegment(id)!.a, net.getSegment(id)!.b];
     const res = smoothSegment(net, id);
-    expect(res.changed).toBe(true);
+    expect(res.changed, res.message).toBe(true);
     expect(res.segments[0]).toBe(id);
+    // Much gentler than the cramped cubic, and about the size of the round loop.
+    expect(res.fit!.radius).toBeGreaterThan(2 * tightBefore);
+    expect(res.fit!.length).toBeLessThan(ideal.length * 1.4);
     expect(res.segments.length).toBeGreaterThanOrEqual(5);
     const first = net.cubicOf(res.segments[0]);
     const last = net.cubicOf(res.segments.at(-1)!);
@@ -147,6 +161,15 @@ describe('Smooth curve', () => {
     expect(checkNetworkInvariants(net)).toEqual([]);
     // Smoothing again does nothing more.
     for (const piece of res.segments) expect(smoothSegment(net, piece).changed, `piece ${piece}`).toBe(false);
+  });
+
+  it('refuses a refit that would need far more room than the road had', () => {
+    const net = new RoadNetwork();
+    const r = net.drawRoad({ start: free(0, 0), end: free(-40, 40), c1: v(140, 0), c2: v(-110, 160), roadType: 'ramp-1' });
+    const res = smoothSegment(net, r.segments[0]);
+    expect(res.changed).toBe(false);
+    expect(res.message).toMatch(/Redraw/);
+    expect(net.segments).toHaveLength(1);
   });
 
   it('leaves a straight road alone', () => {

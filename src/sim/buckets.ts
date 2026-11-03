@@ -35,6 +35,11 @@ export class Buckets {
   tailVeh: Int32Array;
   /** Length spoken for on the way into each lane, by vehicles on or cleared for connectors. */
   reserve: Float64Array;
+  /** The part of `reserve` held by drivers still waiting their turn. */
+  waitReserve: Float64Array;
+  /** The longest-waiting driver refused for room on each lane, and the step it was seen. */
+  roomWaiter: Int32Array;
+  roomWaiterTick: Int32Array;
   /** Last lane change into each lane: the step, and where. */
   changeTick: Int32Array;
   changeAt: Float64Array;
@@ -48,6 +53,9 @@ export class Buckets {
     this.tailV = new Float64Array(n);
     this.tailVeh = new Int32Array(n).fill(-1);
     this.reserve = new Float64Array(n);
+    this.waitReserve = new Float64Array(n);
+    this.roomWaiter = new Int32Array(n).fill(-1);
+    this.roomWaiterTick = new Int32Array(n).fill(-10);
     this.changeTick = new Int32Array(n).fill(-1);
     this.changeAt = new Float64Array(n);
     this.eV = new Int32Array(capacity * 5);
@@ -80,7 +88,8 @@ export class Buckets {
   build(g: CompiledGraph, veh: VehicleStore): void {
     const { start, count, fill, eV, eS, eT, order, tailRear, tailV, tailVeh, reserve } = this;
     const { len: laneLen, isConn, toLane, n } = g;
-    const { alive, lane, s, len, prev1, prev2, lcFrom, reqLane, permit, seen, v: speed } = veh;
+    const { alive, lane, s, len, prev1, prev2, lcFrom, reqLane, permit, seen, v: speed, claimWait } = veh;
+    const { waitReserve } = this;
     const tick = ++this.buildTick;
 
     // Drop dead slots and any duplicate left by a slot being reused.
@@ -96,6 +105,7 @@ export class Buckets {
 
     count.fill(0);
     reserve.fill(0);
+    waitReserve.fill(0);
     for (let i = 0; i < m; i++) {
       const v = order[i];
       const l = lane[v];
@@ -109,7 +119,10 @@ export class Buckets {
       if (lcFrom[v] >= 0) count[lcFrom[v]]++;
       if (reqLane[v] >= 0) count[reqLane[v]]++;
       if (isConn[l]) reserve[toLane[l]] += len[v] + 2;
-      if (permit[v] >= 0) reserve[toLane[permit[v]]] += len[v] + 2;
+      if (permit[v] >= 0) {
+        reserve[toLane[permit[v]]] += len[v] + 2;
+        if (claimWait[v]) waitReserve[toLane[permit[v]]] += len[v] + 2;
+      }
     }
     let total = 0;
     for (let l = 0; l < n; l++) {

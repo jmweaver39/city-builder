@@ -161,7 +161,7 @@ describe('Zone tool', () => {
     r.drag([[50, 9], [300, 9]]);
     expect(zones()).toHaveLength(1);
     r.tools.setTool('bulldoze');
-    r.click(200, 0);
+    r.click(200, 0, { shift: true });
     expect(zones()).toHaveLength(0);
     expect(r.net.endpoints).toHaveLength(0);
   });

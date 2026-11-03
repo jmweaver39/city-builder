@@ -8,8 +8,8 @@ import type { TrackGraph, TrackPiece } from './TrackGraph';
 export interface RouteRules {
   /** Metro stock runs on metro track, everything else off it. */
   metro: boolean;
-  /** Needs wires or a third rail. */
-  electric: boolean;
+  /** The power the train needs. Diesels go anywhere. */
+  power: 'overhead' | 'thirdRail' | 'diesel';
   maxSpeed: number;
 }
 
@@ -20,7 +20,9 @@ const WRONG_ROAD_PENALTY = 60;
 
 export function trackAllows(p: TrackPiece, rules: RouteRules): boolean {
   if (p.metro !== rules.metro) return false;
-  return !rules.electric || p.electrified || p.thirdRail;
+  if (rules.power === 'overhead') return p.electrified;
+  if (rules.power === 'thirdRail') return p.thirdRail;
+  return true;
 }
 
 export function opposite(state: number): number {

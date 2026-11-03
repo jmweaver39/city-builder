@@ -20,19 +20,19 @@ export interface ControlCard {
   kind: ControlKind;
   name: string;
   description: string;
-  /** Hotkey while the Traffic Control tool is active. */
+  /** Its number in the Traffic Control tab: keys 1 to 9 pick the tab's cards. */
   key: string;
   /** Applies per arm when an arm is clicked. */
   perArm: boolean;
 }
 
 export const CONTROL_CARDS: readonly ControlCard[] = [
-  { kind: 'signal', name: 'Traffic Light', description: 'Signals with a default phase plan', key: 'G', perArm: false },
-  { kind: 'stop', name: 'Stop Signs', description: 'Stop the minor road, or one arm', key: 'X', perArm: true },
-  { kind: 'allStop', name: 'All-Way Stop', description: 'Every approach stops', key: 'C', perArm: false },
-  { kind: 'yield', name: 'Yield', description: 'Minor road gives way, or one arm', key: 'Y', perArm: true },
-  { kind: 'priority', name: 'Priority Road', description: 'Main road goes first, or one arm', key: 'I', perArm: true },
-  { kind: 'auto', name: 'Auto', description: 'Picked from the road types', key: 'Z', perArm: false },
+  { kind: 'signal', name: 'Traffic light', description: 'Default phase plan', key: '1', perArm: false },
+  { kind: 'stop', name: 'Stop signs', description: 'Minor road, or one arm', key: '2', perArm: true },
+  { kind: 'allStop', name: 'All-way stop', description: 'Every approach', key: '3', perArm: false },
+  { kind: 'yield', name: 'Yield', description: 'Minor road, or one arm', key: '4', perArm: true },
+  { kind: 'priority', name: 'Priority road', description: 'Main road first', key: '5', perArm: true },
+  { kind: 'auto', name: 'Auto', description: 'From the road types', key: '6', perArm: false },
 ];
 
 export function controlCard(kind: ControlKind): ControlCard {

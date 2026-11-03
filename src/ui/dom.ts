@@ -51,7 +51,7 @@ export function clear(node: HTMLElement): void {
 
 export function iconButton(
   icon: string,
-  opts: { tip: string; keyHint?: string; class?: string; onClick: () => void; label?: string },
+  opts: { tip: string; keyHint?: string; desc?: string; class?: string; onClick: () => void; label?: string },
 ): HTMLButtonElement {
   return el(
     'button',
@@ -59,6 +59,7 @@ export function iconButton(
       class: `icon-btn ${opts.class ?? ''}`,
       tip: opts.tip,
       keyHint: opts.keyHint,
+      desc: opts.desc,
       html: icon + (opts.label ? `<span>${opts.label}</span>` : ''),
       attrs: { type: 'button', 'aria-label': opts.tip },
       on: {

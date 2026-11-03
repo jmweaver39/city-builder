@@ -133,6 +133,10 @@ export class TemplateTool extends Tool {
     this.ctx.changed();
   }
 
+  usesElevationKeys(): boolean {
+    return true;
+  }
+
   keyDown(e: ToolKey): boolean {
     if (e.key === '[' || e.key === ']') {
       this.rotate(e.key === ']' ? 1 : -1);

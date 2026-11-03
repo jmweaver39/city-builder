@@ -7,7 +7,7 @@
  * An area takes two clicks too, on its two sides. A stamp takes one, on a lane.
  */
 import type { NetworkChange } from '../core/RoadNetwork';
-import { pathPoints, roadPathBetween } from '../core/roadPaint';
+import { pathPoints, roadPathBetween, straightPathBetween } from '../core/roadPaint';
 import type { DecalKind, LineStyle, RoadPaintPiece, Vec3 } from '../core/types';
 import type { ToolMark } from '../render/api';
 import { lateralStops, nearestStop, roadCursor, stopPosition, stopRow, type LateralStop, type RoadCursor, type StopKind } from './roadAnchors';
@@ -78,6 +78,8 @@ interface Draft {
   /** Right of the walking direction. */
   offset: number;
   offset2?: number;
+  /** Lines: the offset at the far end, when it is not the start's. */
+  offsetEnd?: number;
   points: Vec3[];
 }
 
@@ -140,7 +142,15 @@ export class PaintTool extends Tool {
         return;
       }
     }
-    const line = pathPoints(net, pieces, offset);
+    // A line ends on the stop picked there, which may be another lane or another road.
+    let offsetEnd: number | undefined;
+    // Along one road the line keeps its lane; turning onto another arm it lands on the stop picked there.
+    if (this.isLine && !straightPathBetween(net, this.start, { segmentId: cursor.segmentId, t: cursor.t })) {
+      const far = this.stop?.offset ?? cursor.lateral;
+      const end = last.t0 <= last.t1 ? far : -far;
+      if (Math.abs(end - offset) > 0.05) offsetEnd = end;
+    }
+    const line = pathPoints(net, pieces, offset, offsetEnd ?? offset);
     let run = 0;
     for (let i = 1; i < line.length; i++) run += Math.hypot(line[i].x - line[i - 1].x, line[i].z - line[i - 1].z);
     if (run < MIN_RUN) {
@@ -148,7 +158,7 @@ export class PaintTool extends Tool {
       return;
     }
     const points = offset2 === undefined ? line : [...line, ...pathPoints(net, pieces, offset2).reverse()];
-    this.draft = { pieces, offset, offset2, points };
+    this.draft = { pieces, offset, offset2, offsetEnd, points };
   }
 
   private rows(): ToolMark[] {
@@ -234,7 +244,12 @@ export class PaintTool extends Tool {
     this.ctx.net.addDecal({
       kind: this.kind,
       points: [],
-      road: { pieces: draft.pieces, offset: draft.offset, ...(draft.offset2 === undefined ? {} : { offset2: draft.offset2 }) },
+      road: {
+        pieces: draft.pieces,
+        offset: draft.offset,
+        ...(draft.offset2 === undefined ? {} : { offset2: draft.offset2 }),
+        ...(draft.offsetEnd === undefined ? {} : { offsetEnd: draft.offsetEnd }),
+      },
       ...(this.isLine ? { lineStyle: paint.lineStyle } : {}),
       color: paint.color,
       width: paint.width,

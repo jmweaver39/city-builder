@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { RoadNetwork, defaultSignalPlan, effectiveControl, type Id } from '../../src/core';
 import { Simulation } from '../../src/sim';
 import { CTL_ALLSTOP, CTL_PRIORITY, CTL_SIGNAL } from '../../src/sim/junctions';
-import { GHOST_COLORS } from '../../src/tools/junctionControl';
+import { CONTROL_CARDS, GHOST_COLORS } from '../../src/tools/junctionControl';
+import { activeScopes, match } from '../../src/ui/keymap';
 import { rig } from './helpers';
 
 const free = (x: number, z: number) => ({ kind: 'free' as const, pos: { x, y: 0, z } });
@@ -169,15 +170,14 @@ describe('one-click junction control', () => {
     expect(r.view.highlight).toBeNull();
   });
 
-  it('picks cards by hotkey while the tool is active', () => {
+  it('numbers the cards 1 to 6, which the open tab picks by key', () => {
+    expect(CONTROL_CARDS.map((c) => c.key)).toEqual(['1', '2', '3', '4', '5', '6']);
+    const scopes = activeScopes({ tool: 'junction', select: null, tab: 'control' });
+    expect(match('2', scopes)?.id).toBe('tab.pick');
+    // Letters no longer pick cards, so they keep their global meaning.
     const r = rig();
     r.tools.setTool('junction');
-    expect(r.key('g')).toBe(true);
-    expect(r.tools.settings.junctionControl).toBe('signal');
-    r.key('x');
-    expect(r.tools.settings.junctionControl).toBe('stop');
-    r.key('Y');
-    expect(r.tools.settings.junctionControl).toBe('yield');
+    expect(r.key('g')).toBe(false);
   });
 
   it('still opens the detailed editor in inspect mode', () => {

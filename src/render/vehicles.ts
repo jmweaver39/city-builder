@@ -135,6 +135,13 @@ interface Bucket {
   material: THREE.Material;
 }
 
+/** Upload only the first n floats of an instanced attribute this frame. */
+function markRange(attr: THREE.BufferAttribute, n: number): void {
+  attr.clearUpdateRanges();
+  attr.addUpdateRange(0, n);
+  attr.needsUpdate = true;
+}
+
 const BEAM_OPACITY = 0.3;
 const START_CAPACITY = 256;
 
@@ -195,6 +202,12 @@ export class VehicleLayer {
   setQuality(q: QualitySettings): void {
     this.nearRange = q.vehicleNear;
     this.midRange = q.vehicleMid;
+    // Without sun shadows a vehicle still sits on its contact shadow, and the shadow map
+    // holds only still things, so it can be cached (scene.ts).
+    this.buckets.forEach((b, i) => {
+      b.castShadow = q.vehicleShadows && i % 3 < 2;
+      if (b.mesh) b.mesh.castShadow = b.castShadow;
+    });
   }
 
   private grow(b: Bucket, capacity: number): void {
@@ -255,12 +268,14 @@ export class VehicleLayer {
     this.projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     this.frustum.setFromProjectionMatrix(this.projView);
     const pl = this.planes;
-    this.frustum.planes.slice(0, 6).forEach((p, i) => {
+    const fp = this.frustum.planes;
+    for (let i = 0; i < 6; i++) {
+      const p = fp[i];
       pl[i * 4] = p.normal.x;
       pl[i * 4 + 1] = p.normal.y;
       pl[i * 4 + 2] = p.normal.z;
       pl[i * 4 + 3] = p.constant;
-    });
+    }
     const night = this.shared.uNight.value;
     const showBeams = night > 0.05 && cameraDistance < 1500;
     const beamArr = this.beams.instanceMatrix.array as Float32Array;
@@ -364,15 +379,9 @@ export class VehicleLayer {
       mesh.count = c;
       mesh.visible = c > 0;
       if (!c) continue;
-      for (const [attr, size] of [
-        [mesh.instanceMatrix, 16],
-        [b.colourAttr!, 3],
-        [b.stateAttr!, 2],
-      ] as [THREE.BufferAttribute, number][]) {
-        attr.clearUpdateRanges();
-        attr.addUpdateRange(0, c * size);
-        attr.needsUpdate = true;
-      }
+      markRange(mesh.instanceMatrix, c * 16);
+      markRange(b.colourAttr!, c * 3);
+      markRange(b.stateAttr!, c * 2);
     }
     this.blobs.count = blobs;
     this.blobs.visible = blobs > 0;

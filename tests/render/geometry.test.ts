@@ -6,7 +6,9 @@ import { buildSegmentPaint, arrowShape } from '../../src/render/markings';
 import { buildSegment } from '../../src/render/roads';
 import { buildJunction } from '../../src/render/junctions';
 import { strokesOf } from '../../src/render/constants';
-import { BuildingBuf, buildZone } from '../../src/render/endpoints';
+import { BuildingBuf, buildRegion, buildZone } from '../../src/render/endpoints';
+import { midrise, shed, tower } from '../../src/render/buildings';
+import { DEFAULT_ZONE_SETTINGS } from '../../src/core/zones';
 import { buildModels } from '../../src/render/vehicleModels';
 import * as THREE from 'three';
 
@@ -142,15 +144,18 @@ describe('ChunkBatch', () => {
 });
 
 /** Signed volume of a triangle soup. Positive when faces point outward. */
-function signedVolume(pos: ArrayLike<number>, idx?: ArrayLike<number>): number {
+function signedVolume(pos: ArrayLike<number>, idx?: ArrayLike<number>, lowest = false): number {
   let v = 0;
   const n = idx ? idx.length : pos.length / 3;
   const at = (k: number) => {
     const i = (idx ? idx[k] : k) * 3;
     return [pos[i], pos[i + 1], pos[i + 2]];
   };
-  // Measured about the first vertex, so position in the world does not matter.
-  const o = at(0);
+  // Measured about the first vertex, so position in the world does not matter. Open-
+  // bottomed parts at many heights are measured from the lowest vertex instead, so
+  // the missing bottoms all count the same way.
+  let o = at(0);
+  if (lowest) for (let i = 1; i < pos.length / 3; i++) if (pos[i * 3 + 1] < o[1]) o = [pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]];
   for (let k = 0; k + 2 < n; k += 3) {
     const a = at(k).map((c, i) => c - o[i]);
     const b = at(k + 1).map((c, i) => c - o[i]);
@@ -204,6 +209,33 @@ describe('procedural solids face outward', () => {
         expect(buf.pos.length).toBeGreaterThan(0);
         expect(signedVolume(buf.pos, buf.idx)).toBeGreaterThan(0);
         net.removeEndpoint(id);
+      }
+    }
+  });
+
+  it('zoned regions of every kind and density, and each generator', () => {
+    const net = new RoadNetwork();
+    net.drawRoad({ start: { kind: 'free', pos: v(-200, 0, 0) }, end: { kind: 'free', pos: v(200, 0, 0) }, roadType: 'street-2' });
+    for (const kind of ['residential', 'commercial', 'industrial', 'office'] as const) {
+      for (const density of ['low', 'medium', 'high'] as const) {
+        const id = net.addZone({ kind, density, enabled: true, name: 'z', polygon: [v(-150, 0, 8), v(150, 0, 8), v(150, 0, 90), v(-150, 0, 90)], source: 'shape', settings: { ...DEFAULT_ZONE_SETTINGS } });
+        const buf = new BuildingBuf();
+        buf.detail = new BuildingBuf();
+        const placed = buildRegion(net, net.project.zones!.find((z) => z.id === id)!, buf);
+        expect(placed.length).toBeGreaterThan(0);
+        expect(signedVolume(buf.pos, buf.idx)).toBeGreaterThan(0);
+        if (buf.detail.pos.length) expect(signedVolume(buf.detail.pos, buf.detail.idx, true)).toBeGreaterThan(0);
+        net.removeZone(id);
+      }
+    }
+    let seed = 1;
+    const rng = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    for (const [fx, fz] of headings) {
+      const f = { x: 10, z: 20, ground: 0, hw: 9, hd: 12, fx, fz };
+      for (const make of [(b: BuildingBuf) => midrise(b, f, 7, 'flats', rng), (b: BuildingBuf) => midrise(b, f, 9, 'offices', rng), (b: BuildingBuf) => tower(b, f, 30, rng), (b: BuildingBuf) => shed(b, f, 9, rng, true)]) {
+        const b = new BuildingBuf();
+        make(b);
+        expect(signedVolume(b.pos, b.idx)).toBeGreaterThan(0);
       }
     }
   });

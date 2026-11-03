@@ -3,7 +3,9 @@
  * inspectors. Everything reads the train sim through UiContext.rail.
  */
 import { TRAIN_TYPES, trainLength } from '../rail/consists';
-import type { TrainTypeId } from '../core/railTypes';
+import { segmentElectrification, stationLayout, type PlatformLayout, type TrainTypeId } from '../core/railTypes';
+import { BUILTIN_ROAD_TYPES } from '../core/roadTypes';
+import { connectedTrack, setElectrification } from '../tools/RailTools';
 import type { Id } from '../core/types';
 import type { UiContext } from './context';
 import { checkbox, clear, el, numberInput, row, selectInput, sliderInput, textInput } from './dom';
@@ -34,9 +36,39 @@ export function renderRailTray(ui: UiContext, options: HTMLElement, cards: HTMLE
       el('div', { class: 'card-name', text: name }),
       el('div', { class: 'card-meta', text: meta }),
     );
+  const wires = (on: boolean) => {
+    const active = tools.active.id === 'electrify' && tools.electrify.electrify === on;
+    return el(
+      'button',
+      {
+        class: `card ${active ? 'active' : ''}`,
+        tip: on ? 'Put up overhead wires (third rail on metro). Click or drag along track' : 'Take wires down: diesel territory. Click or drag along track',
+        keyHint: 'O',
+        attrs: { type: 'button', 'aria-label': on ? 'Electrify' : 'De-electrify' },
+        on: {
+          click: () => {
+            tools.electrify.electrify = on;
+            tools.setTool('electrify');
+            tools.settingsChanged();
+            cards.querySelectorAll('.wires-card').forEach((c) => c.classList.toggle('active', (c as HTMLElement).dataset.on === String(on)));
+          },
+        },
+        dataset: { on: String(on) },
+      },
+      el('div', { class: 'art', html: on ? ICONS.wires : ICONS.noWires }),
+      el('div', { class: 'card-name', text: on ? 'Electrify' : 'De-electrify' }),
+      el('div', { class: 'card-meta', text: on ? 'Wires up' : 'Diesel only' }),
+    );
+  };
+  const up = wires(true);
+  const down = wires(false);
+  up.classList.add('wires-card');
+  down.classList.add('wires-card');
   cards.append(
     card('station', ICONS.station, 'Station', 'Platform on track'),
     card('line', ICONS.trainLine, 'Line', 'Click stations in order'),
+    up,
+    down,
     el(
       'button',
       { class: 'card', tip: 'Every line with its trains and stats', attrs: { type: 'button', 'aria-label': 'Lines' }, on: { click: () => ui.rail?.openLines() } },
@@ -58,8 +90,9 @@ export function renderRailTray(ui: UiContext, options: HTMLElement, cards: HTMLE
     }),
     selectInput(
       [
-        { value: 'auto', label: 'Kind from track height' },
+        { value: 'auto', label: 'Level from track height' },
         { value: 'surface', label: 'Surface' },
+        { value: 'elevated', label: 'Elevated' },
         { value: 'underground', label: 'Subway' },
         { value: 'gateway', label: 'Freight gateway' },
       ],
@@ -69,6 +102,22 @@ export function renderRailTray(ui: UiContext, options: HTMLElement, cards: HTMLE
         rerender();
       },
     ),
+    selectInput(
+      [
+        { value: 'side', label: 'Side platform, side under cursor' },
+        { value: 'both', label: 'Platforms both sides' },
+        { value: 'island', label: 'Island between the tracks' },
+      ],
+      station.layout,
+      (v) => {
+        station.layout = v as typeof station.layout;
+        rerender();
+      },
+    ),
+    row('Building', checkbox(station.building, (v) => {
+      station.building = v;
+      rerender();
+    }), 'A station building beside the platforms. [ puts it on the other side'),
     el('div', { class: 'opt-title', text: 'New line' }),
     selectInput([{ value: 'auto', label: 'Train to suit track' }, ...TYPE_OPTIONS], line.trainType, (v) => {
       line.trainType = v as TrainTypeId | 'auto';
@@ -83,6 +132,12 @@ export function renderRailTray(ui: UiContext, options: HTMLElement, cards: HTMLE
       line.trains = Math.max(1, Math.round(v));
       rerender();
     })),
+    el('div', { class: 'opt-title', text: 'Wires' }),
+    row('Whole line', checkbox(tools.electrify.wholeLine, (v) => {
+      tools.electrify.wholeLine = v;
+      rerender();
+    }), 'Electrify or clear all track joined end to end, not just one piece. Shift+O does the same from any tool'),
+    el('div', { class: 'small muted', text: 'O over track toggles its wires.' }),
     el('button', { class: 'btn', text: 'Rail demo', tip: 'Replace the map with a sample railway', attrs: { type: 'button' }, on: { click: () => ui.rail?.loadDemo() } }),
   );
 }
@@ -164,6 +219,16 @@ export class LinesPanel {
         ),
       );
       if (info.problem) body.append(el('div', { class: 'small', style: { color: '#ff7a6b' }, text: info.problem }));
+      if (info.fixType) {
+        const fix = info.fixType;
+        body.append(el('div', { class: 'btn-row' }, el('button', {
+          class: 'btn primary',
+          text: `Switch to ${TRAIN_TYPES[fix].name}`,
+          tip: 'A diesel runs on track with or without wires',
+          attrs: { type: 'button' },
+          on: { click: () => edit('Switch to diesel', { trainType: fix, cars: TRAIN_TYPES[fix].defaultCars }) },
+        })));
+      }
       else if (info.warning) body.append(el('div', { class: 'small', style: { color: '#ffc857' }, text: info.warning }));
       body.append(
         row('Name', textInput(line.name, 'Line name', (v) => edit('Rename line', { name: v || line.name }))),
@@ -285,6 +350,7 @@ export class StationInspector {
       })),
       row('Kind', selectInput([
         { value: 'surface', label: 'Surface' },
+        { value: 'elevated', label: 'Elevated' },
         { value: 'underground', label: 'Subway' },
         { value: 'gateway', label: 'Freight gateway' },
       ], st.kind, (v) => {
@@ -293,6 +359,28 @@ export class StationInspector {
       })),
     );
     if (st.kind !== 'gateway') {
+      const seg = net.getSegment(st.segmentId);
+      const def = seg ? net.roadTypeOf(st.segmentId) : null;
+      const layouts = [
+        { value: 'left', label: 'Side platform, left' },
+        { value: 'right', label: 'Side platform, right' },
+        { value: 'both', label: 'Both sides' },
+        ...(def && def.lanes.length === 2 && Math.abs(def.lanes[0].offset) > 0.5 ? [{ value: 'island', label: 'Island' }] : []),
+      ] as { value: PlatformLayout; label: string }[];
+      body.append(
+        row('Platforms', selectInput(layouts, def ? stationLayout(st, def) : 'right', (v) => {
+          history.hint('Change platforms');
+          net.updateStation(st.id, { layout: v });
+        })),
+        row('Building', selectInput([
+          { value: 'none', label: 'None' },
+          { value: 'left', label: 'On the left' },
+          { value: 'right', label: 'On the right' },
+        ], st.building ?? 'none', (v) => {
+          history.hint('Change station building');
+          net.updateStation(st.id, { building: v === 'none' ? undefined : v });
+        })),
+      );
       body.append(row('Platform', sliderInput(st.platformLength, { min: 80, max: 450, step: 10, format: (v) => `${v} m` }, (v) => {
         history.hint('Platform length', `platform-${st.id}`);
         net.updateStation(st.id, { platformLength: v });
@@ -322,6 +410,99 @@ export class StationInspector {
 
   refresh(): boolean {
     if (!this.ui.net.rail.stations.some((s) => s.id === this.id)) return false;
+    const a = document.activeElement;
+    if (!(a instanceof HTMLInputElement && this.panel.body.contains(a))) this.render();
+    return true;
+  }
+
+  close(): void {
+    this.panel.onClose = null;
+    this.panel.close();
+  }
+}
+
+/** Clicked track: its power, with buttons, and the basics. */
+export class RailSegmentInspector {
+  private panel: Panel;
+  private whole = false;
+
+  constructor(private readonly ui: UiContext, private readonly id: Id) {
+    this.panel = new Panel(ui.host, 'Track', { wide: true });
+    this.panel.onClose = () => ui.inspect(null);
+    this.render();
+  }
+
+  private targets(): Id[] {
+    return this.whole ? connectedTrack(this.ui.net, this.id) : [this.id];
+  }
+
+  private render(): void {
+    const { net, history } = this.ui;
+    const seg = net.getSegment(this.id);
+    if (!seg) return;
+    const def = net.roadTypeOf(this.id);
+    const power = segmentElectrification(def, seg.overrides);
+    this.panel.setTitle(seg.overrides.name || def.name);
+    const body = this.panel.body;
+    clear(body);
+    const types = BUILTIN_ROAD_TYPES.filter((t) => t.category === 'rail').map((t) => ({ value: t.id, label: t.name }));
+    const setPower = (on: boolean) => {
+      history.hint(on ? 'Electrify track' : 'Remove overhead wires');
+      setElectrification(net, this.targets(), on);
+      this.render();
+    };
+    const metro = def.id.startsWith('metro');
+    const btn = (label: string, active: boolean, on: boolean) =>
+      el('button', { class: `btn ${active ? 'primary' : ''}`, text: label, attrs: { type: 'button', 'aria-pressed': String(active) }, on: { click: () => setPower(on) } });
+    body.append(
+      row('Track', selectInput(types, seg.roadType, (v) => {
+        history.hint('Change track type');
+        net.batch(() => {
+          for (const id of this.targets()) net.setRoadType(id, v);
+        });
+        this.render();
+      })),
+      row('Power', el('div', { class: 'btn-row' },
+        btn(metro ? 'Third rail' : 'Overhead wires', power !== 'none', true),
+        btn('None (diesel)', power === 'none', false),
+      ), 'Electric trains need it; diesels run either way. O over track toggles it'),
+      row(`Whole line (${connectedTrack(net, this.id).length})`, checkbox(this.whole, (v) => {
+        this.whole = v;
+        this.render();
+      }), 'Apply to all track joined end to end with this piece'),
+      row('Speed limit', sliderInput(seg.overrides.speedKmh ?? def.speedKmh, { min: 20, max: def.speedKmh >= 300 ? 320 : 200, step: 10, format: (v) => `${v} km/h` }, (v) => {
+        history.hint('Change speed limit', `speed:${this.id}`);
+        net.batch(() => {
+          for (const id of this.targets()) net.setSegmentOverrides(id, { speedKmh: v === def.speedKmh ? undefined : v });
+        });
+      })),
+    );
+    const geom = net.segmentGeom(this.id);
+    const lines = net.rail.lines.filter((l) => l.stops.some((s) => net.rail.stations.find((st) => st.id === s)?.segmentId === this.id));
+    body.append(
+      el('dl', { class: 'kv' },
+        el('dt', { text: 'Length' }), el('dd', { text: `${Math.round(geom?.length ?? 0)} m` }),
+        el('dt', { text: 'Power' }), el('dd', { text: power === 'overhead' ? 'Overhead wires' : power === 'thirdRail' ? 'Third rail' : 'None: diesel only' }),
+        el('dt', { text: 'Stations here' }), el('dd', { text: lines.length ? lines.map((l) => l.name).join(', ') : 'None' }),
+      ),
+      el('div', { class: 'btn-row', style: { marginTop: '8px' } }, el('button', {
+        class: 'btn danger',
+        text: 'Bulldoze',
+        attrs: { type: 'button' },
+        on: {
+          click: () => {
+            history.hint('Bulldoze track');
+            net.removeSegment(this.id);
+          },
+        },
+      })),
+    );
+  }
+
+  tick(): void {}
+
+  refresh(): boolean {
+    if (!this.ui.net.getSegment(this.id)) return false;
     const a = document.activeElement;
     if (!(a instanceof HTMLInputElement && this.panel.body.contains(a))) this.render();
     return true;

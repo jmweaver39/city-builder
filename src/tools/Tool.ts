@@ -34,6 +34,19 @@ export abstract class Tool {
     return false;
   }
 
+  /** True when Q and E (and PageUp, PageDown) step this tool's elevation rather than turn the camera. */
+  usesElevationKeys(): boolean {
+    return false;
+  }
+
+  /**
+   * True when the tool takes the right button (and Option+click) itself, as
+   * landscaping lowers with it. The camera then leaves right drag alone.
+   */
+  usesRightButton(): boolean {
+    return false;
+  }
+
   /** Right click: step back one stage. Return false when there is nothing to undo. */
   back(): boolean {
     return false;

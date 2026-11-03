@@ -9,7 +9,7 @@
  * The graph is rebuilt from scratch on any rail edit and holds no train state.
  */
 import { cubicPoint, type Cubic } from '../core/bezier';
-import { trackOffsets, trackOfLane, trackSpec } from '../core/railTypes';
+import { platformSides, segmentElectrification, stationLayout, trackOffsets, trackOfLane, trackSpec, type PlatformLayout, type RailStationKind } from '../core/railTypes';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import type { GLane, Id, LaneGraph, RoadTypeDef, Vec3 } from '../core/types';
 import {
@@ -60,6 +60,8 @@ export interface TrackBlock {
 
 /** Where a train can stop for a station: one spot per track. */
 export interface StationStop {
+  /** Platform sides of this track, bits: 1 left, 2 right, looking along the segment a to b. */
+  sides: number;
   piece: number;
   /** Along the piece from v0. */
   s: number;
@@ -69,13 +71,18 @@ export interface StationStop {
 export interface StationPlace {
   id: Id;
   name: string;
-  kind: 'surface' | 'underground' | 'gateway';
+  kind: RailStationKind;
   segmentId: Id;
   center: Vec3;
   platformLength: number;
+  layout: PlatformLayout;
+  building: 'left' | 'right' | null;
+  /** Only tracks with a platform. */
   stops: StationStop[];
-  /** Centreline of each platform track, for meshing. */
+  /** Centreline of each stop's track along the platform, for meshing. Same order as stops. */
   spans: Float32Array[];
+  /** Every track through the station, platform or not, for the station box. */
+  trackSpans: Float32Array[];
 }
 
 export interface LevelCrossing {
@@ -362,6 +369,7 @@ export function buildTrackGraph(net: RoadNetwork): TrackGraph {
     }
   }
   if (!runs.length) return g;
+  spreadForIslands(net, runAt);
 
   // Work out where each segment is cut: at platforms and crossovers first.
   const cuts = new Map<Id, number[]>();
@@ -441,6 +449,7 @@ export function buildTrackGraph(net: RoadNetwork): TrackGraph {
     }
     fractions.push(1);
     const spec = trackSpec(def.id)!;
+    const power = segmentElectrification(def, net.getSegment(seg)?.overrides);
     const normal: 1 | -1 | 0 = trackOffsets(def).length === 1 ? 0 : def.lanes[track].dir;
     let prevVertex = port(seg, track, 'a');
     for (let i = 0; i + 1 < fractions.length; i++) {
@@ -459,8 +468,8 @@ export function buildTrackGraph(net: RoadNetwork): TrackGraph {
         v1: nextVertex,
         normal,
         metro: spec.metro,
-        electrified: spec.electrified,
-        thirdRail: spec.thirdRail,
+        electrified: power === 'overhead',
+        thirdRail: power === 'thirdRail',
       });
       prevVertex = nextVertex;
     }
@@ -471,6 +480,7 @@ export function buildTrackGraph(net: RoadNetwork): TrackGraph {
     const left = runAt.get(`${x.seg}:0`)!;
     const right = runAt.get(`${x.seg}:1`)!;
     const spec = trackSpec(left.def.id)!;
+    const xpower = segmentElectrification(left.def, net.getSegment(x.seg)?.overrides);
     for (const [from, to] of [
       [left, right],
       [right, left],
@@ -507,8 +517,8 @@ export function buildTrackGraph(net: RoadNetwork): TrackGraph {
         v1,
         normal: 0,
         metro: spec.metro,
-        electrified: spec.electrified,
-        thirdRail: spec.thirdRail,
+        electrified: xpower === 'overhead',
+        thirdRail: xpower === 'thirdRail',
       });
     }
   }
@@ -534,6 +544,11 @@ export function buildTrackGraph(net: RoadNetwork): TrackGraph {
       }
       const seg = graph.lanes[lane.fromLane].segmentId;
       const spec = trackSpec(net.roadTypeOf(seg).id)!;
+      // A link is powered only where the track on both sides of it is.
+      const powerOf = (id: number) => segmentElectrification(net.roadTypeOf(id), net.getSegment(id)?.overrides);
+      const lpa = powerOf(seg);
+      const lpb = powerOf(graph.lanes[lane.toLane].segmentId);
+      const lpower = lpa === lpb ? lpa : 'none';
       const pts = Float32Array.from(lane.pts);
       const piece = addPiece({
         kind: 'link',
@@ -547,8 +562,8 @@ export function buildTrackGraph(net: RoadNetwork): TrackGraph {
         v1,
         normal: 1,
         metro: spec.metro,
-        electrified: spec.electrified,
-        thirdRail: spec.thirdRail,
+        electrified: lpower === 'overhead',
+        thirdRail: lpower === 'thirdRail',
       });
       linkKey.set(key, piece);
     } else {
@@ -571,6 +586,64 @@ export function buildTrackGraph(net: RoadNetwork): TrackGraph {
   buildEnds(net, g);
   g.index();
   return g;
+}
+
+/** Half the distance between tracks at an island platform: edge clearance plus half the island. */
+export const ISLAND_HALF = 1.65 + 3;
+/** Length over which the tracks ease apart before an island, and back after it. */
+const ISLAND_EASE = 70;
+
+/**
+ * Double track spreads round an island platform: each track eases out over
+ * ISLAND_EASE metres, runs parallel past the platform, and eases back. Applied to the
+ * runs before anything is cut, so pieces, crossovers and stops all agree.
+ */
+function spreadForIslands(net: RoadNetwork, runAt: Map<string, Run>): void {
+  for (const st of net.rail.stations) {
+    if (st.layout !== 'island' || st.kind === 'gateway') continue;
+    const left = runAt.get(`${st.segmentId}:0`);
+    const right = runAt.get(`${st.segmentId}:1`);
+    if (!left || !right) continue;
+    const offset = trackSpec(left.def.id)?.trackOffset ?? 0;
+    const push = ISLAND_HALF - offset;
+    if (push <= 0.01) continue;
+    for (const [run, sign] of [
+      [left, -1],
+      [right, 1],
+    ] as const) {
+      const c = projectOnto(asPiece(run), stationPoint(net, st.segmentId, st.t)).s;
+      const half = st.platformLength / 2 + 6;
+      const s0 = c - half - ISLAND_EASE;
+      const s1 = c + half + ISLAND_EASE;
+      // No room to ease in and out inside this segment: leave the track as it is.
+      if (s0 < 2 || s1 > run.length - 2) continue;
+      const amount = (s: number): number => {
+        const d = Math.abs(s - c) - half;
+        if (d <= 0) return push;
+        if (d >= ISLAND_EASE) return 0;
+        const k = 1 - d / ISLAND_EASE;
+        return push * k * k * (3 - 2 * k);
+      };
+      const out: number[] = [];
+      const add = (u: number) => {
+        const p = pointOn(run.pts, run.cum, u);
+        const a = pointOn(run.pts, run.cum, Math.max(0, u - 1));
+        const b = pointOn(run.pts, run.cum, Math.min(run.length, u + 1));
+        const tx = b.x - a.x;
+        const tz = b.z - a.z;
+        const l = Math.hypot(tx, tz) || 1;
+        const k = amount(u) * sign;
+        out.push(p.x + (-tz / l) * k, p.y, p.z + (tx / l) * k);
+      };
+      for (let i = 0; i < run.cum.length && run.cum[i] < s0; i++) out.push(run.pts[i * 3], run.pts[i * 3 + 1], run.pts[i * 3 + 2]);
+      for (let u = s0; u < s1; u += 4) add(u);
+      add(s1);
+      for (let i = 0; i < run.cum.length; i++) if (run.cum[i] > s1 + 0.5) out.push(run.pts[i * 3], run.pts[i * 3 + 1], run.pts[i * 3 + 2]);
+      run.pts = Float32Array.from(out);
+      run.cum = polyLength(run.pts);
+      run.length = run.cum[run.cum.length - 1];
+    }
+  }
 }
 
 function asPiece(run: Run): TrackPiece {
@@ -741,11 +814,16 @@ function buildBlocks(net: RoadNetwork, g: TrackGraph): void {
 function buildStations(net: RoadNetwork, g: TrackGraph, fractions: Map<Id, number>): void {
   for (const st of net.rail.stations) {
     if (!fractions.has(st.id)) continue;
+    const def = net.roadTypeOf(st.segmentId);
     const center = stationPoint(net, st.segmentId, st.t);
+    const tracks = trackOffsets(def).length;
+    const layout = stationLayout(st, def);
+    const sides = st.kind === 'gateway' ? new Array(tracks).fill(3) : platformSides(layout, tracks);
     const stops: StationStop[] = [];
     const spans: Float32Array[] = [];
+    const trackSpans: Float32Array[] = [];
     const list = g.pieces.filter((p) => p.segmentId === st.segmentId);
-    for (const track of [0, 1]) {
+    for (let track = 0; track < tracks; track++) {
       const pieces = list.filter((p) => p.track === track);
       let best: StationStop | null = null;
       let bestD = Infinity;
@@ -753,12 +831,15 @@ function buildStations(net: RoadNetwork, g: TrackGraph, fractions: Map<Id, numbe
         const hit = projectOnto(p, center);
         if (hit.distance < bestD) {
           bestD = hit.distance;
-          best = { piece: p.id, s: hit.s, track };
+          best = { piece: p.id, s: hit.s, track, sides: sides[track] };
         }
       }
       if (!best) continue;
+      const span = platformSpan(g, best, Math.max(st.platformLength, 20));
+      trackSpans.push(span);
+      if (!best.sides) continue;
       stops.push(best);
-      spans.push(platformSpan(g, best, st.platformLength));
+      spans.push(span);
     }
     g.stations.set(st.id, {
       id: st.id,
@@ -767,8 +848,11 @@ function buildStations(net: RoadNetwork, g: TrackGraph, fractions: Map<Id, numbe
       segmentId: st.segmentId,
       center,
       platformLength: st.platformLength,
+      layout,
+      building: st.building ?? null,
       stops,
       spans,
+      trackSpans,
     });
   }
 }

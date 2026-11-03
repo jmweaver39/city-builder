@@ -33,8 +33,8 @@ export interface GridSettings {
   originZ: number;
   /** Every this many lines is drawn as a major line. */
   majorEvery: number;
-  /** Grid Block tool: grid cells per block side. */
-  blockCells: number;
+  /** Align to road puts the origin on the road's centreline, so grid lines run at exact multiples of the spacing from it. */
+  alignOrigin: boolean;
   /** Snap to the finest subdivision visible at the current zoom. Off: base spacing only. */
   snapSubdivisions: boolean;
 }
@@ -42,13 +42,10 @@ export interface GridSettings {
 export const GRID_SPACINGS: readonly number[] = [8, 16, 32, 64, 128];
 export const GRID_MIN_SPACING = 2;
 export const GRID_MAX_SPACING = 512;
-export const GRID_MAX_BLOCK_CELLS = 16;
-/** Most blocks along one side of a Grid Block drag. */
-export const GRID_MAX_BLOCKS = 16;
 const QUARTER = Math.PI / 2;
 
 export function defaultGrid(): GridSettings {
-  return { enabled: false, spacing: 32, rotation: 0, originX: 0, originZ: 0, majorEvery: 4, blockCells: 2, snapSubdivisions: true };
+  return { enabled: false, spacing: 32, rotation: 0, originX: 0, originZ: 0, majorEvery: 4, alignOrigin: true, snapSubdivisions: true };
 }
 
 /** Rotation folded into [0, PI/2). */
@@ -75,7 +72,7 @@ export function sanitizeGrid(raw: Partial<GridSettings> | null | undefined): Gri
     originX: Math.min(MAP_HALF_SIZE, Math.max(-MAP_HALF_SIZE, num(raw.originX, d.originX))),
     originZ: Math.min(MAP_HALF_SIZE, Math.max(-MAP_HALF_SIZE, num(raw.originZ, d.originZ))),
     majorEvery: major === 5 ? 5 : 4,
-    blockCells: Math.min(GRID_MAX_BLOCK_CELLS, Math.max(1, Math.round(num(raw.blockCells, d.blockCells)))),
+    alignOrigin: typeof raw.alignOrigin === 'boolean' ? raw.alignOrigin : d.alignOrigin,
     snapSubdivisions: typeof raw.snapSubdivisions === 'boolean' ? raw.snapSubdivisions : d.snapSubdivisions,
   };
 }
@@ -316,285 +313,19 @@ export function refineSegmentHit(net: RoadNetwork, hit: SnapHit, g: GridSettings
 // Align to a road
 // ---------------------------------------------------------------------------
 
-/** Grid settings turned and shifted so a grid line runs along the road at `t`. */
+/**
+ * Grid settings turned to run along the road at `t`. With `alignOrigin`, the
+ * origin moves onto the road's centreline there, so grid lines run along it and
+ * at exact multiples of the spacing from it: roads drawn on grid lines come out
+ * evenly parallel to it. Otherwise only the rotation changes.
+ */
 export function gridAlignedTo(net: RoadNetwork, segmentId: Id, t: number, g: GridSettings): GridSettings {
   const c = net.cubicOf(segmentId);
   const p = cubicPoint(c, t);
   const dir = cubicTangentXZ(c, t);
-  return {
-    ...g,
-    rotation: normalizeGridRotation(Math.atan2(dir.z, dir.x)),
-    originX: Math.round(p.x * 1000) / 1000,
-    originZ: Math.round(p.z * 1000) / 1000,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Grid Block: a rectangle of street blocks
-// ---------------------------------------------------------------------------
-
-export interface BlockEdge {
-  /** Lattice indices of the two ends. */
-  i0: number;
-  j0: number;
-  i1: number;
-  j1: number;
-  from: Vec3;
-  to: Vec3;
-}
-
-export interface BlockPlan {
-  /** Blocks along u and along v. */
-  ni: number;
-  nj: number;
-  /** Block side, metres. */
-  block: number;
-  /** Lattice point (i, j), i along u from the start corner, j along v. */
-  point(i: number, j: number): Vec3;
-  /** Row edges first (along u), then column edges (along v). */
-  edges: BlockEdge[];
-  /** Corners, for drawing the outline. */
-  corners: [Vec3, Vec3, Vec3, Vec3];
-}
-
-/**
- * Plan the street grid dragged from `start` to `cursor`. The start corner lands
- * on the nearest grid intersection, and each side is a whole number of blocks,
- * at least one, on the side of the start the cursor is on.
- */
-export function planGridBlock(g: GridSettings, start: Vec3, cursor: Vec3, y: number): BlockPlan {
-  const s = g.spacing;
-  const block = s * Math.max(1, Math.round(g.blockCells));
-  const st = toGrid(g, start);
-  const a0 = Math.round(st.a / s) * s;
-  const b0 = Math.round(st.b / s) * s;
-  const cur = toGrid(g, cursor);
-  const da = cur.a - a0;
-  const db = cur.b - b0;
-  const ni = Math.min(GRID_MAX_BLOCKS, Math.max(1, Math.round(Math.abs(da) / block)));
-  const nj = Math.min(GRID_MAX_BLOCKS, Math.max(1, Math.round(Math.abs(db) / block)));
-  const sa = da < 0 ? -block : block;
-  const sb = db < 0 ? -block : block;
-  const point = (i: number, j: number) => fromGrid(g, a0 + i * sa, b0 + j * sb, y);
-  const edges: BlockEdge[] = [];
-  for (let j = 0; j <= nj; j++) {
-    for (let i = 0; i < ni; i++) edges.push({ i0: i, j0: j, i1: i + 1, j1: j, from: point(i, j), to: point(i + 1, j) });
-  }
-  for (let i = 0; i <= ni; i++) {
-    for (let j = 0; j < nj; j++) edges.push({ i0: i, j0: j, i1: i, j1: j + 1, from: point(i, j), to: point(i, j + 1) });
-  }
-  return { ni, nj, block, point, edges, corners: [point(0, 0), point(ni, 0), point(ni, nj), point(0, nj)] };
-}
-
-const ATTACH_SLACK = 1;
-
-/**
- * The existing node or road a lattice point lands on, or a free point. Within a
- * road's half width counts, so a block dragged up to a road joins it.
- */
-export function resolveLatticeAnchor(net: RoadNetwork, p: Vec3, block: number, ignore?: ReadonlySet<Id>): RoadAnchor {
-  const nodeReach = Math.min(4, block * 0.2);
-  const near = net.nearestNode(p, nodeReach);
-  const node = near ? net.getNode(near.nodeId) : undefined;
-  if (node && Math.abs(node.pos.y - p.y) < 1.5) return { kind: 'node', id: node.id };
-  const reach = 30;
-  const box = { minX: p.x - reach, minZ: p.z - reach, maxX: p.x + reach, maxZ: p.z + reach };
-  let best: { id: Id; t: number; d: number } | null = null;
-  for (const id of net.segmentsInRegion(box, true)) {
-    if (ignore?.has(id)) continue;
-    const c = net.cubicOf(id);
-    const hit = closestPointOnCubic(c, p);
-    if (Math.abs(hit.point.y - p.y) > 1.5) continue;
-    const tol = Math.min(totalHalfWidth(net.roadTypeOf(id)) + ATTACH_SLACK, block * 0.25);
-    if (hit.distance > tol || (best && hit.distance >= best.d)) continue;
-    best = { id, t: hit.t, d: hit.distance };
-  }
-  if (best) {
-    const seg = net.getSegment(best.id)!;
-    const len = net.segmentGeom(best.id)?.fullLength ?? 0;
-    if (best.t * len < 6) return { kind: 'node', id: seg.a };
-    if ((1 - best.t) * len < 6) return { kind: 'node', id: seg.b };
-    return { kind: 'segment', id: best.id, t: best.t };
-  }
-  return { kind: 'free', pos: { ...p } };
-}
-
-/** True when an existing road already runs along this edge, so it is not drawn again. */
-export function edgeCovered(net: RoadNetwork, e: BlockEdge): boolean {
-  const n = 6;
-  for (let k = 0; k <= n; k++) {
-    const f = k / n;
-    const p = { x: e.from.x + (e.to.x - e.from.x) * f, y: e.from.y, z: e.from.z + (e.to.z - e.from.z) * f };
-    const hit = net.nearestSegment(p, 1.5);
-    if (!hit || Math.abs(hit.point.y - p.y) > 1.5) return false;
-    // A road crossing the edge passes one sample; it must also run along it.
-    if (k > 0 && k < n) {
-      const along = cubicTangentXZ(net.cubicOf(hit.segmentId), hit.t);
-      const dir = normalizeXZ(sub(e.to, e.from));
-      if (Math.abs(along.x * dir.x + along.z * dir.z) < 0.97) return false;
-    }
-  }
-  return true;
-}
-
-function roadsAt(net: RoadNetwork, a: RoadAnchor): readonly Id[] {
-  if (a.kind === 'segment') return [a.id];
-  if (a.kind === 'node') return net.getNode(a.id)?.segments ?? [];
-  return [];
-}
-
-/**
- * Both ends of the edge landed on the same existing road, which runs along the
- * edge: drawing it would lay a second road over the first.
- */
-function sharedRoad(net: RoadNetwork, a: RoadAnchor, b: RoadAnchor, e: BlockEdge, block: number): boolean {
-  const other = new Set(roadsAt(net, b));
-  const mid = { x: (e.from.x + e.to.x) / 2, y: e.from.y, z: (e.from.z + e.to.z) / 2 };
-  const dir = normalizeXZ(sub(e.to, e.from));
-  for (const id of roadsAt(net, a)) {
-    if (!other.has(id)) continue;
-    const c = net.cubicOf(id);
-    const hit = closestPointOnCubic(c, mid);
-    if (hit.distance > block * 0.25) continue;
-    const along = cubicTangentXZ(c, hit.t);
-    if (Math.abs(along.x * dir.x + along.z * dir.z) > 0.9) return true;
-  }
-  return false;
-}
-
-export interface BlockCheck {
-  /** Per edge: drawn, or skipped because a road is already there. */
-  covered: boolean[];
-  /** Per edge: the worst validation severity. */
-  state: ('ok' | 'warning' | 'error')[];
-  /** Reasons that stop the build. */
-  errors: string[];
-  warnings: string[];
-  /** Expected new segments and lattice junctions, before splits of existing roads. */
-  segments: number;
-  junctions: number;
-}
-
-function sampleEdge(e: BlockEdge, step: number): Vec3[] {
-  const len = distXZ(e.from, e.to);
-  const n = Math.max(1, Math.ceil(len / step));
-  const out: Vec3[] = [];
-  for (let k = 0; k <= n; k++) {
-    const f = k / n;
-    out.push({ x: e.from.x + (e.to.x - e.from.x) * f, y: e.from.y, z: e.from.z + (e.to.z - e.from.z) * f });
-  }
-  return out;
-}
-
-/** Smallest block side this road type makes sensible junctions with. */
-export function minBlockFor(net: RoadNetwork, roadType: string): number {
-  const def = net.roadType(roadType);
-  return Math.max(24, (def ? totalHalfWidth(def) : 6) * 2 + 16);
-}
-
-/** Check a plan against the network without changing anything. */
-export function checkGridBlock(net: RoadNetwork, plan: BlockPlan, roadType: string): BlockCheck {
-  const errors = new Set<string>();
-  const warnings = new Set<string>();
-  const covered: boolean[] = [];
-  const state: BlockCheck['state'] = [];
-  const minBlock = minBlockFor(net, roadType);
-  if (plan.block < minBlock - 1e-6) {
-    errors.add(`Blocks of ${plan.block.toFixed(0)} m are too small for this road, it needs ${minBlock.toFixed(0)} m. Raise the block size.`);
-  }
-  for (const c of plan.corners) {
-    if (Math.abs(c.x) > MAP_HALF_SIZE || Math.abs(c.z) > MAP_HALF_SIZE) errors.add('The street grid leaves the map.');
-  }
-  let water = false;
-  const ground = plan.corners[0].y <= 1;
-  for (const e of plan.edges) {
-    if (ground && !water) {
-      for (const p of sampleEdge(e, 4)) {
-        if (isWater(p.x, p.z)) {
-          water = true;
-          break;
-        }
-      }
-    }
-  }
-  if (water) errors.add('A street grid cannot be built over water.');
-  const anchorCache = new Map<string, RoadAnchor>();
-  const anchorAt = (i: number, j: number) => {
-    const key = `${i},${j}`;
-    let a = anchorCache.get(key);
-    if (!a) anchorCache.set(key, (a = resolveLatticeAnchor(net, plan.point(i, j), plan.block)));
-    return a;
-  };
-  let segments = 0;
-  const degree = new Map<string, number>();
-  for (const e of plan.edges) {
-    const isCovered = errors.size === 0 && (edgeCovered(net, e) || sharedRoad(net, anchorAt(e.i0, e.j0), anchorAt(e.i1, e.j1), e, plan.block));
-    covered.push(isCovered);
-    for (const k of [`${e.i0},${e.j0}`, `${e.i1},${e.j1}`]) degree.set(k, (degree.get(k) ?? 0) + 1);
-    if (isCovered) {
-      state.push('ok');
-      continue;
-    }
-    segments++;
-    if (errors.size) {
-      state.push('error');
-      continue;
-    }
-    const issues = net.validateDraft({ start: anchorAt(e.i0, e.j0), end: anchorAt(e.i1, e.j1), roadType });
-    let worst: 'ok' | 'warning' | 'error' = 'ok';
-    for (const issue of issues) {
-      if (issue.severity === 'error') {
-        worst = 'error';
-        errors.add(issue.message);
-      } else {
-        if (worst === 'ok') worst = 'warning';
-        warnings.add(issue.message);
-      }
-    }
-    state.push(worst);
-  }
-  if (errors.size) for (let k = 0; k < state.length; k++) if (!covered[k]) state[k] = 'error';
-  let junctions = 0;
-  for (const d of degree.values()) if (d >= 3) junctions++;
-  return { covered, state, errors: [...errors], warnings: [...warnings], segments, junctions };
-}
-
-export interface BlockBuildResult {
-  segments: Id[];
-  /** Node at each lattice point that got one, keyed "i,j". */
-  lattice: Map<string, Id>;
-}
-
-/**
- * Build the plan. Call inside one `net.batch` so it is one undo step. Edges an
- * existing road already covers are skipped, and lattice points on existing
- * roads split them, so the new streets join the old ones at junctions.
- */
-export function buildGridBlock(net: RoadNetwork, plan: BlockPlan, roadType: string, covered?: readonly boolean[]): BlockBuildResult {
-  const lattice = new Map<string, Id>();
-  const segments: Id[] = [];
-  const own = new Set<Id>();
-  const anchorAt = (i: number, j: number): RoadAnchor => {
-    const id = lattice.get(`${i},${j}`);
-    if (id !== undefined && net.getNode(id)) return { kind: 'node', id };
-    return resolveLatticeAnchor(net, plan.point(i, j), plan.block, own);
-  };
-  plan.edges.forEach((e, k) => {
-    if (covered?.[k]) return;
-    const start = anchorAt(e.i0, e.j0);
-    const end = anchorAt(e.i1, e.j1);
-    if (start.kind === 'node' && end.kind === 'node' && start.id === end.id) return;
-    const r = net.drawRoad({ start, end, roadType });
-    for (const s of r.segments) {
-      segments.push(s);
-      own.add(s);
-    }
-    if (r.nodes.length) {
-      lattice.set(`${e.i0},${e.j0}`, r.nodes[0]);
-      lattice.set(`${e.i1},${e.j1}`, r.nodes[r.nodes.length - 1]);
-    }
-  });
-  return { segments, lattice };
+  const rotation = normalizeGridRotation(Math.atan2(dir.z, dir.x));
+  if (!g.alignOrigin) return { ...g, rotation };
+  return { ...g, rotation, originX: p.x, originZ: p.z };
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +344,7 @@ export function gridViewFor(
   center: { x: number; z: number } | null,
   elevation: number,
 ): GridView | null {
-  const show = toolId === 'gridBlock' || toolId === 'gridAlign' || (toolId === 'road' && g.enabled && drawMode !== 'upgrade');
+  const show = toolId === 'gridAlign' || (toolId === 'road' && g.enabled && drawMode !== 'upgrade');
   if (!show || !center) return null;
   const s = preview ?? g;
   return {

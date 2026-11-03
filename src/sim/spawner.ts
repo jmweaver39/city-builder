@@ -23,6 +23,8 @@ export class Spawner {
   /** Unit-rate time to the next arrival, per place. */
   private nextArrival: Float64Array = new Float64Array(0);
   pending: Int32Array = new Int32Array(0);
+  /** Type drawn for the next vehicle at each place, -1 for none yet. */
+  private drawnType: Int8Array = new Int8Array(0);
   counts: PlaceCounts[] = [];
   private byKey = new Map<string, PlaceCounts>();
   private laneStamp: Float64Array = new Float64Array(0);
@@ -37,6 +39,7 @@ export class Spawner {
     });
     this.nextArrival = new Float64Array(places.length);
     this.pending = new Int32Array(places.length);
+    this.drawnType = new Int8Array(places.length).fill(-1);
     this.counts = places.map((p, i) => {
       this.nextArrival[i] = oldNext.get(p.key) ?? w.rng.exp();
       this.pending[i] = oldPending.get(p.key) ?? 0;
@@ -103,6 +106,7 @@ export class Spawner {
         const r = this.trySpawn(w, i, p, onEnter);
         if (r === 'sent') this.pending[i]--;
         else if (r === 'noRoute') {
+          this.drawnType[i] = -1;
           this.pending[i]--;
           tries++;
           if (this.pending[i] === 0) break;
@@ -158,15 +162,20 @@ export class Spawner {
     const { g, routes } = w;
     const mix = place.mix ?? w.net.traffic.defaultMix;
     // A small share rides wherever a bike lane leads somewhere.
+    // The type is drawn once per waiting vehicle and kept while it waits, so a queue of
+    // blocked cars does not turn into bikes by drawing again on every try.
+    let drawn = this.drawnType[index];
+    if (drawn < 0) {
+      drawn = this.hasLane(g, place.sources, ALLOW_BIKE) && w.rng.next() < BIKE_SHARE ? TYPE_BIKE : this.pickType(w, mix);
+      this.drawnType[index] = drawn;
+    }
     let type = TYPE_BIKE;
     let table = routes.bike;
     let bit = ALLOW_BIKE;
     let dest = -1;
-    if (this.hasLane(g, place.sources, ALLOW_BIKE) && w.rng.next() < BIKE_SHARE) {
-      dest = this.pickDest(w, index, table, place.sources, bit);
-    }
+    if (drawn === TYPE_BIKE) dest = this.pickDest(w, index, table, place.sources, bit);
     if (dest < 0) {
-      type = this.pickType(w, mix);
+      type = drawn === TYPE_BIKE ? this.pickType(w, mix) : drawn;
       bit = type === TYPE_BUS ? ALLOW_BUS : ALLOW_CAR;
       if (!this.hasLane(g, place.sources, bit)) {
         type = 0;
@@ -199,6 +208,7 @@ export class Spawner {
     }
     if (best < 0) return 'blocked';
     this.place(w, index, dest, place.sources[best], type);
+    this.drawnType[index] = -1;
     onEnter(g.segIdx[place.sources[best].lane]);
     return 'sent';
   }
@@ -252,6 +262,7 @@ export class Spawner {
       if (safe < speed) speed = safe;
     }
     if (routes.places[source].isZone) speed = Math.min(speed, 3);
+    if (speed > p.maxSpeed) speed = p.maxSpeed;
 
     veh.type[v] = type;
     veh.color[v] = rng.int(COLOR_COUNT);
@@ -300,9 +311,11 @@ export class Spawner {
     veh.stuckSec[v] = 0;
     veh.stuckProgress[v] = 0;
     veh.held[v] = 0;
+    veh.claimWait[v] = 0;
     veh.spawnTime[v] = w.time;
     veh.vlTick[v] = -1;
     veh.enterTick[v] = 0;
+    veh.guardFor[v] = -1;
     veh.readyTick[v] = -1;
     veh.stratTick[v] = 0;
     veh.blink[v] = 0;

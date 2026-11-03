@@ -116,13 +116,17 @@ export class SceneRig {
   private shadowsOn = true;
   private shadowMin = 110;
   private underground = false;
+  private shadowKey = new Float64Array(8);
+  private shadowEvery = 1;
+  private shadowAge = 0;
+  private shadowDirty = true;
   /** Unit vector toward the sun or, at night, the moon. */
   readonly lightDir = new THREE.Vector3(0.4, 0.8, 0.3);
   readonly sunVector = new THREE.Vector3();
 
   constructor(
     private readonly shared: Shared,
-    gl: THREE.WebGLRenderer,
+    private readonly gl: THREE.WebGLRenderer,
   ) {
     this.scene.add(this.hemi);
     const sun = this.sun;
@@ -277,12 +281,23 @@ export class SceneRig {
     s.mapSize.set(size, size);
     s.map?.dispose();
     (s as { map: THREE.WebGLRenderTarget | null }).map = null;
+    this.shadowDirty = true;
     this.shadowMin = size >= 4096 ? 110 : 170;
   }
 
   setShadows(on: boolean): void {
     this.shadowsOn = on;
     this.sun.castShadow = on;
+    this.shadowDirty = true;
+  }
+
+  /**
+   * How far from the camera's focus, on the ground, the shadow map can show a caster:
+   * the box's half size stretched along a low sun. 0 with shadows off.
+   */
+  get shadowReach(): number {
+    if (!this.shadowsOn || !this.shadowRadius) return 0;
+    return this.shadowRadius / Math.max(0.3, this.lightDir.y) + 30;
   }
 
   /** Keep the sky on the camera, and the shadow box around what is in view. */
@@ -312,11 +327,47 @@ export class SceneRig {
     const up = _u.copy(dir).cross(right).normalize();
     const px = Math.round(focus.dot(right) / texel) * texel;
     const py = Math.round(focus.dot(up) / texel) * texel;
-    const pz = focus.dot(dir);
+    // Depth along the light is snapped coarsely too (near and far have metres to spare),
+    // so a cached shadow map stays valid while the focus only rises or falls.
+    const pz = Math.round(focus.dot(dir) / 4) * 4;
     _t.copy(right).multiplyScalar(px).addScaledVector(up, py).addScaledVector(dir, pz);
     sun.target.position.copy(_t);
     sun.position.copy(_t).addScaledVector(dir, 3200);
     sun.target.updateMatrixWorld();
+    // Cached shadows: redraw when the box or the light moved, when told the scene
+    // changed, and every shadowEvery frames regardless, for moving casters.
+    const k = this.shadowKey;
+    if (k[0] !== px || k[1] !== py || k[2] !== pz || k[3] !== radius || k[4] !== dir.x || k[5] !== dir.y || k[6] !== dir.z || k[7] !== size) {
+      k[0] = px;
+      k[1] = py;
+      k[2] = pz;
+      k[3] = radius;
+      k[4] = dir.x;
+      k[5] = dir.y;
+      k[6] = dir.z;
+      k[7] = size;
+      this.shadowDirty = true;
+    }
+    if (this.shadowEvery > 1) {
+      this.shadowAge++;
+      if (this.shadowDirty || this.shadowAge >= this.shadowEvery) {
+        this.gl.shadowMap.needsUpdate = true;
+        this.shadowAge = 0;
+        this.shadowDirty = false;
+      }
+    }
+  }
+
+  /** Something that casts shadows changed: redraw the shadow map on the next frame. */
+  invalidateShadows(): void {
+    this.shadowDirty = true;
+  }
+
+  /** Redraw the shadow map at least every n frames, and otherwise only when needed. 1 is every frame. */
+  setShadowEvery(n: number): void {
+    this.shadowEvery = Math.max(1, Math.round(n));
+    this.gl.shadowMap.autoUpdate = this.shadowEvery <= 1;
+    this.shadowDirty = true;
   }
 
   /** Fog stays out of the map at any zoom, and always swallows the mesh edge. */

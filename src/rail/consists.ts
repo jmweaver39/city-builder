@@ -38,6 +38,8 @@ export const CAR = {
   flatcar: 13,
   doubleStack: 14,
   autorack: 15,
+  bilevel: 16,
+  bilevelCab: 17,
 } as const;
 
 export const CAR_KINDS: readonly CarKindDef[] = [
@@ -57,6 +59,9 @@ export const CAR_KINDS: readonly CarKindDef[] = [
   { id: 'flatcar', length: 20.4, width: 2.9, height: 3.9, bogieSpacing: 14.6, tare: 24, payload: 50, capacity: 0 },
   { id: 'doubleStack', length: 21.8, width: 2.9, height: 6.1, bogieSpacing: 15.8, tare: 30, payload: 60, capacity: 0 },
   { id: 'autorack', length: 27.6, width: 3.1, height: 5.5, bogieSpacing: 20.5, tare: 50, payload: 28, capacity: 0 },
+  // American bilevel commuter coach and its cab car, 85 ft over the body.
+  { id: 'bilevel', length: 25.9, width: 3.2, height: 4.85, bogieSpacing: 18.3, tare: 52, payload: 12, capacity: 150 },
+  { id: 'bilevelCab', length: 25.9, width: 3.2, height: 4.85, bogieSpacing: 18.3, tare: 54, payload: 11, capacity: 140 },
 ];
 
 export interface TrainTypeDef {
@@ -90,8 +95,10 @@ export interface TrainTypeDef {
   metro: boolean;
   /** Passengers or freight. */
   passengers: boolean;
-  /** Needs overhead wire or third rail. Diesels go anywhere. */
-  electric: boolean;
+  /** What it draws power from. Diesels go anywhere; the rest need their kind of electrification. */
+  power: 'overhead' | 'thirdRail' | 'diesel';
+  /** The diesel type to offer when its track is not electrified, if any. */
+  diesel: TrainTypeId | null;
   /** Shown in the line panel. */
   blurb: string;
 }
@@ -116,7 +123,8 @@ export const TRAIN_TYPES: Record<TrainTypeId, TrainTypeDef> = {
     changeEnds: 30,
     metro: true,
     passengers: true,
-    electric: true,
+    power: 'thirdRail',
+    diesel: null,
     blurb: '6 to 10 cars of 20 m, third rail',
   },
   emu: {
@@ -138,7 +146,8 @@ export const TRAIN_TYPES: Record<TrainTypeId, TrainTypeDef> = {
     changeEnds: 50,
     metro: false,
     passengers: true,
-    electric: true,
+    power: 'overhead',
+    diesel: 'dieselCommuter',
     blurb: '8 to 12 cars of 25 m, overhead wire',
   },
   intercity: {
@@ -160,7 +169,8 @@ export const TRAIN_TYPES: Record<TrainTypeId, TrainTypeDef> = {
     changeEnds: 90,
     metro: false,
     passengers: true,
-    electric: true,
+    power: 'overhead',
+    diesel: 'dieselIntercity',
     blurb: 'Locomotive, 10 to 14 coaches and a cab car',
   },
   highspeed: {
@@ -182,7 +192,8 @@ export const TRAIN_TYPES: Record<TrainTypeId, TrainTypeDef> = {
     changeEnds: 120,
     metro: false,
     passengers: true,
-    electric: true,
+    power: 'overhead',
+    diesel: 'dieselIntercity',
     blurb: '16 cars with streamlined noses, 300 km/h',
   },
   freight: {
@@ -204,8 +215,55 @@ export const TRAIN_TYPES: Record<TrainTypeId, TrainTypeDef> = {
     changeEnds: 240,
     metro: false,
     passengers: false,
-    electric: false,
-    blurb: '2 to 4 locomotives and 40 to 120 mixed wagons',
+    power: 'diesel',
+    diesel: null,
+    blurb: '2 to 4 road-switcher diesels and 40 to 120 mixed wagons',
+  },
+  dieselCommuter: {
+    id: 'dieselCommuter',
+    name: 'Diesel commuter',
+    minCars: 4,
+    maxCars: 9,
+    defaultCars: 6,
+    maxKmh: 130,
+    unitPower: 2400e3,
+    unitTraction: 270e3,
+    brake: 0.8,
+    emergency: 1.1,
+    jerk: 0.6,
+    rolling: 0.0015,
+    dragFront: 8,
+    dragPerMetre: 0.1,
+    dwell: 40,
+    changeEnds: 60,
+    metro: false,
+    passengers: true,
+    power: 'diesel',
+    diesel: null,
+    blurb: 'Push-pull: a diesel, bilevel coaches and a cab car',
+  },
+  dieselIntercity: {
+    id: 'dieselIntercity',
+    name: 'Diesel intercity',
+    minCars: 7,
+    maxCars: 14,
+    defaultCars: 10,
+    maxKmh: 177,
+    unitPower: 3200e3,
+    unitTraction: 300e3,
+    brake: 0.65,
+    emergency: 1,
+    jerk: 0.5,
+    rolling: 0.0014,
+    dragFront: 8,
+    dragPerMetre: 0.09,
+    dwell: 60,
+    changeEnds: 90,
+    metro: false,
+    passengers: true,
+    power: 'diesel',
+    diesel: null,
+    blurb: 'Two diesels, coaches and a cab car, runs anywhere',
   },
 };
 
@@ -262,7 +320,7 @@ function assemble(type: TrainTypeDef, kinds: number[], flip: number[], tint: num
 
 function isPowered(type: TrainTypeDef, kind: number): boolean {
   if (type.id === 'intercity') return kind === CAR.electricLoco;
-  if (type.id === 'freight') return kind === CAR.dieselLoco;
+  if (type.id === 'freight' || type.id === 'dieselCommuter' || type.id === 'dieselIntercity') return kind === CAR.dieselLoco;
   if (type.id === 'highspeed') return true;
   return kind === CAR.metroCab || kind === CAR.metroCar || kind === CAR.emuCar || kind === CAR.emuCab;
 }
@@ -325,6 +383,19 @@ export function makeConsist(id: TrainTypeId, cars: number, rng: RailRng): Consis
     }
     case 'freight':
       return freightConsist(type, n, rng);
+    case 'dieselCommuter': {
+      // Locomotive pushing on the way out, pulling back, with a cab car at the far end.
+      const kinds: number[] = [CAR.dieselLoco];
+      while (kinds.length + 1 < n) kinds.push(CAR.bilevel);
+      kinds.push(CAR.bilevelCab);
+      return assemble(type, kinds, kinds.map((_, i) => (i === n - 1 ? 1 : 0)), kinds.map((_, i) => (i === 0 ? 4 : 0)), 0.5);
+    }
+    case 'dieselIntercity': {
+      const kinds: number[] = [CAR.dieselLoco, CAR.dieselLoco];
+      while (kinds.length + 1 < n) kinds.push(CAR.coach);
+      kinds.push(CAR.cabCar);
+      return assemble(type, kinds, kinds.map((_, i) => (i === n - 1 ? 1 : 0)), kinds.map((_, i) => (i < 2 ? 5 : 0)), 0.5);
+    }
   }
 }
 

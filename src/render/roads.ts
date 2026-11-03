@@ -28,10 +28,13 @@ import {
   lerpRGB,
   type RGB,
 } from './constants';
-import { buildFrames, type Frame } from './frames';
+import { buildFrames, isTunnelFrame, type Frame } from './frames';
+import { groundFn } from '../core/terrainMods';
+import { markStructureFrames } from './wallFrames';
 import { junctionSetback } from './markings';
 import { addSegmentStructures } from './structures';
 import { asphaltFor } from './style';
+import { kerbShiftStations, segmentKerbShift } from '../core/junctionShape';
 
 export interface RoadOutputs {
   surf: SurfBuf;
@@ -199,7 +202,16 @@ function median(buf: SurfBuf, frames: readonly Frame[], def: RoadTypeDef, slot: 
 }
 
 /** Sidewalk or verge on one side, for all frames. side -1 left, 1 right. */
-function roadside(buf: SurfBuf, frames: readonly Frame[], def: RoadTypeDef, side: -1 | 1, slot: number, bias: number): void {
+function roadside(
+  buf: SurfBuf,
+  frames: readonly Frame[],
+  def: RoadTypeDef,
+  side: -1 | 1,
+  slot: number,
+  bias: number,
+  /** Kerb moved into the road (+) near a shaped junction, and the asphalt to fill a narrowing. */
+  shape?: { shift: (side: 1 | -1, s: number) => number; asphalt: SurfStyle } | null,
+): void {
   const H = def.halfWidth;
   const W = sidewalkOn(def, side);
   const n = frames.length - 1;
@@ -207,14 +219,20 @@ function roadside(buf: SurfBuf, frames: readonly Frame[], def: RoadTypeDef, side
   if (W > 0) {
     const kerb: SurfStyle = { color: COL.kerb, kind: KIND_PLAIN, slot, bias };
     const walk: SurfStyle = { color: COL.sidewalk, kind: KIND_SIDEWALK, slot, bias };
+    const K = shape ? (f: Frame) => H - shape.shift(side, f.s) : () => H;
     // Kerb face looks at the road.
-    if (side > 0) ribbon(buf, frames, 0, n, () => [H, 0], () => [H, KERB_HEIGHT], kerb);
-    else ribbon(buf, frames, 0, n, () => [-H, KERB_HEIGHT], () => [-H, 0], kerb);
+    if (side > 0) ribbon(buf, frames, 0, n, (f) => [K(f), 0], (f) => [K(f), KERB_HEIGHT], kerb);
+    else ribbon(buf, frames, 0, n, (f) => [-K(f), KERB_HEIGHT], (f) => [-K(f), 0], kerb);
     const [l, r] = swap(
-      () => [side * H, KERB_HEIGHT],
+      (f) => [side * K(f), KERB_HEIGHT],
       () => [side * (H + W), KERB_HEIGHT],
     );
     ribbon(buf, frames, 0, n, l, r, walk);
+    if (shape) {
+      // A narrowed sidewalk leaves road surface between the old and new kerb.
+      const [al, ar] = swap(() => [side * H, 0], (f) => [side * Math.max(H, K(f)), 0]);
+      for (const [a, b] of runsOf(frames, (f) => K(f) > H + 0.01)) ribbon(buf, frames, a, b, al, ar, shape.asphalt);
+    }
     return;
   }
   const gravel: SurfStyle = { color: COL.gravel, kind: KIND_GRASS, slot, bias };
@@ -247,14 +265,59 @@ function deck(buf: SurfBuf, frames: readonly Frame[], def: RoadTypeDef, slot: nu
   for (const [a, b] of runsOf(frames, raised)) {
     ribbon(buf, frames, a, b, (f) => [outerOffset(def, f, 1), deckBottom(f)], (f) => [-outerOffset(def, f, -1), deckBottom(f)], under);
   }
+  girders(buf, frames, def, slot);
+}
+
+/**
+ * Beams under a raised deck, between the slab and the pier caps: one or two
+ * trapezoid box girders under highways, ramps and wide roads, precast I-girders
+ * under streets and railways. Faces wind outward (see ribbon).
+ */
+function girders(buf: SurfBuf, frames: readonly Frame[], def: RoadTypeDef, slot: number): void {
+  const web: SurfStyle = { color: COL.concrete, kind: KIND_CONCRETE, slot, bias: 0 };
+  const soffit: SurfStyle = { color: COL.concreteDark, kind: KIND_CONCRETE, slot, bias: 0 };
+  const top = -SLAB_DEPTH + 0.02;
+  const bot = -DECK_DEPTH;
+  for (const [a, b] of runsOf(frames, (f) => f.c > GIRDER_CLEARANCE - 0.7)) {
+    if (b <= a) continue;
+    const f0 = frames[a];
+    const right = outerOffset(def, f0, 1);
+    const left = outerOffset(def, f0, -1);
+    const total = right + left;
+    const centre = (right - left) / 2;
+    if (def.category === 'highway' || def.category === 'ramp' || total > 11) {
+      const twin = total > 22;
+      const bw = twin ? total * 0.5 : total;
+      const ht = bw * 0.31;
+      const hb = bw * 0.21;
+      for (const c of twin ? [centre - total * 0.25, centre + total * 0.25] : [centre]) {
+        ribbon(buf, frames, a, b, () => [c + ht, top], () => [c + hb, bot], web);
+        ribbon(buf, frames, a, b, () => [c - hb, bot], () => [c - ht, top], web);
+        ribbon(buf, frames, a, b, () => [c + hb, bot], () => [c - hb, bot], soffit);
+      }
+      continue;
+    }
+    const n = Math.max(2, Math.round(total / 2.6));
+    const fl = bot + 0.22;
+    for (let k = 0; k < n; k++) {
+      const x = -left + (total * (k + 0.5)) / n;
+      ribbon(buf, frames, a, b, () => [x - 0.12, fl], () => [x - 0.12, top], web);
+      ribbon(buf, frames, a, b, () => [x + 0.12, top], () => [x + 0.12, fl], web);
+      ribbon(buf, frames, a, b, () => [x - 0.36, fl], () => [x - 0.12, fl], web);
+      ribbon(buf, frames, a, b, () => [x + 0.12, fl], () => [x + 0.36, fl], web);
+      ribbon(buf, frames, a, b, () => [x - 0.36, bot], () => [x - 0.36, fl], web);
+      ribbon(buf, frames, a, b, () => [x + 0.36, fl], () => [x + 0.36, bot], web);
+      ribbon(buf, frames, a, b, () => [x + 0.36, bot], () => [x - 0.36, bot], soffit);
+    }
+  }
 }
 
 function isOpenCut(f: Frame): boolean {
-  return f.c < -0.03 && f.y - ROAD_LIFT > TUNNEL_Y;
+  return f.c < -0.03 && !isTunnelFrame(f);
 }
 
 function isTunnel(f: Frame): boolean {
-  return f.y - ROAD_LIFT <= TUNNEL_Y;
+  return isTunnelFrame(f);
 }
 
 /** Tunnel with its roof still above the ground: the cut-and-cover stretch behind a portal. */
@@ -371,8 +434,12 @@ export function buildSegment(net: RoadNetwork, id: Id, slot: number, out: RoadOu
       if (atJunction(seg.b)) extras.push(endS - hw * k);
     }
   }
-  const frames = buildFrames(st, extras);
+  // A shaped junction can move the kerb near this road's ends; give the taper cross sections.
+  const kerbShift = segmentKerbShift(net, id);
+  if (kerbShift) extras.push(...kerbShiftStations(net, id));
+  const frames = buildFrames(st, extras, groundFn(net));
   if (frames.length < 2) return;
+  markStructureFrames(net, id, frames);
 
   const bias = rankBias(def);
   const main = surfaceColour(seg, def);
@@ -390,8 +457,9 @@ export function buildSegment(net: RoadNetwork, id: Id, slot: number, out: RoadOu
     ribbon(out.surf, frames, 0, n, () => [z.a, 0], () => [z.b, 0], { color: z.color, kind: KIND_ASPHALT, slot, bias }, z.centre);
   }
   if (hasMedian) median(out.surf, frames, def, slot, bias, startS, endS);
-  roadside(out.surf, frames, def, 1, slot, bias);
-  roadside(out.surf, frames, def, -1, slot, bias);
+  const shaped = kerbShift ? { shift: kerbShift, asphalt: { color: main, kind: KIND_ASPHALT, slot, bias } } : null;
+  roadside(out.surf, frames, def, 1, slot, bias, shaped);
+  roadside(out.surf, frames, def, -1, slot, bias, shaped);
   deck(out.surf, frames, def, slot);
   cutting(out, frames, def, slot);
   hoodAndTube(out, frames, def, slot);

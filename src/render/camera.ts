@@ -95,14 +95,26 @@ export class CameraRig {
     on(dom, 'wheel', (e) => this.wheel(e), { passive: false });
     on(window, 'keydown', (e) => this.keyDown(e));
     on(window, 'keyup', (e) => {
+      const down = this.downAt.get(e.code);
+      if (down !== undefined) {
+        // Credit time held since the last frame, so a tap inside a stalled frame still moves.
+        const held = performance.now() - Math.max(down, this.lastKeyFrame);
+        this.carry.set(e.code, (this.carry.get(e.code) ?? 0) + Math.max(0, held));
+        this.downAt.delete(e.code);
+      }
       this.keys.delete(e.code);
+      if (!this.keys.has('KeyQ') && !this.keys.has('KeyE')) this.altTurn = false;
       this.speedBoost = e.shiftKey;
     });
-    on(window, 'blur', () => this.keys.clear());
+    on(window, 'blur', () => this.clearKeys());
   }
 
   private pointerDown(e: PointerEvent): void {
-    if (e.button !== 1 && e.button !== 2) return;
+    // Option-drag orbits too, for trackpads with no right or middle drag.
+    const altOrbit = e.button === 0 && e.altKey;
+    if (e.button !== 1 && e.button !== 2 && !altOrbit) return;
+    // A tool that uses the right button (landscaping) keeps right and Option drags; middle still orbits.
+    if (this.toolButtons && e.button !== 1) return;
     if (e.button === 1) e.preventDefault();
     this.dragButton = e.button;
     this.dragStartX = this.lastX = e.clientX;
@@ -154,7 +166,14 @@ export class CameraRig {
   private wheel(e: WheelEvent): void {
     e.preventDefault();
     this.animating = false;
-    const steps = (e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY) / 100;
+    // A trackpad: two-finger scroll pans; a pinch arrives with ctrlKey and zooms.
+    if (!e.ctrlKey && isTrackpadScroll(e)) {
+      const k = (this.distance * 2 * Math.tan((this.camera.fov * Math.PI) / 360)) / this.dom.clientHeight;
+      this.panBy(e.deltaX * k, -e.deltaY * k / Math.max(Math.sin(this.pitch), 0.25));
+      return;
+    }
+    const pinch = e.ctrlKey ? 3 : 1;
+    const steps = ((e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY) * pinch) / 100;
     const factor = Math.pow(1.14, THREE.MathUtils.clamp(steps, -6, 6));
     const old = this.goalDistance;
     const next = THREE.MathUtils.clamp(old * factor, MIN_DISTANCE, MAX_DISTANCE);
@@ -178,10 +197,42 @@ export class CameraRig {
 
   private keyDown(e: KeyboardEvent): void {
     this.speedBoost = e.shiftKey;
-    if (!this.keysEnabled || e.ctrlKey || e.metaKey || e.altKey) return;
+    const turn = e.code === 'KeyQ' || e.code === 'KeyE';
+    // Alt+Q/E always turns the camera, for when a tool uses Q and E for elevation.
+    if (!this.keysEnabled || e.ctrlKey || e.metaKey || (e.altKey && !turn)) return;
     if (isTypingTarget(document.activeElement)) return;
+    if (turn && e.altKey) this.altTurn = true;
     this.keys.add(e.code);
+    if (!this.downAt.has(e.code)) this.downAt.set(e.code, performance.now());
   }
+
+  /** When each held key went down, and key time not yet applied, in ms. */
+  private downAt = new Map<string, number>();
+  private carry = new Map<string, number>();
+  private lastKeyFrame = performance.now();
+
+  private clearKeys(): void {
+    this.keys.clear();
+    this.downAt.clear();
+    this.carry.clear();
+  }
+
+  /** Seconds a key was held since the last frame, measured in real time so stutters don't eat input. */
+  private heldSince(code: string, now: number): number {
+    const down = this.downAt.get(code);
+    const live = down !== undefined && this.keys.has(code) ? now - Math.max(down, this.lastKeyFrame) : 0;
+    return Math.min(0.5, (live + (this.carry.get(code) ?? 0)) / 1000);
+  }
+
+  /** Off while a tool uses Q and E for elevation. Alt+Q/E still turns. */
+  /** Leave right drag and Option-drag to the active tool. */
+  toolButtons = false;
+
+  setRotateKeysEnabled(on: boolean): void {
+    this.rotateKeys = on;
+  }
+  private rotateKeys = true;
+  private altTurn = false;
 
   private clampTarget(v: THREE.Vector3): void {
     const lim = MAP_HALF_SIZE + TARGET_MARGIN;
@@ -209,7 +260,7 @@ export class CameraRig {
 
   setKeysEnabled(on: boolean): void {
     this.keysEnabled = on;
-    if (!on) this.keys.clear();
+    if (!on) this.clearKeys();
   }
 
   getPose(): CameraPose {
@@ -235,25 +286,23 @@ export class CameraRig {
   }
 
   update(dt: number): void {
-    const k = this.keys;
-    if (k.size && this.keysEnabled) {
-      const pan = this.goalDistance * (this.speedBoost ? 2.4 : 1.1) * dt + 2 * dt;
-      let r = 0;
-      let f = 0;
-      if (k.has('KeyW')) f += pan;
-      if (k.has('KeyS')) f -= pan;
-      if (k.has('KeyD')) r += pan;
-      if (k.has('KeyA')) r -= pan;
+    const now = performance.now();
+    if ((this.keys.size || this.carry.size) && this.keysEnabled) {
+      const t = (code: string) => this.heldSince(code, now);
+      const speed = this.goalDistance * (this.speedBoost ? 2.4 : 1.1) + 2;
+      const f = speed * (t('KeyW') - t('KeyS'));
+      const r = speed * (t('KeyD') - t('KeyA'));
       if (r || f) {
         this.panBy(r, f);
         this.animating = false;
       }
-      const spin = 1.5 * dt;
-      if (k.has('KeyQ')) this.goalYaw += spin;
-      if (k.has('KeyE')) this.goalYaw -= spin;
-      if (k.has('KeyR')) this.goalPitch = Math.min(MAX_PITCH, this.goalPitch + spin * 0.75);
-      if (k.has('KeyF')) this.goalPitch = Math.max(MIN_PITCH, this.goalPitch - spin * 0.75);
+      const turn = this.rotateKeys || this.altTurn;
+      if (turn) this.goalYaw += 1.5 * (t('KeyQ') - t('KeyE'));
+      const tilt = 1.5 * 0.75 * (t('KeyR') - t('KeyF'));
+      if (tilt) this.goalPitch = Math.min(MAX_PITCH, Math.max(MIN_PITCH, this.goalPitch + tilt));
     }
+    this.carry.clear();
+    this.lastKeyFrame = now;
     if (this.followPoint) this.goalTarget.copy(this.followPoint);
 
     const rate = this.animating ? DAMP_ANIMATED : DAMP;
@@ -307,4 +356,16 @@ export class CameraRig {
     for (const c of this.cleanups) c();
     this.cleanups = [];
   }
+}
+
+/**
+ * Whether a wheel event is a two-finger trackpad scroll rather than a mouse wheel.
+ * Browsers do not say; a sideways delta, or the legacy wheelDelta being exactly
+ * three times the pixel delta (which mouse wheels are not), gives it away.
+ */
+export function isTrackpadScroll(e: WheelEvent): boolean {
+  if (e.deltaMode !== 0) return false;
+  if (e.deltaX !== 0) return true;
+  const legacy = (e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY;
+  return legacy !== undefined && legacy !== 0 && legacy === -3 * e.deltaY;
 }

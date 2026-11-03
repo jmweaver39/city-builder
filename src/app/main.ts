@@ -1,6 +1,7 @@
 /** Bootstrap: build the network, the sim, the renderer, the tools and the UI, then run the loop. */
 import { ProjectFormatError } from '../core/serialize';
 import { RoadNetwork } from '../core/RoadNetwork';
+import { bindTerrainEdits } from '../core/terrainEdit';
 import { Renderer, WebGLUnavailableError } from '../render/Renderer';
 import { Simulation } from '../sim/Simulation';
 import * as templates from '../templates';
@@ -8,7 +9,12 @@ import { ToolManager } from '../tools/ToolManager';
 import { UI } from '../ui/UI';
 import { History } from './History';
 import { installRail, type RailApp } from './rail';
+import { registerKeys } from '../ui/keymap';
+import { markingKeys } from '../ui/markingKeys';
+import { installStreetLife } from './streetLife';
+import { RoundaboutLayer } from '../render/roundabouts';
 import { buildStarterScene } from './starter';
+import { BenchRunner, benchPacer, benchParams, buildBenchScene } from './bench';
 import { debounce, SaveStore, type KeyValueStore, type SaveRecord } from './storage';
 
 declare global {
@@ -22,6 +28,9 @@ declare global {
       ui: UI;
       trains?: import('../rail/TrainSim').TrainSim;
       rail?: import('../render/rail').RailLayer;
+      streetLife?: import('./streetLife').StreetLife;
+      /** Landscaping (core/terrainEdit.ts): grid, strokes, sampling. */
+      landscape?: import('../core/terrainEdit').TerrainEditor;
     };
   }
 }
@@ -35,12 +44,22 @@ const STARTER_CAMERA = { target: { x: -40, y: 0, z: -90 }, distance: 1050, yaw: 
 const MAX_DT = 0.1;
 
 function fatal(root: HTMLElement, title: string, detail: string): void {
+  document.getElementById('boot')?.remove();
   const box = document.createElement('div');
   box.className = 'fatal';
   box.innerHTML = '<div><h1></h1><p></p></div>';
   box.querySelector('h1')!.textContent = title;
   box.querySelector('p')!.textContent = detail;
   root.append(box);
+}
+
+function memoryStore(): KeyValueStore {
+  const memory = new Map<string, string>();
+  return {
+    getItem: (k) => memory.get(k) ?? null,
+    setItem: (k, v) => void memory.set(k, v),
+    removeItem: (k) => void memory.delete(k),
+  };
 }
 
 function safeStorage(): KeyValueStore {
@@ -59,9 +78,13 @@ function safeStorage(): KeyValueStore {
 async function boot(): Promise<void> {
   const root = document.getElementById('app')!;
 
-  const saves = new SaveStore(safeStorage());
+  // ?bench=1 runs the benchmark (app/bench.ts) on a fixed scene, and never touches saves.
+  const bench = benchParams();
+  const saves = new SaveStore(bench ? memoryStore() : safeStorage());
   const net = new RoadNetwork();
-  const saved = saves.loadAutosave();
+  // Landscaping follows this network's Project.terrain from here on, loads and undo included.
+  const landscape = bindTerrainEdits(net);
+  const saved = bench ? null : saves.loadAutosave();
   let restored: SaveRecord | null = null;
   if (saved) {
     try {
@@ -71,7 +94,8 @@ async function boot(): Promise<void> {
       console.warn('Autosave could not be read, starting fresh.', err);
     }
   }
-  if (!restored) buildStarterScene(net);
+  if (bench) buildBenchScene(net, bench.traffic);
+  else if (!restored) buildStarterScene(net);
 
   const viewport = document.createElement('div');
   viewport.id = 'viewport';
@@ -90,7 +114,9 @@ async function boot(): Promise<void> {
     throw err;
   }
 
-  const resize = (): void => renderer.resize(window.innerWidth, window.innerHeight);
+  // The benchmark draws at a fixed size, whatever the window does.
+  if (bench) Object.assign(viewport.style, { position: 'fixed', left: '0', top: '0', width: `${bench.width}px`, height: `${bench.height}px` });
+  const resize = (): void => (bench ? renderer.resize(bench.width, bench.height) : renderer.resize(window.innerWidth, window.innerHeight));
   resize();
   window.addEventListener('resize', resize);
   renderer.setCamera(restored?.camera ?? STARTER_CAMERA);
@@ -98,7 +124,8 @@ async function boot(): Promise<void> {
   const warmUp = (): void => {
     for (let i = 0; i < STARTER_WARM_STEPS; i++) sim.step();
   };
-  if (!restored) warmUp();
+  if (bench) for (let i = 0; i < bench.warmSteps; i++) sim.step();
+  else if (!restored) warmUp();
 
   const history = new History(net);
   const tools = new ToolManager({ net, sim, view: renderer, history, templates });
@@ -157,27 +184,50 @@ async function boot(): Promise<void> {
     },
   });
 
+  // Junction marking editor keys and commands, in the shortcut panel and the palette.
+  registerKeys(markingKeys(ui.context));
   rail = installRail({ net, sim, renderer, tools, history, ui, warmRoads: warmUp });
+  // Roundabout islands, drawn from the ring geometry (core/roundabout.ts).
+  renderer.context.addLayer(new RoundaboutLayer(net, renderer.context));
   // Trains go out on the line before the first frame, on a restored map too.
   rail.warm();
+  if (bench) rail.trains.warm(300);
 
   const autosave = debounce(() => saves.autosave(net, renderer.getCamera()), AUTOSAVE_MS);
   net.onChange(autosave);
   window.addEventListener('beforeunload', () => autosave.flush());
 
-  window.__cloverleaf = { net, sim, renderer, tools, history, ui, trains: rail.trains, rail: rail.layer };
+  // People, props and clutter close up. Off and free when zoomed out.
+  const streetLife = installStreetLife({ net, sim, renderer, trains: rail.trains, history, ui: ui.context });
 
+  window.__cloverleaf = { net, sim, renderer, tools, history, ui, trains: rail.trains, rail: rail.layer, streetLife, landscape };
+
+  const runner = bench ? new BenchRunner({ sim, renderer }, bench) : null;
   let last = performance.now();
   const frame = (now: number): void => {
-    const dt = Math.min((now - last) / 1000, MAX_DT);
+    const wall = now - last;
+    const dt = Math.min(wall / 1000, MAX_DT);
     last = now;
+    const prof = runner && !runner.done ? renderer.profiler : null;
+    runner?.beforeFrame(dt);
+    prof?.start();
     sim.advance(dt);
+    prof?.lap('sim');
     rail?.advance(dt);
+    prof?.lap('trains');
     renderer.frame(dt);
+    prof?.start();
     ui.update(dt);
-    requestAnimationFrame(frame);
+    prof?.lap('ui');
+    runner?.afterFrame(wall);
+    if (pacer) pacer.postMessage(performance.now() - now);
+    else requestAnimationFrame(frame);
   };
-  requestAnimationFrame(frame);
+  // The benchmark paces itself at 60 Hz from a worker, so it keeps running when the
+  // page is hidden (requestAnimationFrame stops then). GPU and CPU times stay valid.
+  const pacer = runner ? benchPacer((t) => frame(t)) : null;
+  if (pacer) pacer.postMessage(0);
+  else requestAnimationFrame(frame);
 }
 
 boot().catch((err) => {

@@ -162,4 +162,11 @@ export interface SimApi {
    * already on it drive off. A closure survives graph rebuilds, tracked by lane key.
    */
   blockConflict?(lane: number, blocked: boolean): void;
+  /**
+   * Make vehicles that stop at the end of this road lane (dense lane index), for a red
+   * light, a sign or a closure, stop this many metres short of it, as before a
+   * crosswalk. Only applied when the driver can still stop comfortably short of it;
+   * 0 clears. Survives graph rebuilds, tracked by lane key. Used by src/peds.
+   */
+  setStopBack?(lane: number, metres: number): void;
 }

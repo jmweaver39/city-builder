@@ -19,6 +19,7 @@ import { effectiveLanes, effectiveMarkings } from '../core/roadTypes';
 import { PaintBuf, type LinePoint } from './batch';
 import { LINE_WIDTH, PAINT_COL, ROAD_LIFT, strokesOf } from './constants';
 import { clipToPolygon } from './nodeMarkings';
+import { isAutoOff } from '../core/autoMarkings';
 
 const EDGE_INSET = 0.18;
 /** Edges of two branches closer than this are painted as one line. */
@@ -133,6 +134,24 @@ function distToPolyline(p: Vec3, pts: Vec3[]): number {
   return best;
 }
 
+/** Distance to a polyline where the point lies alongside it, Infinity past either end. */
+function distAlongside(p: Vec3, pts: Vec3[]): number {
+  let best = Infinity;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    const dx = b.x - a.x;
+    const dz = b.z - a.z;
+    const l2 = dx * dx + dz * dz;
+    if (l2 < 1e-12) continue;
+    const t = ((p.x - a.x) * dx + (p.z - a.z) * dz) / l2;
+    if ((i === 0 && t < 0) || (i === pts.length - 2 && t > 1)) continue;
+    const c = Math.max(0, Math.min(1, t));
+    best = Math.min(best, Math.hypot(p.x - a.x - dx * c, p.z - a.z - dz * c));
+  }
+  return best;
+}
+
 /** The lane strips through the junction: one per lane leaving, and one per lane arriving. */
 function stripsAt(net: RoadNetwork, nodeId: Id): Strip[] {
   const g = net.laneGraph;
@@ -161,7 +180,20 @@ function stripsAt(net: RoadNetwork, nodeId: Id): Strip[] {
 }
 
 /** Lines and gores through a ramp junction. Paints nothing at an ordinary junction. */
-export function buildRampJunctionPaint(net: RoadNetwork, nodeId: Id, buf: PaintBuf): void {
+/** A gore's hatched area, named by the segments of its two branches, as core/autoMarkings.ts refers to it. */
+export interface GoreArea {
+  segments: Id[];
+  poly: Vec3[];
+}
+
+/** The gores of a ramp junction, taken away ones included. */
+export function goreAreas(net: RoadNetwork, nodeId: Id): GoreArea[] {
+  const out: GoreArea[] = [];
+  buildRampJunctionPaint(net, nodeId, new PaintBuf(), out);
+  return out;
+}
+
+export function buildRampJunctionPaint(net: RoadNetwork, nodeId: Id, buf: PaintBuf, gores?: GoreArea[]): void {
   if (!isRampJunction(net, nodeId)) return;
   const node = net.getNode(nodeId);
   if (!node || node.control.hideAutoMarkings) return;
@@ -233,9 +265,12 @@ export function buildRampJunctionPaint(net: RoadNetwork, nodeId: Id, buf: PaintB
       for (let fj = 0; fj < ei; fj++) {
         const f = edges[fj];
         if (f.branch === e.branch) continue;
-        if (distToPolyline(p, f.pts.filter((_, j) => f.visible[j])) < MERGE_GAP) {
-          e.visible[k] = false;
-          return;
+        // Only the stretches of the other edge that are painted, each on its own.
+        for (const [i, j] of runs(f.visible)) {
+          if (j > i && distAlongside(p, f.pts.slice(i, j + 1)) < MERGE_GAP) {
+            e.visible[k] = false;
+            return;
+          }
         }
       }
     });
@@ -256,13 +291,16 @@ export function buildRampJunctionPaint(net: RoadNetwork, nodeId: Id, buf: PaintB
       const diverge = A.fromLane !== -1 && g.lanes[A.fromLane].segmentId === g.lanes[B.fromLane].segmentId;
       const merge = g.lanes[A.toLane].segmentId === g.lanes[B.toLane].segmentId;
       if (diverge === merge) continue;
-      paintGore(buf, edges, a, b, diverge, net.getNode(nodeId)!.pos.y);
+      const segments = [...new Set([A, B].flatMap((l) => [g.lanes[l.fromLane]?.segmentId, g.lanes[l.toLane].segmentId]).filter((x): x is Id => x !== undefined))].sort((p, q) => p - q);
+      const off = isAutoOff(node.control, { kind: 'gore', segments });
+      const poly = paintGore(off ? new PaintBuf() : buf, edges, a, b, diverge, net.getNode(nodeId)!.pos.y);
+      if (gores && poly) gores.push({ segments, poly });
     }
   }
 }
 
 /** Hatch the area between the facing edges of two branches once they part. */
-function paintGore(buf: PaintBuf, edges: { pts: Vec3[]; branch: number; side: -1 | 1; markings: MarkingStyle }[], a: number, b: number, diverge: boolean, y: number): void {
+function paintGore(buf: PaintBuf, edges: { pts: Vec3[]; branch: number; side: -1 | 1; markings: MarkingStyle }[], a: number, b: number, diverge: boolean, y: number): Vec3[] | null {
   // Facing edges: whichever pair is closest at the far end, where the branches have parted.
   const ea = edges.filter((e) => e.branch === a);
   const eb = edges.filter((e) => e.branch === b);
@@ -278,7 +316,7 @@ function paintGore(buf: PaintBuf, edges: { pts: Vec3[]; branch: number; side: -1
       }
     }
   }
-  if (!best) return;
+  if (!best) return null;
   const [p, q] = best;
   const n = p.pts.length;
   // Walk from the far end towards the shared end until the edges meet.
@@ -292,7 +330,7 @@ function paintGore(buf: PaintBuf, edges: { pts: Vec3[]; branch: number; side: -1
     if (gap < 0.6 || Math.sign(sideNow) !== p.side) break;
     kept.push(k);
   }
-  if (kept.length < 3) return;
+  if (kept.length < 3) return null;
   kept.sort((i, j) => i - j);
   const poly = [...kept.map((k) => p.pts[k]), ...kept.slice().reverse().map((k) => q.pts[k])];
   const color = PAINT_COL[p.markings.edgeColor];
@@ -322,6 +360,7 @@ function paintGore(buf: PaintBuf, edges: { pts: Vec3[]; branch: number; side: -1
       buf.bar(ax + (bx - ax) * t0, sy, az + (bz - az) * t0, ax + (bx - ax) * t1, sy, az + (bz - az) * t1, HATCH_WIDTH, color);
     }
   }
+  return poly;
 }
 
 /** Height of the nearest polygon vertex, lifted onto the road. */

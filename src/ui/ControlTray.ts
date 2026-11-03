@@ -9,6 +9,10 @@ import { CONTROL_CARDS, type ControlKind } from '../tools/junctionControl';
 import type { UiContext } from './context';
 import { clear, el, sliderInput } from './dom';
 import { ICONS, type IconName } from './icons';
+import { CONTROL_ART } from './cardArt';
+import { MarkingsEditor } from './MarkingsEditor';
+import { JunctionShapePanel } from './JunctionShapePanel';
+import type { Panel } from './Panel';
 
 const CARD_ICON: Record<ControlKind, IconName> = {
   signal: 'signalLight',
@@ -31,6 +35,21 @@ const CARD_TONE: Record<ControlKind, string> = {
 
 export const ROUNDABOUT_KEY = 'O';
 
+/** Which picture in cardArt.ts stands for each card's icon. */
+const PICTURE: Partial<Record<IconName, string>> = {
+  signalLight: 'signal',
+  stopSign: 'stop',
+  allStop: 'allStop',
+  yieldSign: 'yield',
+  priorityRoad: 'priority',
+  autoControl: 'auto',
+  roundabout: 'roundabout',
+  lanes: 'lanes',
+  junctionShape: 'junctionShape',
+  intersections: 'markings',
+  advanced: 'editor',
+};
+
 function card(opts: { icon: IconName; name: string; meta: string; key?: string; tone?: string; data: Record<string, string>; onClick: () => void }): HTMLElement {
   return el(
     'button',
@@ -43,7 +62,10 @@ function card(opts: { icon: IconName; name: string; meta: string; key?: string; 
       attrs: { type: 'button', 'aria-label': opts.name },
       on: { click: opts.onClick },
     },
-    el('div', { class: `art ${opts.tone ?? ''}`, html: ICONS[opts.icon] }),
+    // The real sign, signal or a little picture where there is one; the line icon otherwise.
+    PICTURE[opts.icon]
+      ? el('div', { class: 'art picture', html: CONTROL_ART[PICTURE[opts.icon]!] })
+      : el('div', { class: `art ${opts.tone ?? ''}`, html: ICONS[opts.icon] }),
     el('div', { class: 'card-name', text: opts.name }),
     el('div', { class: 'card-meta', text: opts.meta }),
     opts.key ? el('kbd', { class: 'card-key', text: opts.key }) : null,
@@ -69,12 +91,36 @@ function segmented<T extends string | number>(options: { value: T; label: string
 
 export class ControlTray {
   private mode = '';
+  /** The Markings and Shape tabs host their editors right here in the strip. */
+  private markings: MarkingsEditor | null = null;
+  private shape: JunctionShapePanel | null = null;
+  private readonly offNet: () => void;
 
   constructor(
     private readonly ui: UiContext,
     private readonly cards: HTMLElement,
     private readonly options: HTMLElement,
-  ) {}
+  ) {
+    this.offNet = ui.net.onChange(() => this.syncEditors());
+  }
+
+  /** Drop the hosted editors and listeners when the tray goes. */
+  dispose(): void {
+    this.offNet();
+    this.closeEditors();
+  }
+
+  private closeEditors(): void {
+    this.markings?.dispose();
+    this.markings = null;
+    this.shape = null;
+    this.options.classList.remove('wide-editor');
+  }
+
+  private syncEditors(): void {
+    this.markings?.sync();
+    this.shape?.sync();
+  }
 
   private get tools() {
     return this.ui.tools;
@@ -103,24 +149,36 @@ export class ControlTray {
       card({
         icon: 'roundabout',
         name: 'Roundabout',
-        meta: 'Build or edit a roundabout',
-        key: ROUNDABOUT_KEY,
+        meta: 'Build, resize, remove',
         data: { tool: 'roundabout' },
         onClick: () => tools.setTool('roundabout'),
       }),
       el('div', { class: 'card-sep', attrs: { 'aria-hidden': 'true' } }),
       card({
         icon: 'lanes',
-        name: 'Lane connector',
+        name: 'Lanes',
         meta: 'Link lanes by hand',
-        key: 'L',
         data: { tool: 'lanes' },
         onClick: () => tools.setTool('lanes'),
       }),
       card({
+        icon: 'junctionShape',
+        name: 'Shape',
+        meta: 'Kerbs, cut lines, islands',
+        data: { tool: 'junctionShape' },
+        onClick: () => tools.setTool('junctionShape'),
+      }),
+      card({
+        icon: 'intersections',
+        name: 'Markings',
+        meta: 'Lines and fillers by hand',
+        data: { tool: 'nodeMarkings' },
+        onClick: () => tools.setTool('nodeMarkings'),
+      }),
+      card({
         icon: 'advanced',
-        name: 'Advanced',
-        meta: 'Junction editor and signal phases',
+        name: 'Editor',
+        meta: 'Signs, phases, crosswalks',
         data: { control: 'inspect' },
         onClick: () => this.openAdvanced(),
       }),
@@ -141,6 +199,11 @@ export class ControlTray {
     const id = tools.active.id;
     if (id === 'roundabout') return `roundabout:${tools.roundabout.selection ? 'edit' : 'new'}`;
     if (id === 'junction') return `junction:${tools.settings.junctionControl}`;
+    if (id === 'nodeMarkings') {
+      const h = tools.nodeMarkings.host;
+      return `markings:${h ? `${h.kind}${h.id}` : ''}`;
+    }
+    if (id === 'junctionShape') return `shape:${tools.junctionShape.node ?? ''}`;
     return id;
   }
 
@@ -167,6 +230,7 @@ export class ControlTray {
 
   private renderOptions(): void {
     const o = this.options;
+    this.closeEditors();
     clear(o);
     const { tools } = this;
     const id = tools.active.id;
@@ -174,10 +238,34 @@ export class ControlTray {
       this.renderRoundabout();
       return;
     }
+    // With a junction open, its markings or shape editor fills the strip.
+    if (id === 'nodeMarkings' && tools.nodeMarkings.host) {
+      const box = el('div', { class: 'tab-editor' });
+      o.append(box);
+      o.classList.add('wide-editor');
+      this.markings = new MarkingsEditor(this.ui, tools.nodeMarkings.host, box);
+      return;
+    }
+    if (id === 'junctionShape' && tools.junctionShape.node !== null) {
+      const box = el('div', { class: 'tab-editor' });
+      o.append(box);
+      o.classList.add('wide-editor');
+      // The shape panel wants a Panel; here it only needs a body and a title.
+      const shim = { body: box, setTitle: () => {} } as unknown as Panel;
+      this.shape = new JunctionShapePanel(this.ui, tools.junctionShape.node, shim);
+      return;
+    }
+    if (id === 'junctionShape' || id === 'nodeMarkings') {
+      o.append(
+        el('div', { class: 'opt-title', text: id === 'junctionShape' ? 'Shape' : 'Markings' }),
+        el('p', { class: 'opt-help', text: id === 'junctionShape' ? 'Click a junction, then drag its handles.' : 'Click a junction, then its anchors.' }),
+      );
+      return;
+    }
     if (id === 'lanes') {
       o.append(
         el('div', { class: 'opt-title', text: 'Lane connector' }),
-        el('p', { class: 'opt-help', text: 'Click a junction, then an amber arriving lane, then a cyan leaving lane.' }),
+        el('p', { class: 'opt-help', text: 'Click a junction, an arriving lane, then a leaving lane.' }),
         el('button', {
           class: 'btn reset-lanes',
           text: 'Reset to Auto',
@@ -197,8 +285,8 @@ export class ControlTray {
         el('p', {
           class: 'opt-help',
           text: c.perArm
-            ? 'Click a junction to apply. Click near one arm to sign just that arm.'
-            : 'Click a junction to apply. The tool stays on, so you can click down a street.',
+            ? 'Click a junction, or near one arm.'
+            : 'Click junctions to apply.',
         }),
         el('div', { class: 'opt-keys' }, ...CONTROL_CARDS.map((x) => el('span', { class: x.kind === kind ? 'on' : '' }, el('kbd', { text: x.key }), x.name))),
         el('button', {
@@ -212,9 +300,8 @@ export class ControlTray {
       return;
     }
     o.append(
-      el('div', { class: 'opt-title', text: 'Advanced' }),
-      el('p', { class: 'opt-help', text: 'Click a junction to open its detailed editor: per-arm signs, crosswalks and signal phases.' }),
-      el('p', { class: 'opt-help muted', text: 'Pick a card on the right to set control with one click instead.' }),
+      el('div', { class: 'opt-title', text: 'Editor' }),
+      el('p', { class: 'opt-help', text: 'Click a junction to edit signs, phases and crosswalks.' }),
     );
   }
 
@@ -293,13 +380,14 @@ export class ControlTray {
         ),
       );
     } else {
-      o.append(el('p', { class: 'opt-help', text: 'Click a junction to replace it, or open ground for a new one. Click a roundabout to edit it.' }));
+      o.append(el('p', { class: 'opt-help', text: 'Click a junction or open ground. Click a roundabout to edit it.' }));
     }
   }
 
   /** Keep values in step with the tool (the wheel changes radius) without rebuilding. */
   private syncValues(): void {
     const { tools } = this;
+    this.syncEditors();
     this.options.querySelector('.reset-lanes')?.toggleAttribute('disabled', tools.lanes.node === null);
     if (tools.active.id !== 'roundabout') return;
     const s = tools.settings.roundabout;

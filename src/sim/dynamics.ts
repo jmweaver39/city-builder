@@ -29,6 +29,12 @@ const GUARD_LAST_CHANCE = -1.3;
 const STUCK_PROGRESS = 2;
 /** Queued this close behind a held vehicle counts as held too. */
 const HELD_QUEUE_GAP = 12;
+/** A shared stretch is watched from this far before it. */
+const SHARE_LEAD = 25;
+/** Room kept between bodies passing on lanes that share space. */
+const SHARE_CLEARANCE = 0.3;
+/** The longest a lane change may take, at a standstill. */
+const LANE_CHANGE_CREEP_SEC = 10;
 
 // Results of walkAhead and guard, kept out of the heap.
 let outGap = Infinity;
@@ -57,6 +63,17 @@ function waitPoint(d: number, back: number): number {
   return at > 0.05 ? at : d < 0.05 ? d : 0.05;
 }
 
+/**
+ * How far short of a lane's end to stop: the sweep's setback, or a crosswalk's stop
+ * back (SimApi.setStopBack) when the driver can still stop comfortably before it.
+ */
+function stopBack(w: World, v: number, lane: number, d: number, sp: number): number {
+  const base = w.g.setback[lane];
+  const extra = w.stopBack ? w.stopBack[lane] : 0;
+  if (extra <= base) return base;
+  return d - extra >= (sp * sp) / (2 * w.veh.decel[v]) - 0.3 ? extra : base;
+}
+
 /** What the first vehicle on a lane finds beyond its lane end. */
 function walkAhead(w: World, v: number, lane: number, pos: number, sp: number): void {
   const { g, veh, bk, jn } = w;
@@ -79,8 +96,10 @@ function walkAhead(w: World, v: number, lane: number, pos: number, sp: number): 
     if (d > horizon) return;
     if (nxt < 0) {
       if (hop > 0 && sinkOn(w, v, cur) >= 0) return;
-      // Stop with enough lane left to change out of it.
-      outStop = waitPoint(d, laneChangeRoom(veh.len[v]));
+      // Stop with enough lane left to change out of it, but on the lane that needs the
+      // change: on a short lane the room would otherwise reach back onto the one before.
+      const room = laneChangeRoom(veh.len[v]);
+      outStop = waitPoint(d, room < laneLen[cur] * 0.8 ? room : laneLen[cur] * 0.8);
       // Waiting at the end of the lane for a gap that is not coming.
       if (hop === 0 && d < MUST_TAKE_LAST_STRETCH + laneChangeRoom(veh.len[v]) && sp < 2) {
         veh.mustWait[v] += DT;
@@ -91,7 +110,7 @@ function walkAhead(w: World, v: number, lane: number, pos: number, sp: number): 
     if (w.blocked[nxt]) {
       if (veh.permit[v] === nxt) dropClaim(w, v);
       veh.denied[v] = DENY_BLOCKED;
-      outStop = waitPoint(d, g.setback[cur]);
+      outStop = waitPoint(d, stopBack(w, v, cur, d, sp));
       return;
     }
     if (isConn[nxt] && jn.needPermit[nxt]) {
@@ -102,7 +121,7 @@ function walkAhead(w: World, v: number, lane: number, pos: number, sp: number): 
       permitSeen = true;
       if (d <= reach || veh.permit[v] === nxt) {
         if (!evaluate(w, v, nxt, d)) {
-          outStop = waitPoint(d, g.setback[cur]);
+          outStop = waitPoint(d, stopBack(w, v, cur, d, sp));
           return;
         }
       } else if (veh.permit[v] >= 0) {
@@ -129,12 +148,14 @@ function walkAhead(w: World, v: number, lane: number, pos: number, sp: number): 
  * cleared it, and follow a vehicle on a branch that has not yet separated from this.
  */
 function guard(w: World, v: number, c: number, pos: number): void {
+  // guardFor: whom each vehicle held for last time, to spot two holding for each other.
   const { g, veh, bk } = w;
   const { confStart, confLane, confSelf, confOther, confKind } = g;
   const { start, eV, eS, eT } = bk;
   outGap = Infinity;
   outLeadV = 0;
   outStop = Infinity;
+  veh.guardFor[v] = -1;
   const k0 = confStart[c];
   const k1 = confStart[c + 1];
   for (let k = k0; k < k1; k++) {
@@ -166,18 +187,27 @@ function guard(w: World, v: number, c: number, pos: number): void {
       const b = start[other + 1];
       const mine = veh.enterTick[v];
       const sweep = kind === KIND_SWEEP;
+      const sameExit = g.toLane[other] === g.toLane[c];
       const myLen = veh.len[v];
       for (let e = a; e < b; e++) {
         if (eT[e] === ENTRY_REQUEST || eT[e] === ENTRY_GHOST) continue;
         const u = eV[e];
         if (u === v || eS[e] - veh.len[u] > otherS + GUARD_MARGIN) continue;
         if (sweep && myLen < LONG_BODY && veh.len[u] < LONG_BODY) continue;
+        // Into the same lane, merge ordering keeps bodies apart; a second order here
+        // could disagree with it and leave each waiting for the other.
+        if (sweep && sameExit) continue;
         // Crossings go in order of entry. A later arrival matters only once it is
         // past its own last chance to stop, which the order then cannot undo.
         const theirs = veh.enterTick[u];
         const earlier = theirs < mine || (theirs === mine && veh.id[u] < veh.id[v]);
+        const inZone = eS[e] >= otherS - GUARD_MARGIN;
+        // Someone already waiting for me, and not in this zone, is no reason to wait:
+        // two vehicles each holding for the other would sit there for ever.
+        if (earlier && !inZone && veh.guardFor[u] === v) continue;
         if (earlier || eS[e] >= otherS - GUARD_MARGIN - GUARD_LAST_CHANCE) {
           if (hold < outStop) outStop = hold;
+          veh.guardFor[v] = u;
         }
       }
     }
@@ -188,6 +218,8 @@ export function accelPass(w: World): void {
   const { g, veh, bk, tick } = w;
   const { n, len: laneLen, isConn, prof, profStart, confStart } = g;
   const { start, eV, eS, eT } = bk;
+  const { shareStart, shareLane, shareFrom, shareTo, shareOffset, shareGap } = g;
+  const { halfWidth } = veh;
   const { s, v: speed, len, accel, decel, headway, minGap, maxSpeed, speedFactor, limitV, limitD, acc, gapHard } = veh;
   const { vlTick, vlGap, vlV, vlFloor, seekV, yieldSec, lcFrom, held } = veh;
 
@@ -242,6 +274,29 @@ export function accelPass(w: World): void {
         if (gk < hard) hard = gk;
         if (t !== ENTRY_GHOST) {
           leadU = u;
+          break;
+        }
+      }
+
+      // A lane sharing space with another near a junction: follow whoever is ahead on it.
+      for (let q = shareStart[l]; q < shareStart[l + 1]; q++) {
+        if (pos < shareFrom[q] - SHARE_LEAD || pos - len[v] > shareTo[q]) continue;
+        const other = shareLane[q];
+        const offset = shareOffset[q];
+        for (let k = start[other + 1] - 1; k >= start[other]; k--) {
+          if (eT[k] === ENTRY_REQUEST || eT[k] === ENTRY_GHOST) continue;
+          const u = eV[k];
+          // Two bodies this narrow pass side by side here.
+          if (shareGap[q] >= halfWidth[v] + halfWidth[u] + SHARE_CLEARANCE) continue;
+          const at = eS[k] - offset;
+          // Behind me, or level and second in a fixed order: theirs to wait, not mine.
+          if (at < pos || (at === pos && veh.id[u] > veh.id[v])) continue;
+          const gk = at - len[u] - pos;
+          if (gk < gap) {
+            gap = gk;
+            leadV = speed[u];
+          }
+          if (gk < hard) hard = gk;
           break;
         }
       }
@@ -415,7 +470,7 @@ function crossLanes(w: World, v: number, sink: ArrivalSink): boolean {
       return true;
     }
     if (isConn[n]) {
-      if ((jn.needPermit[n] && veh.permit[v] !== n) || (jn.ctl[n] === CTL_SIGNAL && sig.state[n] === LIGHT_RED)) {
+      if ((jn.needPermit[n] && (veh.permit[v] !== n || veh.claimWait[v])) || (jn.ctl[n] === CTL_SIGNAL && sig.state[n] === LIGHT_RED)) {
         if (veh.permit[v] === n) dropClaim(w, v);
         hold(w, v, l);
         return true;
@@ -489,8 +544,11 @@ export function integrate(w: World, sink: ArrivalSink): void {
     limitD[v] -= ds;
     permitDist[v] -= ds;
     if (lcSec[v] > 0) {
-      // Across the lane in step with distance along it, so a stopped vehicle stays put.
-      lcSec[v] -= (ds * LANE_CHANGE_SEC) / veh.lcLen[v];
+      // Across the lane in step with distance along it, but never slower than nosing in
+      // at walking pace: a car stopped half across would hold both lanes for ever.
+      const along = (ds * LANE_CHANGE_SEC) / veh.lcLen[v];
+      const creep = veh.lcPause[v] ? 0 : (DT * LANE_CHANGE_SEC) / LANE_CHANGE_CREEP_SEC;
+      lcSec[v] -= along > creep ? along : creep;
       if (lcSec[v] <= 0) lcFrom[v] = -1;
     }
     if (lcCool[v] > 0) lcCool[v] -= DT;

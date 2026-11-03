@@ -5,12 +5,15 @@
  * A coarse grid of road footprints says which trees are hidden.
  */
 import * as THREE from 'three';
-import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { totalHalfWidth } from '../core/roadTypes';
-import { isWater, riverDistance, terrainHeight } from '../core/terrain';
+import { isWater, riverDistance, terrainEditDelta, terrainHeight, WATER_LEVEL } from '../core/terrain';
+import { terrainModsFor } from '../core/terrainMods';
 import type { QualitySettings } from './quality';
-import { paintFacets, rgb, worldMaterial } from './style';
+import type { Shared } from './materials';
+import { rgb } from './style';
+import { displayGround, mountainRidge } from './terrain';
+import { BILLBOARD_COUNT, makeBillboardAtlas, makeLeafAtlas } from './textures';
 
 const WORLD = 3200;
 const TILE = 800;
@@ -20,6 +23,10 @@ const MASK_SIZE = Math.ceil((2 * WORLD) / MASK_CELL);
 const CLEAR_OVER = 16;
 /** Camera movement that triggers a re-sort. */
 const RESORT_MOVE = 18;
+/** How far the shadow focus may drift before trees re-sort; the shadow reach is padded by as much. */
+const SHADOW_SLACK = 20;
+/** Share of each level's range over which it crossfades into the next. */
+const FADE_BAND = 0.14;
 
 
 function rngFrom(seed: number): () => number {
@@ -35,96 +42,365 @@ function rngFrom(seed: number): () => number {
 
 type Tint = readonly [number, number, number];
 
-/** One faceted part of a tree. Foliage is painted pale so the instance colour sets it. */
-function part(geo: THREE.BufferGeometry, colour: Tint, foliage: boolean, seed: number): THREE.BufferGeometry {
-  geo.deleteAttribute('uv');
-  // Smooth shaded: weld the vertices so normals average across faces.
-  const welded = mergeVertices(geo.index ? geo.toNonIndexed() : geo, 1e-4);
-  welded.computeVertexNormals();
-  const g = paintFacets(welded, colour, foliage ? 0.05 : 0.03, seed);
-  g.computeVertexNormals();
-  const n = g.getAttribute('position').count;
-  g.setAttribute('aFoliage', new THREE.BufferAttribute(new Float32Array(n).fill(foliage ? 1 : 0), 1));
-  return g;
+const CELL_BROAD = 0;
+const CELL_NEEDLE = 1;
+const CELL_BARK = 2;
+const CELL_PALE_BARK = 3;
+
+/** Leaf cards, needle sprays and bark limbs in one geometry, all on the foliage atlas. */
+class Foliage {
+  pos: number[] = [];
+  nor: number[] = [];
+  col: number[] = [];
+  uv: number[] = [];
+  fol: number[] = [];
+  cen: number[] = [];
+  cor: number[] = [];
+  idx: number[] = [];
+
+  private v(x: number, y: number, z: number, nx: number, ny: number, nz: number, c: number, u: number, w: number, foliage: number): number {
+    const i = this.pos.length / 3;
+    this.pos.push(x, y, z);
+    const l = Math.hypot(nx, ny, nz) || 1;
+    this.nor.push(nx / l, ny / l, nz / l);
+    this.col.push(c, c, c);
+    this.uv.push(u, w);
+    this.fol.push(foliage);
+    this.cen.push(x, y, z);
+    this.cor.push(0, 0);
+    return i;
+  }
+
+  /** A card centred at c, spanned by half vectors a and b, lit with normal n. */
+  card(c: number[], a: number[], b: number[], n: number[], shade: number, cell: number): void {
+    const u0 = cell * 0.25 + 0.004;
+    const u1 = u0 + 0.242;
+    const i0 = this.v(c[0] - a[0] - b[0], c[1] - a[1] - b[1], c[2] - a[2] - b[2], n[0], n[1], n[2], shade, u0, 0, 1);
+    const i1 = this.v(c[0] + a[0] - b[0], c[1] + a[1] - b[1], c[2] + a[2] - b[2], n[0], n[1], n[2], shade, u1, 0, 1);
+    const i2 = this.v(c[0] + a[0] + b[0], c[1] + a[1] + b[1], c[2] + a[2] + b[2], n[0], n[1], n[2], shade, u1, 1, 1);
+    const i3 = this.v(c[0] - a[0] + b[0], c[1] - a[1] + b[1], c[2] - a[2] + b[2], n[0], n[1], n[2], shade, u0, 1, 1);
+    this.idx.push(i0, i1, i2, i0, i2, i3);
+  }
+
+  /**
+   * A card that turns to face the camera, so a crown never shows a card edge-on.
+   * Its geometry still lies along a and b, which is what the shadow pass sees.
+   */
+  sprite(c: number[], a: number[], b: number[], n: number[], shade: number, cell: number, size: number, roll: number): void {
+    const first = this.pos.length / 3;
+    this.card(c, a, b, n, shade, cell);
+    const cs = Math.cos(roll) * size;
+    const sn = Math.sin(roll) * size;
+    const corners = [
+      [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+    ];
+    for (let k = 0; k < 4; k++) {
+      const [x, y] = corners[k];
+      const v = first + k;
+      this.cen[v * 3] = c[0];
+      this.cen[v * 3 + 1] = c[1];
+      this.cen[v * 3 + 2] = c[2];
+      this.cor[v * 2] = x * cs - y * sn;
+      this.cor[v * 2 + 1] = x * sn + y * cs;
+    }
+  }
+
+  /** Tapered round limb from p to q, with bark wrapped round it. */
+  limb(p: number[], q: number[], r0: number, r1: number, sides: number, cell: number): void {
+    const d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+    const l = Math.hypot(d[0], d[1], d[2]) || 1;
+    const t = [d[0] / l, d[1] / l, d[2] / l];
+    const ref = Math.abs(t[1]) > 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const a = [t[1] * ref[2] - t[2] * ref[1], t[2] * ref[0] - t[0] * ref[2], t[0] * ref[1] - t[1] * ref[0]];
+    const al = Math.hypot(a[0], a[1], a[2]) || 1;
+    a[0] /= al;
+    a[1] /= al;
+    a[2] /= al;
+    const b = [t[1] * a[2] - t[2] * a[1], t[2] * a[0] - t[0] * a[2], t[0] * a[1] - t[1] * a[0]];
+    const base = this.pos.length / 3;
+    const u0 = cell * 0.25 + 0.01;
+    for (let i = 0; i <= sides; i++) {
+      const ang = (i / sides) * Math.PI * 2;
+      const nx = a[0] * Math.cos(ang) + b[0] * Math.sin(ang);
+      const ny = a[1] * Math.cos(ang) + b[1] * Math.sin(ang);
+      const nz = a[2] * Math.cos(ang) + b[2] * Math.sin(ang);
+      const u = u0 + (i / sides) * 0.23;
+      this.v(p[0] + nx * r0, p[1] + ny * r0, p[2] + nz * r0, nx, ny, nz, 1, u, 0, 0);
+      this.v(q[0] + nx * r1, q[1] + ny * r1, q[2] + nz * r1, nx, ny, nz, 1, u, Math.min(1, l / 5), 0);
+    }
+    for (let i = 0; i < sides; i++) {
+      const v = base + i * 2;
+      this.idx.push(v, v + 2, v + 1, v + 1, v + 2, v + 3);
+    }
+  }
+
+  build(): THREE.BufferGeometry {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nor, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(this.col, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
+    g.setAttribute('aFoliage', new THREE.Float32BufferAttribute(this.fol, 1));
+    g.setAttribute('aCentre', new THREE.Float32BufferAttribute(this.cen, 3));
+    g.setAttribute('aCorner', new THREE.Float32BufferAttribute(this.cor, 2));
+    g.setIndex(this.idx);
+    return g;
+  }
 }
 
-function join(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
-  return mergeGeometries(parts, false)!;
+interface Lobe {
+  c: number[];
+  r: number[];
 }
 
-const PALE: Tint = [0.95, 0.95, 0.95];
-
-function trunk(h: number, r: number, sides: number, colour: Tint, seed: number): THREE.BufferGeometry {
-  return part(new THREE.CylinderGeometry(r * 0.7, r, h, sides).translate(0, h / 2 - 0.2, 0), colour, false, seed);
+/**
+ * Leaf cards scattered through ellipsoid lobes. Each card's normal bends out from
+ * its lobe's centre and up, so the crown lights as one soft volume and its edge
+ * breaks up irregularly.
+ */
+function crown(f: Foliage, lobes: Lobe[], cardsPerLobe: number, size: number, seed: number, cell = CELL_BROAD): void {
+  const rng = rngFrom(seed);
+  for (const lobe of lobes) {
+    for (let i = 0; i < cardsPerLobe; i++) {
+      const y = rng() * 1.8 - 0.9;
+      const ring = Math.sqrt(1 - y * y);
+      const ang = rng() * Math.PI * 2;
+      const nx = Math.cos(ang) * ring;
+      const nz = Math.sin(ang) * ring;
+      // Most cards sit near the shell, some fill the inside so it never looks hollow.
+      const k = rng() < 0.75 ? 0.72 + rng() * 0.3 : 0.25 + rng() * 0.4;
+      const c = [lobe.c[0] + nx * lobe.r[0] * k, lobe.c[1] + y * lobe.r[1] * k, lobe.c[2] + nz * lobe.r[2] * k];
+      const roll = rng() * Math.PI * 2;
+      const tx = -nz;
+      const tz = nx;
+      const sz = size * (0.75 + rng() * 0.6);
+      const cr = Math.cos(roll) * sz;
+      const sr = Math.sin(roll) * sz;
+      const ax = tx * cr - nx * y * sr;
+      const ay = ring * sr;
+      const az = tz * cr - nz * y * sr;
+      const bx = -tx * sr - nx * y * cr;
+      const by = ring * cr;
+      const bz = -tz * sr - nz * y * cr;
+      // Inside and underneath fall into shade, so depth reads even from above.
+      const shade = 0.64 + 0.36 * (y * 0.5 + 0.5) * (0.6 + 0.4 * k) + (rng() - 0.5) * 0.08;
+      f.sprite(c, [ax, ay, az], [bx, by, bz], [nx, y * 0.5 + 0.6, nz], shade, cell, sz, roll);
+    }
+  }
 }
 
-function blob(r: number, detail: number, x: number, y: number, z: number, sy = 1, seed = 1): THREE.BufferGeometry {
-  return part(new THREE.IcosahedronGeometry(r, detail).scale(1, sy, 1).translate(x, y, z), PALE, true, seed);
-}
-
-/** Eight-faced crown for distant broadleaf trees. */
-function gem(r: number, y: number, sy: number, seed: number): THREE.BufferGeometry {
-  return part(new THREE.OctahedronGeometry(r, 0).scale(1, sy, 1).translate(0, y, 0), PALE, true, seed);
-}
-
-function cone(r: number, h: number, sides: number, y: number, seed = 1): THREE.BufferGeometry {
-  return part(new THREE.ConeGeometry(r, h, sides).translate(0, y + h / 2, 0), PALE, true, seed);
-}
-
-interface SpeciesModel {
+interface TreeShape {
   near: THREE.BufferGeometry;
   mid: THREE.BufferGeometry;
+}
+
+/** Broadleaf tree: tapered trunk, branches out to each lobe, a crown of leaf cards. */
+function broadleaf(lobes: Lobe[], height: number, trunkR: number, near: number, nearSize: number, bark: number, seed: number): TreeShape {
+  const n = new Foliage();
+  const fork = height * 0.48;
+  if (trunkR > 0.08) {
+    n.limb([0, -0.3, 0], [0, fork, 0], trunkR, trunkR * 0.66, 8, bark);
+    for (const l of lobes) {
+      const end = [l.c[0] * 0.8, l.c[1] * 0.92, l.c[2] * 0.8];
+      n.limb([0, fork * 0.82, 0], end, trunkR * 0.48, trunkR * 0.14, 5, bark);
+      // A twig or two off each branch, so bare patches show structure.
+      n.limb([end[0] * 0.6, fork + (end[1] - fork) * 0.6, end[2] * 0.6], [end[0] * 1.1 + 0.6, end[1] + 0.8, end[2] * 1.1 - 0.4], trunkR * 0.15, trunkR * 0.05, 3, bark);
+    }
+  }
+  crown(n, lobes, near, nearSize, seed);
+  const m = new Foliage();
+  if (trunkR > 0.08) m.limb([0, -0.3, 0], [0, fork, 0], trunkR, trunkR * 0.6, 5, bark);
+  crown(m, lobes, Math.max(4, Math.round(near / 4)), nearSize * 2.1, seed + 9);
+  return { near: n.build(), mid: m.build() };
+}
+
+/** Conifer: a straight trunk with whorls of drooping needle sprays, narrowing to the tip. */
+function conifer(height: number, radius: number, trunkR: number, baseFrac: number, rows: number, seed: number): TreeShape {
+  const build = (rowCount: number, perRow: number, widthScale: number, seedOff: number) => {
+    const f = new Foliage();
+    f.limb([0, -0.3, 0], [0, height * 0.97, 0], trunkR, 0.04, rowCount > 6 ? 8 : 5, CELL_BARK);
+    const rng = rngFrom(seed + seedOff);
+    for (let r = 0; r < rowCount; r++) {
+      const t = r / (rowCount - 1);
+      const y = height * (baseFrac + (0.95 - baseFrac) * t);
+      const reach = radius * (1 - t) * (1 - t * 0.15) + 0.3;
+      const count = Math.max(3, Math.round(perRow * (1 - t * 0.5)));
+      const start = rng() * 6.28;
+      for (let i = 0; i < count; i++) {
+        const a = start + (i / count) * Math.PI * 2 + (rng() - 0.5) * 0.5;
+        const dx = Math.cos(a);
+        const dz = Math.sin(a);
+        const droop = -0.28 - rng() * 0.22;
+        const half = reach * 0.55;
+        const c = [dx * half, y + droop * half, dz * half];
+        const w = (0.45 + reach * 0.35) * widthScale;
+        const shade = 0.62 + 0.4 * t + (rng() - 0.5) * 0.08;
+        f.card(c, [-dz * w, 0, dx * w], [dx * half, droop * half, dz * half], [dx * 0.7, 0.75, dz * 0.7], shade, CELL_NEEDLE);
+        // A second, flatter spray on top of each branch fills the whorl.
+        if (rowCount > 6) f.card([c[0] * 0.8, c[1] + 0.25, c[2] * 0.8], [-dz * w * 0.8, 0, dx * w * 0.8], [dx * half * 0.8, -0.05 * half, dz * half * 0.8], [dx * 0.5, 0.85, dz * 0.5], shade * 1.05, CELL_NEEDLE);
+      }
+      // Camera-facing needle clumps fill the body, so the tree never reads as a bare
+      // trunk with fins, from the side or from above.
+      const clumps = rowCount > 6 ? 2 : 3;
+      for (let i = 0; i < clumps; i++) {
+        const a = start + (i / clumps) * Math.PI * 2 + 0.6;
+        const rr = reach * 0.35;
+        const sz = (0.35 + reach * 0.32) * Math.sqrt(widthScale);
+        const p = [Math.cos(a) * rr, y - 0.2, Math.sin(a) * rr];
+        f.sprite(p, [sz, 0, 0], [0, sz, 0], [Math.cos(a) * 0.6, 0.8, Math.sin(a) * 0.6], 0.7 + 0.35 * t, CELL_NEEDLE, sz, rng() * 6.28);
+      }
+    }
+    // Leader at the top.
+    f.card([0, height * 0.98, 0], [0.5, 0, 0], [0, 0.9, 0], [0, 1, 0], 1, CELL_NEEDLE);
+    f.card([0, height * 0.98, 0], [0, 0, 0.5], [0, 0.9, 0], [0, 1, 0], 1, CELL_NEEDLE);
+    return f.build();
+  };
+  return { near: build(rows, 7, 1, 0), mid: build(Math.max(5, Math.round(rows / 2)), 5, 1.6, 3) };
+}
+
+interface SpeciesModel extends TreeShape {
+  /** Billboard quad for far away. */
   far: THREE.BufferGeometry;
-  /** Foliage colour, multiplied with the pale foliage. */
+  /** Foliage colour, multiplied with the pale leaf texture. */
   tint: Tint;
 }
 
+/** Quad for a distant tree, its cell of the billboard atlas, sized to the model. */
+function billboard(width: number, height: number, cell: number): THREE.BufferGeometry {
+  const g = new THREE.PlaneGeometry(width, height).translate(0, height / 2 - 0.2, 0);
+  const uv = g.getAttribute('uv') as THREE.BufferAttribute;
+  for (let i = 0; i < uv.count; i++) uv.setX(i, (cell + uv.getX(i)) / BILLBOARD_COUNT);
+  const n = uv.count;
+  g.setAttribute('aFoliage', new THREE.BufferAttribute(new Float32Array(n).fill(1), 1));
+  g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3).fill(1), 3));
+  g.setAttribute('aCentre', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+  g.setAttribute('aCorner', new THREE.BufferAttribute(new Float32Array(n * 2), 2));
+  return g;
+}
+
 function buildSpecies(): SpeciesModel[] {
-  const wood = rgb('trunk');
-  const pale = rgb('birchTrunk');
-  const oak = {
-    near: join([trunk(5, 0.38, 6, wood, 1), blob(3.5, 2, 0, 7.4, 0, 0.9, 2), blob(2.4, 1, 1.9, 6.2, 1.1, 1, 3), blob(2.2, 1, -1.8, 6.5, -1, 1, 4)]),
-    mid: join([trunk(5, 0.38, 4, wood, 5), blob(3.8, 1, 0, 7, 0, 0.9, 6)]),
-    far: join([gem(3.8, 6.8, 1.1, 7)]),
-    tint: rgb('leaf'),
+  const lobes = (list: number[][]) => list.map(([x, y, z, rx, ry, rz]) => ({ c: [x, y, z], r: [rx, ry, rz] }));
+  // Oak or plane: broad and irregular.
+  const oak = broadleaf(lobes([[0, 8.4, 0, 4.2, 3.2, 4.2], [2.6, 7.3, 1.3, 2.9, 2.4, 2.9], [-2.5, 7.5, -1.5, 3, 2.5, 2.9], [0.6, 10.6, -0.6, 3, 2.3, 3], [-1, 6.6, 2.7, 2.5, 2, 2.5], [1.4, 6.8, -2.6, 2.3, 1.9, 2.3]]), 12.5, 0.42, 30, 1.0, CELL_BARK, 11);
+  // Round field tree, smaller.
+  const round = broadleaf(lobes([[0, 7.2, 0, 3.4, 3.4, 3.4], [1.3, 9.2, 0.6, 2.4, 2.2, 2.4], [-1.4, 6.2, -0.8, 2.5, 2.2, 2.5]]), 11.5, 0.32, 36, 0.9, CELL_BARK, 23);
+  const birch = broadleaf(lobes([[0, 8.3, 0, 2.1, 3.7, 2.1], [0.5, 11, 0.3, 1.5, 2.4, 1.5], [-0.6, 6, -0.4, 1.8, 2.2, 1.8]]), 13.5, 0.16, 32, 0.72, CELL_PALE_BARK, 37);
+  const poplar = broadleaf(lobes([[0, 9.5, 0, 1.8, 6.8, 1.8], [0.2, 14.6, 0.1, 1.15, 3.2, 1.15], [-0.3, 6.6, 0.2, 1.4, 2.6, 1.4]]), 18, 0.27, 42, 0.72, CELL_BARK, 41);
+  const pine = conifer(16, 2.7, 0.27, 0.5, 12, 53);
+  const spruce = conifer(15, 3.1, 0.26, 0.1, 14, 67);
+  const bush = broadleaf(lobes([[0, 0.95, 0, 1.5, 1.05, 1.5], [0.9, 0.75, 0.4, 0.95, 0.75, 0.95], [-0.8, 0.85, -0.5, 1, 0.85, 1]]), 0.3, 0.05, 20, 0.5, CELL_BARK, 71);
+  return [
+    { ...oak, far: billboard(12.5, 13.5, 0), tint: rgb('leaf') },
+    { ...round, far: billboard(9.5, 12.5, 1), tint: rgb('leafLight') },
+    { ...birch, far: billboard(6.5, 15, 2), tint: rgb('leafLight') },
+    { ...poplar, far: billboard(5, 18.5, 3), tint: rgb('leaf') },
+    { ...pine, far: billboard(7, 16.5, 4), tint: rgb('pine') },
+    { ...spruce, far: billboard(8, 15.5, 5), tint: rgb('pineDark') },
+    { ...bush, far: billboard(4.4, 2.3, 6), tint: rgb('leaf') },
+  ];
+}
+
+const FADE_GLSL = /* glsl */ `
+float treeDither(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+`;
+
+/**
+ * Foliage material. uFade holds the distances over which this level fades in
+ * (x to y) and out (z to w). Fragments are dithered away, so two levels crossfade
+ * without popping or sorting. Leaves sway a little in the wind.
+ */
+function treeMaterial(shared: Shared, map: THREE.Texture, billboardMode: boolean): THREE.MeshStandardMaterial {
+  // Alpha to coverage softens the leaf and needle edges through MSAA instead of a
+  // hard, crawling alpha test.
+  const m = new THREE.MeshStandardMaterial({ map, alphaTest: 0.45, alphaToCoverage: true, side: THREE.DoubleSide, vertexColors: true, roughness: 0.88, metalness: 0 });
+  const fade = { value: new THREE.Vector4(-1, 0, 1e9, 1e9 + 1) };
+  m.userData.fade = fade;
+  m.onBeforeCompile = (s) => {
+    s.uniforms.uFade = fade;
+    s.uniforms.uTime = shared.uTime;
+    s.vertexShader = s.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>\nattribute float aFoliage;\nattribute vec3 aCentre;\nattribute vec2 aCorner;\nuniform float uTime;\nvarying float vFadeDist;\nvarying vec2 vCell;\n`,
+      )
+      .replace(
+        '#include <color_vertex>',
+        `vColor = vec4(1.0);\nvColor.rgb *= color.rgb;\n#ifdef USE_INSTANCING_COLOR\nvColor.rgb *= mix(vec3(1.0), instanceColor.rgb, aFoliage);\n#endif`,
+      )
+      .replace(
+        '#include <begin_vertex>',
+        /* glsl */ `#include <begin_vertex>
+vec3 treeBase = (instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+vFadeDist = distance(treeBase, cameraPosition);
+vCell = vec2(fract(uv.x * ${BILLBOARD_COUNT.toFixed(1)}), uv.y);
+bool facing = dot(aCorner, aCorner) > 0.0;
+if (facing) transformed = aCentre;
+// Wind: the crown sways, more towards the top; trunks stay put.
+float sway = aFoliage * max(transformed.y, 0.0) * 0.011;
+transformed.x += sin(uTime * 1.5 + treeBase.x * 0.13 + treeBase.z * 0.07) * sway;
+transformed.z += cos(uTime * 1.2 + treeBase.z * 0.11 - treeBase.x * 0.05) * sway * 0.7;
+`,
+      );
+    if (!billboardMode) {
+      s.vertexShader = s.vertexShader.replace(
+        '#include <project_vertex>',
+        `#include <project_vertex>
+if (facing) {
+  mvPosition.xy += aCorner * length(instanceMatrix[0].xyz);
+  gl_Position = projectionMatrix * mvPosition;
+}`,
+      );
+    }
+    if (billboardMode) {
+      s.vertexShader = s.vertexShader
+        .replace(
+          '#include <project_vertex>',
+          /* glsl */ `
+// Stand up and turn about Y to face the camera.
+float wScale = length(instanceMatrix[1].xyz);
+vec3 toCam = cameraPosition - treeBase;
+vec3 wRight = normalize(vec3(toCam.z, 0.0, -toCam.x) + vec3(1e-5, 0.0, 0.0));
+vec3 wPos = treeBase + wRight * transformed.x * length(instanceMatrix[0].xyz) + vec3(0.0, transformed.y * wScale, 0.0);
+vec4 mvPosition = viewMatrix * vec4(wPos, 1.0);
+gl_Position = projectionMatrix * mvPosition;
+`,
+        )
+        .replace('#include <worldpos_vertex>', `vec4 worldPosition = vec4(wPos, 1.0);`);
+    }
+    s.fragmentShader = s.fragmentShader
+      .replace('#include <common>', `#include <common>\nuniform vec4 uFade;\nvarying float vFadeDist;\nvarying vec2 vCell;\n${FADE_GLSL}`)
+      .replace(
+        '#include <alphatest_fragment>',
+        /* glsl */ `#include <alphatest_fragment>
+{
+  // Fading in keeps the pixels below the dither value, fading out the ones above,
+  // so the two levels in a band fill complementary pixels and leave no holes.
+  float fadeIn = smoothstep(uFade.x, uFade.y, vFadeDist);
+  float fadeOut = 1.0 - smoothstep(uFade.z, uFade.w, vFadeDist);
+  float dither = treeDither(gl_FragCoord.xy);
+  if (dither >= fadeIn || 1.0 - dither > fadeOut) discard;
+}
+`,
+      )
+      .replace(
+        '#include <normal_fragment_begin>',
+        billboardMode
+          ? /* glsl */ `#include <normal_fragment_begin>
+// A billboard lights like the round crown it stands for.
+normal = normalize(vec3((vCell.x - 0.5) * 1.5, (vCell.y - 0.42) * 1.1, 0.7));
+nonPerturbedNormal = normal;`
+          : /* glsl */ `#include <normal_fragment_begin>
+// Bent crown normal, eased toward the sky so shaded cards still pick up skylight
+// the way thin leaves pass light through.
+normal = normalize(mix(normalize(vNormal), (viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz, 0.3));
+nonPerturbedNormal = normal;`,
+      );
   };
-  const maple = {
-    near: join([trunk(4.4, 0.3, 6, wood, 8), blob(3, 2, 0, 7.2, 0, 1.18, 9)]),
-    mid: join([trunk(4.4, 0.3, 4, wood, 10), blob(3.1, 1, 0, 7.1, 0, 1.15, 11)]),
-    far: join([gem(3.1, 7, 1.2, 12)]),
-    tint: rgb('leafLight'),
-  };
-  const birch = {
-    near: join([trunk(7, 0.17, 6, pale, 13), blob(1.8, 0, 0, 7.6, 0, 1.4, 14), blob(1.4, 0, 0.3, 10.2, 0.2, 1.3, 15)]),
-    mid: join([trunk(7, 0.17, 4, pale, 16), blob(2, 0, 0, 8.6, 0, 1.8, 17)]),
-    far: join([gem(2, 8.4, 2, 18)]),
-    tint: rgb('leafLight'),
-  };
-  const poplar = {
-    near: join([trunk(4, 0.25, 6, wood, 19), blob(1.9, 1, 0, 10, 0, 3.2, 20)]),
-    mid: join([trunk(4, 0.25, 4, wood, 21), blob(1.9, 0, 0, 10, 0, 3.2, 22)]),
-    far: join([gem(1.9, 10, 3.4, 23)]),
-    tint: rgb('leaf'),
-  };
-  const pine = {
-    near: join([trunk(3.2, 0.3, 6, wood, 24), cone(2.7, 4.4, 12, 2.2, 25), cone(2.1, 3.8, 12, 4.6, 26), cone(1.4, 3.4, 12, 7, 27)]),
-    mid: join([trunk(2.6, 0.3, 4, wood, 28), cone(2.6, 8.6, 8, 2, 29)]),
-    far: join([cone(2.6, 9, 3, 1.4, 30)]),
-    tint: rgb('pine'),
-  };
-  const spruce = {
-    near: join([trunk(2.4, 0.3, 6, wood, 31), cone(3.1, 7.4, 12, 1.2, 32), cone(2.1, 6, 12, 5.4, 33)]),
-    mid: join([trunk(2, 0.3, 4, wood, 34), cone(3, 11.6, 8, 1, 35)]),
-    far: join([cone(3, 12, 3, 0.6, 36)]),
-    tint: rgb('pineDark'),
-  };
-  const bush = {
-    near: join([blob(1.3, 1, 0, 0.9, 0, 0.8, 37), blob(0.9, 1, 0.9, 0.7, 0.4, 0.8, 38), blob(0.85, 1, -0.8, 0.75, -0.5, 0.8, 39)]),
-    mid: join([blob(1.4, 1, 0, 0.9, 0, 0.75, 40)]),
-    far: join([gem(1.4, 0.9, 0.75, 41)]),
-    tint: rgb('leaf'),
-  };
-  return [oak, maple, birch, poplar, pine, spruce, bush];
+  m.customProgramCacheKey = () => (billboardMode ? 'cl-tree-billboard' : 'cl-tree-cards');
+  return m;
 }
 
 /**
@@ -176,6 +452,8 @@ interface Bucket {
   colour: Float32Array;
   count: number;
   capacity: number;
+  /** The first this many instances stand where the sun's shadow map can see them. */
+  shadowCount: number;
 }
 
 export class TreeLayer {
@@ -186,6 +464,11 @@ export class TreeLayer {
 
   private species: SpeciesModel[];
   private leafMat: THREE.MeshStandardMaterial;
+  private nearMat: THREE.MeshStandardMaterial;
+  private midMat: THREE.MeshStandardMaterial;
+  private farMat: THREE.MeshStandardMaterial;
+  private atlas: THREE.Texture;
+  private billboardAtlas: THREE.Texture;
   private near: Bucket[] = [];
   private mid: Bucket[] = [];
   private far: Bucket[] = [];
@@ -212,6 +495,10 @@ export class TreeLayer {
   private lastZ = Infinity;
   private lastY = Infinity;
   private dirtySort = true;
+  private shadowX = 0;
+  private shadowZ = 0;
+  private shadowR = Infinity;
+  private deferred = new Int32Array(0);
 
   /** Extra blockers such as zone buildings: x, z, radius. */
   blockers: () => Iterable<{ x: number; z: number; r: number }> = () => [];
@@ -219,20 +506,16 @@ export class TreeLayer {
   constructor(
     private readonly net: RoadNetwork,
     anisotropy: number,
+    shared: Shared,
   ) {
-    void anisotropy;
     this.species = buildSpecies();
-    this.leafMat = worldMaterial({ vertexColors: true, roughness: 0.9 });
-    // Instance colour tints the foliage only, so trunks keep their own colour.
-    this.leafMat.onBeforeCompile = (sh) => {
-      sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', `#include <common>\nattribute float aFoliage;`)
-        .replace(
-          '#include <color_vertex>',
-          `vColor = vec4(1.0);\nvColor.rgb *= color.rgb;\n#ifdef USE_INSTANCING_COLOR\nvColor.rgb *= mix(vec3(1.0), instanceColor.rgb, aFoliage);\n#endif`,
-        );
-    };
-    this.leafMat.customProgramCacheKey = () => 'cl-tree-smooth';
+    this.atlas = makeLeafAtlas(anisotropy);
+    this.billboardAtlas = makeBillboardAtlas(anisotropy);
+    this.nearMat = treeMaterial(shared, this.atlas, false);
+    this.midMat = treeMaterial(shared, this.atlas, false);
+    this.farMat = treeMaterial(shared, this.billboardAtlas, true);
+    this.leafMat = this.nearMat;
+
     this.scatter();
     this.rasteriseWater();
     this.maskTexture = new THREE.DataTexture(this.mask, MASK_SIZE, MASK_SIZE, THREE.RedFormat, THREE.UnsignedByteType);
@@ -257,7 +540,9 @@ export class TreeLayer {
       if (d < threshold - 0.1 * rng() && rng() > 0.012) continue;
       if (!inMap && rng() > 0.4) continue;
       if (isWater(x, z) || riverDistance(x, z) < 42) continue;
-      const y = terrainHeight(x, z);
+      // Stand on the ground as drawn, and keep off the rocky ridges.
+      if (mountainRidge(x, z) > 30) continue;
+      const y = displayGround(x, z);
       if (y > 520) continue;
       // Mixed woods: pine stands on one side of the map, broadleaf on the other,
       // bushes along the rims and on their own in the fields.
@@ -284,7 +569,8 @@ export class TreeLayer {
         const x = cx + (rng() * 2 - 1) * spread;
         const z = cz + (rng() * 2 - 1) * spread;
         if (isWater(x, z) || riverDistance(x, z) < 42) continue;
-        const y = terrainHeight(x, z);
+        if (mountainRidge(x, z) > 30) continue;
+        const y = displayGround(x, z);
         if (y > 520) continue;
         const kind = rng() < 0.35 ? 6 : rng() < 0.75 ? 0 : rng() < 0.6 ? 1 : 4;
         const s = kind === 6 ? 0.6 + rng() * 0.5 : 0.48 + rng() * 0.32;
@@ -361,22 +647,61 @@ export class TreeLayer {
     mesh.receiveShadow = false;
     mesh.count = 0;
     this.group.add(mesh);
-    return { mesh, matrix: mesh.instanceMatrix.array as Float32Array, colour: mesh.instanceColor.array as Float32Array, count: 0, capacity };
+    const bucket: Bucket = { mesh, matrix: mesh.instanceMatrix.array as Float32Array, colour: mesh.instanceColor.array as Float32Array, count: 0, capacity, shadowCount: 0 };
+    if (castShadow) {
+      // Trees sort with those inside the shadow box first, so the shadow pass draws only them.
+      let drawn = 0;
+      mesh.onBeforeShadow = () => {
+        drawn = mesh.count;
+        mesh.count = Math.min(drawn, bucket.shadowCount);
+      };
+      mesh.onAfterShadow = () => {
+        mesh.count = drawn;
+      };
+    }
+    return bucket;
+  }
+
+  /**
+   * Where the sun's shadow map reaches on the ground: a circle round the camera's
+   * focus. Trees outside it cast nothing visible, so they are left out of the shadow pass.
+   */
+  setShadowReach(x: number, z: number, r: number): void {
+    const moved = Math.hypot(x - this.shadowX, z - this.shadowZ);
+    // Small pans keep the old circle: the margin in sort() covers them.
+    if (r === this.shadowR && moved < SHADOW_SLACK) return;
+    this.shadowX = x;
+    this.shadowZ = z;
+    this.shadowR = r;
+    this.dirtySort = true;
   }
 
   setQuality(q: QualitySettings): void {
     this.quality = q;
+    // Alpha to coverage needs MSAA and costs fill rate on dense foliage; low uses a plain alpha test.
+    for (const m of [this.nearMat, this.midMat, this.farMat]) {
+      if (m.alphaToCoverage !== q.treeCoverage) {
+        m.alphaToCoverage = q.treeCoverage;
+        m.needsUpdate = true;
+      }
+    }
     for (const b of [...this.near, ...this.mid, ...this.far]) {
       this.group.remove(b.mesh);
       b.mesh.dispose();
     }
     const nearCap = 1600;
     const midCap = 9000;
-    this.near = this.species.map((s) => this.makeBucket(s.near, this.leafMat, nearCap, true));
-    this.mid = this.species.map((s) => this.makeBucket(s.mid, this.leafMat, midCap, true));
+    this.near = this.species.map((s) => this.makeBucket(s.near, this.nearMat, nearCap, true));
+    this.mid = this.species.map((s) => this.makeBucket(s.mid, this.midMat, midCap, true));
     const totals = new Array(this.species.length).fill(0);
     for (let i = 0; i < this.count; i++) totals[this.kind[i]]++;
-    this.far = this.species.map((sp, k) => this.makeBucket(sp.far, this.leafMat, Math.max(1, totals[k]), false));
+    this.far = this.species.map((sp, k) => this.makeBucket(sp.far, this.farMat, Math.max(1, totals[k]), false));
+    // Crossfade bands, where a tree is drawn at both levels and dithered between them.
+    const nb = q.treeNear * FADE_BAND;
+    const mb = q.treeMid * FADE_BAND;
+    (this.nearMat.userData.fade.value as THREE.Vector4).set(-1, 0, q.treeNear - nb, q.treeNear);
+    (this.midMat.userData.fade.value as THREE.Vector4).set(q.treeNear - nb, q.treeNear, q.treeMid - mb, q.treeMid);
+    (this.farMat.userData.fade.value as THREE.Vector4).set(q.treeMid - mb, q.treeMid, 1e9, 1e9 + 1);
     this.dirtySort = true;
   }
 
@@ -439,7 +764,19 @@ export class TreeLayer {
     }
     const net = this.net;
     const region = { minX: minX - 40, minZ: minZ - 40, maxX: minX + TILE + 40, maxZ: minZ + TILE + 40 };
+    const mods = terrainModsFor(net);
     for (const id of net.segmentsInRegion(region, true)) {
+      // Embankments, walls and cuts clear their whole footprint, at any height.
+      const works = mods.segments.get(id);
+      if (works) {
+        for (let i = 0; i + 1 < works.length; i++) {
+          const a = works[i];
+          const b = works[i + 1];
+          const reach = Math.max(a.left?.extent ?? 0, a.right?.extent ?? 0, b.left?.extent ?? 0, b.right?.extent ?? 0, totalHalfWidth(net.roadTypeOf(id))) + 2;
+          this.stampLine(a.x, a.z, b.x, b.z, reach, minX, minZ);
+        }
+        continue;
+      }
       const stations = net.curveOf(id).stations;
       const r = totalHalfWidth(net.roadTypeOf(id)) + 4.5;
       for (let i = 0; i + 1 < stations.length; i++) {
@@ -459,6 +796,17 @@ export class TreeLayer {
       const cj = lo(this.z[i]);
       const inside = ci >= 0 && cj >= 0 && ci < MASK_SIZE && cj < MASK_SIZE;
       this.hidden[i] = inside && this.mask[ci + cj * MASK_SIZE] === 1 ? 1 : 0;
+      // Landscaping (core/terrainEdit.ts): trees stand on the edited land, and are
+      // cleared where it floods or where a steep edit has cut or heaped the ground.
+      const x = this.x[i];
+      const z = this.z[i];
+      const d = terrainEditDelta(x, z);
+      const y = terrainHeight(x, z) - 0.05;
+      if (d !== 0 || Math.abs(this.y[i] - y) > 0.01) {
+        this.y[i] = y;
+        const steep = Math.hypot(terrainEditDelta(x + 2, z) - terrainEditDelta(x - 2, z), terrainEditDelta(x, z + 2) - terrainEditDelta(x, z - 2)) / 4;
+        if (y < WATER_LEVEL + 0.25 || steep > 0.9) this.hidden[i] = 1;
+      }
     }
   }
 
@@ -496,6 +844,10 @@ export class TreeLayer {
     if (!q) return;
     const near2 = q.treeNear * q.treeNear;
     const mid2 = q.treeMid * q.treeMid;
+    const nearIn = q.treeNear * (1 - FADE_BAND);
+    const midIn = q.treeMid * (1 - FADE_BAND);
+    const nearIn2 = nearIn * nearIn;
+    const midIn2 = midIn * midIn;
     // Fog hides trees past this, so they are not drawn at all.
     // From high up the whole map is in view, so the cutoff grows with the camera's height.
     const farR = Math.max(q.treeFar, camY * 1.7);
@@ -503,18 +855,55 @@ export class TreeLayer {
     for (const set of [this.near, this.mid, this.far]) for (const b of set) b.count = 0;
     const limit = Math.floor(this.count * q.treeDensity);
     const { x, y, z, kind, hidden } = this;
+    // Near and mid trees outside the shadow reach are held back and placed after the
+    // rest, so each near and mid bucket starts with its shadow casters. The slack covers
+    // the focus drifting between re-sorts.
+    const sx = this.shadowX;
+    const sz = this.shadowZ;
+    const sr = this.shadowR + SHADOW_SLACK;
+    const sr2 = Number.isFinite(sr) ? sr * sr : Infinity;
+    if (this.deferred.length < this.count) this.deferred = new Int32Array(this.count);
+    const deferred = this.deferred;
+    let held = 0;
+    const placeTree = (i: number, d2: number) => {
+      const k = kind[i];
+      const nb = this.near[k];
+      const mb = this.mid[k];
+      // Inside a fade band a tree goes in both levels; the shaders dither between them.
+      let placed = false;
+      if (d2 < near2 && nb.count < nb.capacity) {
+        this.place(nb, i);
+        placed = d2 < nearIn2;
+      }
+      if (!placed && d2 < mid2 && mb.count < mb.capacity) {
+        this.place(mb, i);
+        placed = d2 < midIn2;
+      }
+      if (!placed && d2 < far2) this.place(this.far[k], i);
+    };
     for (let i = 0; i < limit; i++) {
       if (hidden[i]) continue;
       const dx = x[i] - camX;
       const dy = y[i] - camY;
       const dz = z[i] - camZ;
       const d2 = dx * dx + dy * dy + dz * dz;
-      const k = kind[i];
-      const nb = this.near[k];
-      const mb = this.mid[k];
-      if (d2 < near2 && nb.count < nb.capacity) this.place(nb, i);
-      else if (d2 < mid2 && mb.count < mb.capacity) this.place(mb, i);
-      else if (d2 < far2) this.place(this.far[k], i);
+      if (d2 < mid2) {
+        const ex = x[i] - sx;
+        const ez = z[i] - sz;
+        if (ex * ex + ez * ez >= sr2) {
+          deferred[held++] = i;
+          continue;
+        }
+      }
+      placeTree(i, d2);
+    }
+    for (const set of [this.near, this.mid]) for (const b of set) b.shadowCount = b.count;
+    for (let j = 0; j < held; j++) {
+      const i = deferred[j];
+      const dx = x[i] - camX;
+      const dy = y[i] - camY;
+      const dz = z[i] - camZ;
+      placeTree(i, dx * dx + dy * dy + dz * dz);
     }
     for (const set of [this.near, this.mid, this.far]) {
       for (const b of set) {
@@ -531,7 +920,8 @@ export class TreeLayer {
     }
   }
 
-  update(dt: number, camX: number, camY: number, camZ: number): void {
+  /** Returns true when the trees drawn changed, so a cached shadow map is stale. */
+  update(dt: number, camX: number, camY: number, camZ: number): boolean {
     this.staleTimer += dt;
     // Editing drags can dirty roads every frame, so tree work is held to a trickle.
     if (this.stale.size && (this.staleTimer > 0.1 || this.dirtySort)) {
@@ -552,7 +942,9 @@ export class TreeLayer {
       this.lastZ = camZ;
       this.dirtySort = false;
       this.sort(camX, camY, camZ);
+      return true;
     }
+    return false;
   }
 
   dispose(): void {
@@ -562,7 +954,11 @@ export class TreeLayer {
       s.mid.dispose();
       s.far.dispose();
     }
-    this.leafMat.dispose();
+    this.nearMat.dispose();
+    this.midMat.dispose();
+    this.farMat.dispose();
+    this.atlas.dispose();
+    this.billboardAtlas.dispose();
     this.maskTexture.dispose();
     this.group.clear();
   }

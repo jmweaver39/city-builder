@@ -9,7 +9,7 @@ import type { RoadNetwork } from '../core/RoadNetwork';
 import { closestPointOnCubic } from '../core/bezier';
 import { totalHalfWidth } from '../core/roadTypes';
 import { effectiveControl } from '../core/signals';
-import { terrainHeight } from '../core/terrain';
+import { surfaceLevel, terrainHeight } from '../core/terrain';
 import type { LightState, SignalHead, SimApi } from '../sim/api';
 import { ChunkBatch, SURF_SCHEMA, SurfBuf, type SurfStyle } from './batch';
 import { COL, KIND_UNTINTED, ROAD_LIFT, hexRGB } from './constants';
@@ -361,7 +361,7 @@ export class FurnitureLayer {
         const b = st[i + 1];
         const f = (s - a.s) / Math.max(b.s - a.s, 1e-6);
         const y = a.pos.y + (b.pos.y - a.pos.y) * f;
-        if (y < -1.5) continue;
+        if (y < surfaceLevel(a.pos.x, a.pos.z) - 1.5) continue;
         const x = a.pos.x + (b.pos.x - a.pos.x) * f;
         const z = a.pos.z + (b.pos.z - a.pos.z) * f;
         // Alternate sides on streets. Fast roads keep to the right edge.

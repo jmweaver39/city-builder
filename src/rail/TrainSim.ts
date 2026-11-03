@@ -19,7 +19,11 @@ import { buildTrackGraph, TrackGraph, type StationPlace } from './TrackGraph';
 import { TrackPath, type PathPoint } from './TrackPath';
 
 export const FLAG_HIDDEN = 1;
+/** Doors open on the car's own left (local -x). */
 export const FLAG_DOORS = 2;
+/** Doors open on the car's own right (local +x). */
+export const FLAG_DOORS_R = 16;
+const DOOR_BITS = FLAG_DOORS | FLAG_DOORS_R;
 export const FLAG_BRAKING = 4;
 
 /** Per-car render state. Slots are packed. A train's cars sit together, front first. */
@@ -133,6 +137,8 @@ export interface Train {
   dirty: boolean;
   /** Wants another stop to reverse or plan from. */
   lost: boolean;
+  /** Platform sides at the current stop, relative to travel: 1 left, 2 right. */
+  doorSides: number;
 }
 
 export interface LinePlan {
@@ -140,6 +146,8 @@ export interface LinePlan {
   ok: boolean;
   problem: string | null;
   warning: string | null;
+  /** A diesel type that could run where this electric train cannot. */
+  fixType: TrainTypeId | null;
   rules: RouteRules;
   /** Station ids, one full cycle. */
   cycle: Id[];
@@ -184,6 +192,8 @@ export interface LineInfo {
   wanted: number;
   problem: string | null;
   warning: string | null;
+  /** Diesel type that would run here, when wires are the problem. */
+  fixType: TrainTypeId | null;
   carried: number;
   onTimePct: number;
   cycleSec: number;
@@ -438,9 +448,9 @@ export class TrainSim {
 
   private planLine(line: RailLine): LinePlan {
     const type = TRAIN_TYPES[line.trainType];
-    const rules: RouteRules = { metro: type.metro, electric: type.electric, maxSpeed: type.maxKmh / 3.6 };
+    const rules: RouteRules = { metro: type.metro, power: type.power, maxSpeed: type.maxKmh / 3.6 };
     const trainLen = makeConsist(line.trainType, line.cars, new RailRng(1)).length;
-    const plan: LinePlan = { line, ok: false, problem: null, warning: null, rules, cycle: [], cycleSec: 0, lengthM: 0, trainLength: trainLen };
+    const plan: LinePlan = { line, ok: false, problem: null, warning: null, fixType: null, rules, cycle: [], cycleSec: 0, lengthM: 0, trainLength: trainLen };
     if (line.stops.length < 2) {
       plan.problem = 'Needs at least two stops';
       return plan;
@@ -460,20 +470,26 @@ export class TrainSim {
     const pieces = (id: Id) => new Set(this.graph.stations.get(id)!.stops.map((s) => s.piece));
     const allStates = (id: Id) => this.graph.stations.get(id)!.stops.flatMap((s) => [s.piece * 2, s.piece * 2 + 1]);
 
-    const first = findRoute(this.graph, allStates(cycle[0]), pieces(cycle[1]), rules);
-    if (!first) {
-      plan.problem = `No track from ${this.stationName(cycle[0])} to ${this.stationName(cycle[1])} for this train`;
+    const noRoute = (from: Id, to: Id, starts: number[]): LinePlan => {
+      // Say whether wires are what is missing, and offer a diesel that could run.
+      const unpowered = type.power !== 'diesel' && findRoute(this.graph, starts, pieces(to), { ...rules, power: 'diesel' });
+      if (unpowered) {
+        const what = type.power === 'thirdRail' ? 'third rail' : 'overhead wire';
+        plan.problem = `${type.name} needs ${what}: the track from ${this.stationName(from)} to ${this.stationName(to)} has none in places`;
+        plan.fixType = type.diesel;
+      } else {
+        plan.problem = `No track from ${this.stationName(from)} to ${this.stationName(to)} for this train`;
+      }
       return plan;
-    }
+    };
+    const first = findRoute(this.graph, allStates(cycle[0]), pieces(cycle[1]), rules);
+    if (!first) return noRoute(cycle[0], cycle[1], allStates(cycle[0]));
     let state = first.states[0];
     const legs: { route: Route; from: Id }[] = [];
     for (let i = 0; i < cycle.length; i++) {
       const to = cycle[(i + 1) % cycle.length];
       const route = this.bestLeg(state, pieces(to), rules, type.changeEnds);
-      if (!route) {
-        plan.problem = `No track from ${this.stationName(cycle[i])} to ${this.stationName(to)} for this train`;
-        return plan;
-      }
+      if (!route) return noRoute(cycle[i], to, [state, opposite(state)]);
       legs.push({ route, from: cycle[i] });
       state = route.states[route.states.length - 1];
     }
@@ -706,6 +722,7 @@ export class TrainSim {
       born: this.time_,
       dirty: true,
       lost: false,
+      doorSides: 3,
     };
     this.buildEntries(t);
     // The whole body must land on free track.
@@ -1174,8 +1191,22 @@ export class TrainSim {
     this.extend(t);
   }
 
+  /** Which side of the train the platform is on, from the stop under its middle. */
+  private platformSidesAt(t: Train, stationId: Id): number {
+    const place = this.graph.stations.get(stationId);
+    if (!place) return 3;
+    const mid = t.head - t.consist.length / 2;
+    const state = t.path.states[t.path.locate(Math.max(0, Math.min(mid, t.path.length - 1e-3)))];
+    const stop = place.stops.find((x) => x.piece === state >> 1) ?? place.stops[0];
+    if (!stop) return 3;
+    // Run pieces go a to b, so running forward keeps the segment's left and right.
+    if ((state & 1) === 0) return stop.sides;
+    return ((stop.sides & 1) << 1) | ((stop.sides & 2) >> 1);
+  }
+
   private arrive(t: Train): void {
     const stop = t.stops[t.stopIndex];
+    t.doorSides = this.platformSidesAt(t, stop.station);
     const plan = this.plans.get(t.lineId);
     const c = this.counter(t.lineId);
     const late = this.time_ - t.departed - stop.sched * 1.15 - 25;
@@ -1234,8 +1265,18 @@ export class TrainSim {
   private writeFlags(t: Train): void {
     const v = this.view;
     const open = t.state === 'dwell' && t.timer > 3;
-    for (let i = t.slot; i < t.slot + t.consist.count; i++) {
-      v.flags[i] = (v.flags[i] & ~FLAG_DOORS) | (open ? FLAG_DOORS : 0);
+    const c = t.consist;
+    for (let k = 0; k < c.count; k++) {
+      const i = t.slot + k;
+      let bits = 0;
+      if (open) {
+        // A car facing against travel has its own left on the travel right.
+        const along = (c.flip[k] === 1) === t.reversed;
+        const left = along ? t.doorSides & 1 : t.doorSides & 2;
+        const right = along ? t.doorSides & 2 : t.doorSides & 1;
+        bits = (left ? FLAG_DOORS : 0) | (right ? FLAG_DOORS_R : 0);
+      }
+      v.flags[i] = (v.flags[i] & ~DOOR_BITS) | bits;
     }
   }
 
@@ -1272,7 +1313,7 @@ export class TrainSim {
       v.pitch[slot] = flip ? -pitch : pitch;
       v.speed[slot] = t.v;
       const hidden = t.exits || t.head - c.length < 0 ? s1 < hiddenBefore || s2 < hiddenBefore || s1 > hiddenAfter || s2 > hiddenAfter : false;
-      let flags = v.flags[slot] & FLAG_DOORS;
+      let flags = v.flags[slot] & DOOR_BITS;
       if (hidden) flags |= FLAG_HIDDEN;
       if (braking) flags |= FLAG_BRAKING;
       v.flags[slot] = flags;
@@ -1489,6 +1530,7 @@ export class TrainSim {
       wanted: line.trains,
       problem: plan?.problem ?? null,
       warning,
+      fixType: plan?.fixType ?? null,
       carried: c?.carried ?? 0,
       onTimePct: c?.arrivals ? (c.onTime / c.arrivals) * 100 : 100,
       cycleSec: plan?.cycleSec ?? 0,
@@ -1498,13 +1540,13 @@ export class TrainSim {
   }
 
   /** Why a line cannot run, or a warning, without adding it. */
-  checkLine(init: Omit<RailLine, 'id'>): { problem: string | null; warning: string | null; trainLength: number } {
+  checkLine(init: Omit<RailLine, 'id'>): { problem: string | null; warning: string | null; fixType: TrainTypeId | null; trainLength: number } {
     if (this.dirty) this.rebuild();
     const saved = this.use;
     this.use = new Uint8Array(saved.length);
     const plan = this.planLine({ ...init, id: -1 });
     this.use = saved;
-    return { problem: plan.problem, warning: plan.warning, trainLength: plan.trainLength };
+    return { problem: plan.problem, warning: plan.warning, fixType: plan.fixType, trainLength: plan.trainLength };
   }
 
   /** Slots of a train's cars. */

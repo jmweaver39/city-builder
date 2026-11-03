@@ -64,8 +64,8 @@ function hillHeight(x: number, z: number): number {
   return 0.32 * rise * roll;
 }
 
-/** Ground height in metres at a plan position. Deterministic. */
-export function terrainHeight(x: number, z: number): number {
+/** The untouched land: river channel and far hills, before any landscaping. */
+export function baseTerrainHeight(x: number, z: number): number {
   const d = riverDistance(x, z);
   const channel = RIVER_DEPTH * (smoothstep(BANK_INNER, BANK_OUTER, d) - 1);
   const hills = hillHeight(x, z);
@@ -73,9 +73,85 @@ export function terrainHeight(x: number, z: number): number {
   return channel + hills * smoothstep(BANK_OUTER, VALLEY_OUTER, d);
 }
 
-/** True where the surface is river. */
+/**
+ * Landscaping (core/terrainEdit.ts) installs its height offsets here. Null while
+ * nothing is bound, so tests and tools that never edit terrain see the old land.
+ */
+let editSampler: ((x: number, z: number) => number) | null = null;
+
+/** Install or remove the edit layer's sampler. Only core/terrainEdit.ts calls this. */
+export function setTerrainEditSampler(fn: ((x: number, z: number) => number) | null): void {
+  editSampler = fn;
+}
+
+let editVersion = 0;
+
+/**
+ * Changes whenever committed landscaping changes (stroke end, load, undo, roads
+ * re-conforming it). Caches of anything derived from terrainHeight key on this.
+ */
+export function terrainEditVersion(): number {
+  return editVersion;
+}
+
+/** Only core/terrainEdit.ts calls this. */
+export function bumpTerrainEditVersion(): void {
+  editVersion++;
+}
+
+/** True while any landscaping is in force (the sampler is only installed then). */
+export function hasTerrainEdits(): boolean {
+  return editSampler !== null;
+}
+
+/** Landscaping offset at a point: 0 where the land is as generated. */
+export function terrainEditDelta(x: number, z: number): number {
+  return editSampler === null ? 0 : editSampler(x, z);
+}
+
+/**
+ * Ground height in metres at a plan position: the land plus landscaping. Roads'
+ * embankments, cuts and quays go on top in core/terrainMods.ts (groundHeight).
+ */
+export function terrainHeight(x: number, z: number): number {
+  const h = baseTerrainHeight(x, z);
+  return editSampler === null ? h : h + editSampler(x, z);
+}
+
+/**
+ * Landscaping's water: 1 wet, 0 dry, -1 where it has nothing to say (unedited
+ * land, so the generated river decides). Installed by core/terrainEdit.ts.
+ */
+let waterSampler: ((x: number, z: number) => number) | null = null;
+
+/** Only core/terrainEdit.ts calls this. */
+export function setTerrainWaterSampler(fn: ((x: number, z: number) => number) | null): void {
+  waterSampler = fn;
+}
+
+/**
+ * True where the surface is water. Water reaches only ground below WATER_LEVEL
+ * that connects to the river (or that the player let water into), and never a
+ * road, trench or tunnel; pits dug elsewhere stay dry. River bed raised above the
+ * level is dry land.
+ */
 export function isWater(x: number, z: number): boolean {
-  return riverDistance(x, z) < RIVER_HALF_WIDTH;
+  if (editSampler === null) return riverDistance(x, z) < RIVER_HALF_WIDTH;
+  if (terrainHeight(x, z) >= WATER_LEVEL) return false;
+  const w = waterSampler === null ? -1 : waterSampler(x, z);
+  return w === -1 ? riverDistance(x, z) < RIVER_HALF_WIDTH : w === 1;
+}
+
+/**
+ * The level things are built on and tunnels are measured from: the ground, with
+ * the river's dip counted as 0 (as before landscaping) unless the land was dug
+ * deeper. Without edits this is max(terrainHeight, 0).
+ */
+export function surfaceLevel(x: number, z: number): number {
+  const base = baseTerrainHeight(x, z);
+  if (editSampler === null) return Math.max(base, 0);
+  const d = editSampler(x, z);
+  return Math.max(base + d, Math.min(0, d));
 }
 
 export function isInsideMap(x: number, z: number): boolean {
@@ -86,7 +162,7 @@ export type RoadLevel = 'ground' | 'bridge' | 'tunnel';
 
 /** How a road surface at this position is built, per the elevation conventions. */
 export function roadLevel(pos: Vec3): RoadLevel {
-  if (pos.y < -1.5) return 'tunnel';
+  if (pos.y < surfaceLevel(pos.x, pos.z) - 1.5) return 'tunnel';
   if (pos.y - terrainHeight(pos.x, pos.z) > 1) return 'bridge';
   return 'ground';
 }

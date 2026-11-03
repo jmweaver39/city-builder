@@ -7,7 +7,7 @@
 import * as THREE from 'three';
 import { CAR, CAR_KINDS } from '../rail/consists';
 import { RAIL_TOP } from '../rail/constants';
-import { FLAG_BRAKING, FLAG_DOORS, FLAG_HIDDEN, type TrainSim } from '../rail/TrainSim';
+import { FLAG_BRAKING, FLAG_DOORS, FLAG_DOORS_R, FLAG_HIDDEN, type TrainSim } from '../rail/TrainSim';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import type { Shared } from './materials';
 import { CONTAINER_COLOURS, LOCO_LIVERIES as STYLE_LIVERIES, TRAIN_GREY, TRAIN_IVORY, TRAIN_RED, TRAIN_SILVER, WAGON_COLOURS } from './style';
@@ -83,7 +83,9 @@ varying float vShine;
   } else if (part > ${P_DOOR - 1}.5 && part < ${P_DOOR}.5) {
     vColor.rgb *= aBody * 0.82;
     // Open doors show the lit vestibule.
-    if (aState.y > 0.5) { vColor.rgb = vec3(0.55, 0.5, 0.42); glow = vec3(1.0, 0.85, 0.6) * (0.25 + uNight * 1.4); }
+    // Open only on the platform side: bit 1 is the car's left (x < 0), bit 2 its right.
+    float doorBit = position.x < 0.0 ? 1.0 : 2.0;
+    if (mod(floor(aState.y / doorBit), 2.0) > 0.5) { vColor.rgb = vec3(0.55, 0.5, 0.42); glow = vec3(1.0, 0.85, 0.6) * (0.25 + uNight * 1.4); }
   }
   vGlow = glow;
 }
@@ -238,15 +240,16 @@ export class TrainLayer {
       this.livery(layer, k, i, trains);
       const st = layer.state.array as Float32Array;
       st[k * 4] = v.lamp[i];
-      st[k * 4 + 1] = v.flags[i] & FLAG_DOORS ? 1 : 0;
+      // 1 left doors, 2 right doors, 3 both, in the car's own frame.
+      st[k * 4 + 1] = (v.flags[i] & FLAG_DOORS ? 1 : 0) + (v.flags[i] & FLAG_DOORS_R ? 2 : 0);
       st[k * 4 + 2] = v.flags[i] & FLAG_BRAKING ? 1 : 0;
-      st[k * 4 + 3] = kind <= CAR.hsCar ? 1 : 0;
+      st[k * 4 + 3] = kind <= CAR.hsCar || kind >= CAR.bilevel ? 1 : 0;
 
       const d2 = (x - cx) * (x - cx) + (z - cz) * (z - cz);
-      const wagon = kind > CAR.dieselLoco;
+      const wagon = kind > CAR.dieselLoco && kind < CAR.bilevel;
       const near = d2 < (wagon ? FREIGHT_DETAIL * FREIGHT_DETAIL : BOGIE_DISTANCE * BOGIE_DISTANCE * 1.4);
       if (showBogies && near) {
-        const freight = kind >= CAR.dieselLoco && kind !== CAR.dieselLoco ? 1 : 0;
+        const freight = kind > CAR.dieselLoco && kind < CAR.bilevel ? 1 : 0;
         const bm = this.bogies[freight];
         for (const b of [i * 8, i * 8 + 4]) {
           const bx = v.prevBogie[b] + (v.bogie[b] - v.prevBogie[b]) * alpha;
@@ -358,11 +361,21 @@ export class TrainLayer {
         body = IVORY;
         break;
       case CAR.dieselLoco: {
+        // Tints 4 and up are passenger diesels: silver commuter, ivory intercity, in the line colour.
+        if (tint >= 4) {
+          body = tint === 4 ? SILVER : IVORY;
+          stripe = line;
+          break;
+        }
         const l = LOCO_LIVERIES[tint % LOCO_LIVERIES.length];
         body = l[0];
         stripe = l[1];
         break;
       }
+      case CAR.bilevel:
+      case CAR.bilevelCab:
+        body = SILVER;
+        break;
       case CAR.flatcar:
       case CAR.doubleStack:
         body = BOXES[tint & 15];

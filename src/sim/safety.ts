@@ -18,8 +18,13 @@ import { placeVehicle } from './view';
 import { freeVehicle, type VehicleStore } from './vehicles';
 import type { World } from './world';
 
-const CELL = 16;
-const GRID_BITS = 12;
+/**
+ * Grid cell: enough for any pair involving a car, whose bodies reach under 9 m apart.
+ * Long vehicles reach further and are checked separately over two rings of cells.
+ */
+const CELL = 9;
+const LONG_RADIUS = 4;
+const GRID_BITS = 16;
 const GRID_SIZE = 1 << GRID_BITS;
 const GRID_MASK = GRID_SIZE - 1;
 /** Sets a limit on rounds; each round resolves at least one vehicle, so this is only a backstop. */
@@ -60,24 +65,66 @@ export function boxesOverlap(
   return true;
 }
 
+/**
+ * Bodies are kept this far apart, metres, not merely not overlapping: published
+ * positions are rounded to 32 bits, and two bodies exactly touching here must not read
+ * as overlapping there.
+ */
+const SKIN = 0.01;
+
+// Per-vehicle box, filled once per scan so pair tests need no trigonometry.
+let boxFx = new Float64Array(0);
+let boxFz = new Float64Array(0);
+let boxR = new Float64Array(0);
+let boxMoved = new Uint8Array(0);
+
+function prepareBoxes(w: World): void {
+  const { veh, tick } = w;
+  if (boxFx.length < veh.capacity) {
+    boxFx = new Float64Array(veh.capacity);
+    boxFz = new Float64Array(veh.capacity);
+    boxR = new Float64Array(veh.capacity);
+    boxMoved = new Uint8Array(veh.capacity);
+  }
+  const { live, wyaw, len, halfWidth } = veh;
+  for (let i = 0; i < veh.liveCount; i++) {
+    const v = live[i];
+    boxFx[v] = -Math.sin(wyaw[v]);
+    boxFz[v] = -Math.cos(wyaw[v]);
+    const hl = len[v] * 0.5 + SKIN;
+    const hw = halfWidth[v] + SKIN;
+    boxR[v] = Math.sqrt(hl * hl + hw * hw);
+    boxMoved[v] = moved(veh, v) || veh.spawnTick[v] === tick ? 1 : 0;
+  }
+}
+
 function overlapping(veh: VehicleStore, a: number, b: number): boolean {
-  const dx = veh.wx[a] - veh.wx[b];
-  const dz = veh.wz[a] - veh.wz[b];
-  const reach = (veh.len[a] + veh.len[b]) * 0.5 + veh.halfWidth[a] + veh.halfWidth[b];
+  const dx = veh.wx[b] - veh.wx[a];
+  const dz = veh.wz[b] - veh.wz[a];
+  const reach = boxR[a] + boxR[b];
   if (dx * dx + dz * dz > reach * reach) return false;
   if (Math.abs(veh.wy[a] - veh.wy[b]) > OVERLAP_HEADROOM) return false;
-  return boxesOverlap(
-    veh.wx[a],
-    veh.wz[a],
-    veh.wyaw[a],
-    veh.len[a] * 0.5,
-    veh.halfWidth[a],
-    veh.wx[b],
-    veh.wz[b],
-    veh.wyaw[b],
-    veh.len[b] * 0.5,
-    veh.halfWidth[b],
-  );
+  const adx = boxFx[a];
+  const adz = boxFz[a];
+  const bdx = boxFx[b];
+  const bdz = boxFz[b];
+  const ahl = veh.len[a] * 0.5 + SKIN;
+  const ahw = veh.halfWidth[a] + SKIN;
+  const bhl = veh.len[b] * 0.5 + SKIN;
+  const bhw = veh.halfWidth[b] + SKIN;
+  const c = Math.abs(adx * bdx + adz * bdz);
+  const s = Math.abs(adx * bdz - adz * bdx);
+  if (Math.abs(dx * adx + dz * adz) > ahl + bhl * c + bhw * s) return false;
+  if (Math.abs(dx * -adz + dz * adx) > ahw + bhl * s + bhw * c) return false;
+  if (Math.abs(dx * bdx + dz * bdz) > bhl + ahl * c + ahw * s) return false;
+  if (Math.abs(dx * -bdz + dz * bdx) > bhw + ahl * s + ahw * c) return false;
+  return true;
+}
+
+/** Re-place a vehicle's box after it was moved back. */
+function refreshBox(veh: VehicleStore, v: number): void {
+  boxFx[v] = -Math.sin(veh.wyaw[v]);
+  boxFz[v] = -Math.cos(veh.wyaw[v]);
 }
 
 /** Save what a vehicle might need to go back to. Runs before anything moves. */
@@ -135,6 +182,7 @@ function restore(w: World, v: number): void {
   veh.acc[v] = keepAcc;
   veh.ptIdx[v] = 0;
   placeVehicle(g, veh, v);
+  refreshBox(veh, v);
 }
 
 function rollBack(w: World, v: number): void {
@@ -155,6 +203,8 @@ function rollBack(w: World, v: number): void {
   veh.acc[v] = 0;
   veh.ptIdx[v] = 0;
   placeVehicle(g, veh, v);
+  refreshBox(veh, v);
+  boxMoved[v] = 1;
 }
 
 /** Which of a moving pair should give way, or -1 if neither moved. */
@@ -189,8 +239,13 @@ function buildGrid(veh: VehicleStore): void {
   }
 }
 
-/** Call fn for each overlapping pair until it asks to stop. Returns pairs seen. */
-function scan(veh: VehicleStore, fn: (a: number, b: number) => void): number {
+/**
+ * Call fn for each overlapping pair. Returns pairs seen. With onlyMoved, pairs where
+ * neither vehicle moved are skipped: if they did not overlap before, they cannot now.
+ * Pairs of short vehicles come from half of each cell's neighbourhood, so each is met
+ * once; any pair with a long vehicle is met once, from the long one's wider search.
+ */
+function scan(veh: VehicleStore, fn: (a: number, b: number) => void, onlyMoved = false): number {
   const { live, wx, wz, gridNext, alive } = veh;
   let pairs = 0;
   const count = veh.liveCount;
@@ -199,17 +254,41 @@ function scan(veh: VehicleStore, fn: (a: number, b: number) => void): number {
     if (!alive[a]) continue;
     const ix = Math.floor(wx[a] / CELL);
     const iz = Math.floor(wz[a] / CELL);
-    // Half the neighbourhood, so each pair is met once. Hash clashes only add a re-check.
+    const am = boxMoved[a];
+    if (boxR[a] > LONG_RADIUS) {
+      for (let dz = -2; dz <= 2; dz++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          for (let b = gridHead[cellOf(ix + dx, iz + dz)]; b >= 0; b = gridNext[b]) {
+            if (b === a || !alive[b] || !alive[a]) continue;
+            // Long with long: once, from the lower slot.
+            if (boxR[b] > LONG_RADIUS && b < a) continue;
+            if (onlyMoved && !am && !boxMoved[b]) continue;
+            if (Math.floor(wx[b] / CELL) !== ix + dx || Math.floor(wz[b] / CELL) !== iz + dz) continue;
+            if (overlapping(veh, a, b)) {
+              pairs++;
+              fn(a, b);
+            }
+          }
+        }
+      }
+      continue;
+    }
     for (let b = gridNext[a]; b >= 0; b = gridNext[b]) {
+      if (boxR[b] > LONG_RADIUS || (onlyMoved && !am && !boxMoved[b])) continue;
+      if (Math.floor(wx[b] / CELL) !== ix || Math.floor(wz[b] / CELL) !== iz) continue;
       if (alive[b] && overlapping(veh, a, b)) {
         pairs++;
         fn(a, b);
       }
     }
     for (let k = 0; k < 4; k++) {
-      const c = cellOf(ix + (k === 0 ? 1 : k - 2), iz + (k === 0 ? 0 : 1));
-      for (let b = gridHead[c]; b >= 0; b = gridNext[b]) {
-        if (b !== a && alive[a] && alive[b] && overlapping(veh, a, b)) {
+      const cx = ix + (k === 0 ? 1 : k - 2);
+      const cz = iz + (k === 0 ? 0 : 1);
+      for (let b = gridHead[cellOf(cx, cz)]; b >= 0; b = gridNext[b]) {
+        if (b === a || boxR[b] > LONG_RADIUS || (onlyMoved && !am && !boxMoved[b])) continue;
+        // A hash clash can bring in a vehicle from elsewhere, or from my own cell.
+        if (Math.floor(wx[b] / CELL) !== cx || Math.floor(wz[b] / CELL) !== cz) continue;
+        if (alive[a] && alive[b] && overlapping(veh, a, b)) {
           pairs++;
           fn(a, b);
         }
@@ -235,6 +314,7 @@ export const safetyDebug: { onStop: ((w: World, a: number, b: number, loser: num
 /** Enforce the invariant for this step. onDrop hears of spawns that had no room. */
 export function enforceNoOverlap(w: World, onDrop: (v: number) => void): void {
   const { veh, counters, tick } = w;
+  prepareBoxes(w);
   for (let round = 0; round < MAX_ROUNDS; round++) {
     buildGrid(veh);
     let fixes = 0;
@@ -263,7 +343,7 @@ export function enforceNoOverlap(w: World, onDrop: (v: number) => void): void {
           if (overlapping(veh, a, b)) rollBack(w, loser);
         }
       }
-    });
+    }, true);
     if (dropped.length) {
       for (const v of dropped) dropVehicle(w, v, onDrop);
       dropped.length = 0;
@@ -278,10 +358,19 @@ export function enforceNoOverlap(w: World, onDrop: (v: number) => void): void {
   counters.collisions += scan(veh, () => {});
 }
 
+
+/** How many vehicle pairs overlap right now. For tests and the debug overlay. */
+export function countOverlaps(w: World): number {
+  prepareBoxes(w);
+  buildGrid(w.veh);
+  return scan(w.veh, () => {});
+}
+
 /** After an edit: place everyone and remove what overlaps, keeping the older vehicle. */
 export function clearEditOverlaps(w: World): void {
   const { veh, g, counters } = w;
   for (let i = 0; i < veh.liveCount; i++) placeVehicle(g, veh, veh.live[i]);
+  prepareBoxes(w);
   buildGrid(veh);
   scan(veh, (a, b) => {
     const v = veh.id[a] > veh.id[b] ? a : b;

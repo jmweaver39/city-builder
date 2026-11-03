@@ -6,13 +6,16 @@ import type { NetworkChange, RoadNetwork } from '../core/RoadNetwork';
 import type { ToolMark } from '../render/api';
 import type { SimApi } from '../sim/api';
 import { BulldozeTool } from './BulldozeTool';
+import { QuayTool } from './QuayTool';
+import { TerrainTool } from './TerrainTool';
 import { JunctionTool } from './JunctionTool';
 import { RoundaboutTool } from './RoundaboutTool';
 import { LaneTool } from './LaneTool';
 import { MoveTool } from './MoveTool';
 import { NodeMarkingTool } from './NodeMarkingTool';
+import { JunctionShapeTool } from './JunctionShapeTool';
 import { PaintTool } from './PaintTool';
-import { LineTool, StationTool, type RailHooks } from './RailTools';
+import { ElectrifyTool, LineTool, StationTool, toggleWiresAt, type RailHooks } from './RailTools';
 import { ReverseTool } from './ReverseTool';
 import { RoadTool } from './RoadTool';
 import { SelectTool } from './SelectTool';
@@ -20,7 +23,8 @@ import { TemplateTool } from './TemplateTool';
 import { Tool } from './Tool';
 import { TrafficTool } from './TrafficTool';
 import { ZoneTool } from './ZoneTool';
-import { GridAlignTool, GridBlockTool } from './GridBlockTool';
+import { GridAlignTool } from './GridAlignTool';
+import { ParallelTool } from './ParallelTool';
 import { gridViewFor } from './grid';
 import {
   defaultSettings,
@@ -101,12 +105,16 @@ export class ToolManager {
       traffic: new TrafficTool(this.ctx),
       template: new TemplateTool(this.ctx),
       nodeMarkings: new NodeMarkingTool(this.ctx),
+      junctionShape: new JunctionShapeTool(this.ctx),
       reverse: new ReverseTool(this.ctx),
-      gridBlock: new GridBlockTool(this.ctx),
+      parallel: new ParallelTool(this.ctx),
       gridAlign: new GridAlignTool(this.ctx),
       zone: new ZoneTool(this.ctx),
       station: new StationTool(this.ctx),
       line: new LineTool(this.ctx),
+      electrify: new ElectrifyTool(this.ctx),
+      quay: new QuayTool(this.ctx),
+      terrain: new TerrainTool(this.ctx),
     };
     (this.tools.gridAlign as GridAlignTool).onDone = () => this.setTool(this.beforeAlign);
     this.current = this.tools.select;
@@ -122,6 +130,10 @@ export class ToolManager {
 
   get station(): StationTool {
     return this.tools.station as StationTool;
+  }
+
+  get electrify(): ElectrifyTool {
+    return this.tools.electrify as ElectrifyTool;
   }
 
   get line(): LineTool {
@@ -151,6 +163,10 @@ export class ToolManager {
 
   get nodeMarkings(): NodeMarkingTool {
     return this.tools.nodeMarkings as NodeMarkingTool;
+  }
+
+  get junctionShape(): JunctionShapeTool {
+    return this.tools.junctionShape as JunctionShapeTool;
   }
 
   get zone(): ZoneTool {
@@ -224,13 +240,13 @@ export class ToolManager {
     for (const fn of [...this.listeners]) fn();
   }
 
-  get gridBlock(): GridBlockTool {
-    return this.tools.gridBlock as GridBlockTool;
+  get parallel(): ParallelTool {
+    return this.tools.parallel as ParallelTool;
   }
 
   /** Pick a road to line the grid up with, then come back to the current tool. */
   alignGrid(): void {
-    if (this.current.id !== 'gridAlign') this.beforeAlign = this.current.id === 'gridBlock' ? 'gridBlock' : 'road';
+    if (this.current.id !== 'gridAlign') this.beforeAlign = 'road';
     this.setTool('gridAlign');
   }
 
@@ -267,6 +283,11 @@ export class ToolManager {
   // -------------------------------------------------------------------------
 
   pointerDown(e: ToolPointer): void {
+    // Landscaping lowers with the right button, so it gets the press itself.
+    if (e.button === 2 && this.current.usesRightButton()) {
+      this.current.pointerDown(e);
+      return;
+    }
     if (e.button === 2) {
       this.rightDown = { x: e.x, y: e.y };
       return;
@@ -281,6 +302,10 @@ export class ToolManager {
   }
 
   pointerUp(e: ToolPointer): void {
+    if (e.button === 2 && this.current.usesRightButton()) {
+      this.current.pointerUp(e);
+      return;
+    }
     if (e.button === 2) {
       const down = this.rightDown;
       this.rightDown = null;
@@ -298,7 +323,27 @@ export class ToolManager {
     return this.current.wheel(delta, e);
   }
 
+  get terrain(): TerrainTool {
+    return this.tools.terrain as TerrainTool;
+  }
+
+  /** The active tool takes right clicks and Option+click, so the camera must not orbit on them. */
+  get usesRightButton(): boolean {
+    return this.current.usesRightButton();
+  }
+
+  /** Q and E step elevation (down, up) in tools that have one, like PageDown and PageUp. */
+  get elevationKeys(): boolean {
+    return this.current.usesElevationKeys();
+  }
+
   keyDown(e: ToolKey): boolean {
+    const k = e.key.toLowerCase();
+    // O over track toggles its overhead wires from any tool (see RAIL_COMMANDS).
+    if (k === 'o' && !e.ctrl && !e.alt && this.gridPointer && toggleWiresAt(this.ctx, this.gridPointer, e.shift)) return true;
+    if ((k === 'q' || k === 'e') && !e.ctrl && !e.alt && this.current.usesElevationKeys()) {
+      return this.current.keyDown({ ...e, key: k === 'e' ? 'PageUp' : 'PageDown' }) || true;
+    }
     return this.current.keyDown(e);
   }
 

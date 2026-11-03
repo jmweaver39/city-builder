@@ -32,9 +32,11 @@ plain DOM and CSS. No other runtime dependencies without a strong reason.
   editor steps elevation in 4 m increments. Grade separation needs 6 m clearance
   between road surfaces. Two roads crossing with less clearance must join at a
   junction (or be rejected).
-- Terrain height comes only from `terrainHeight(x, z)` in `core/terrain.ts`. It is
-  flat 0 across the buildable area except a decorative river channel, and rises
-  into hills beyond the map edge. A road over the river is a bridge because it
+- Terrain height comes only from `terrainHeight(x, z)` in `core/terrain.ts`. The
+  generated land is flat 0 across the buildable area except a decorative river
+  channel, and rises into hills beyond the map edge; landscaping
+  (`core/terrainEdit.ts`) adds the player's edits on top. With edits, "ground"
+  and tunnels are measured from the edited land (`surfaceLevel`). A road over the river is a bridge because it
   is above the local terrain, so "elevated" means `y - terrainHeight > 1`.
 
 ## Module map and ownership
@@ -145,6 +147,15 @@ Connectors, auto-generated when `control.laneLinks` is null:
 - Trees are instanced and hidden where roads run through them.
 - Procedural everything: textures from canvas, models from primitives. No binary
   assets in the repo.
+- Performance budgets live in `render/quality.ts`. The default level is High at
+  most, guessed from the GPU; the governor steps down after 1.5 s of slow,
+  GPU-bound frames and steps up only after 6 s of clear GPU headroom (it times the
+  GPU with `EXT_disjoint_timer_query_webgl2` where the browser allows).
+- The sun's shadow map is cached at Medium and Low (`shadowEvery`): it redraws when
+  the shadow box or light moves, on network edits and tree re-sorts, and at least
+  every few frames. Something that animates and casts shadows is fine at High and
+  Ultra; at lower levels it updates at that slower rate. Vehicles cast sun shadows
+  only at High and Ultra; their contact shadow is always on.
 
 ## Editor behaviour (modelled on Skylines)
 
@@ -174,5 +185,8 @@ sections.
 ## Testing hooks
 
 `window.__cloverleaf` exposes `{ net, sim, renderer, tools, history }` in dev, so
-the game can be driven by scripts in a real browser. Everything in `core`, `sim`
+the game can be driven by scripts in a real browser. `?bench=1` runs the performance
+benchmark (`app/bench.ts`): a fixed heavy scene, a scripted camera through map,
+mid, close, low-angle and rail views at each quality level, and a table of CPU time
+per section and GPU time per phase. It never touches saves. Everything in `core`, `sim`
 and `templates` must be testable headlessly under Vitest.

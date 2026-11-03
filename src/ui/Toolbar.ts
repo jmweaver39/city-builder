@@ -4,6 +4,7 @@ import type { DecalKind, EndpointKind, PaintColor, RoadCategory, RoadTypeDef, Zo
 import { MAX_ELEVATION, MIN_ELEVATION } from '../core/terrain';
 import { defaultDecalWidth, LINE_DECALS, LINE_STYLES, AREA_DECALS } from '../tools/PaintTool';
 import { formatElevation } from '../tools/RoadTool';
+import { MOD_KEY } from '../tools/platform';
 import { ENDPOINT_NAMES } from '../tools/TrafficTool';
 import { ZONE_COLORS } from '../tools/ZoneTool';
 import { ZONE_NAMES } from '../tools/zoneOps';
@@ -11,35 +12,23 @@ import type { DrawMode, ToolId } from '../tools/types';
 import type { UiContext } from './context';
 import { renderRailTray } from './RailPanels';
 import { ControlTray } from './ControlTray';
+import { renderLandscapeTray, roadStructureOptions } from './WallControls';
+import { registerTerrainKeys, renderTerrainTray } from './TerrainControls';
 import { checkbox, clear, el, hiDpiCanvas, iconButton, row, selectInput, sliderInput, textInput } from './dom';
 import { ICONS, type IconName } from './icons';
 import { drawDecalThumb, drawLineThumb, drawRoadThumb, PAINT_CSS } from './thumbnails';
-import { gridBlockButton, gridSnapButtons, initGridPrefs, syncGridControls } from './GridControls';
+import { gridSnapButtons, guideToggleRow, initGridPrefs, parallelButtons, syncGridControls } from './GridControls';
+import { group, groupOf, GROUPS, legacyTab, modeOf, ROAD_CHIPS, type GroupId, type ToolMode } from './toolGroups';
+import { keyHint } from './keymap';
+import { GATEWAY_ART, zoneArt } from './cardArt';
+import { roadThumbnail } from './roadThumbs3d';
 
-export type TabId = RoadCategory | 'intersections' | 'control' | 'paint' | 'traffic';
+/**
+ * The open tray: one of the eight tools (toolGroups.ts). Old tab ids still open
+ * the right one, so code that calls openTab('street') or openTab('control') works.
+ */
+export type TabId = GroupId | RoadCategory | 'intersections' | 'control' | 'traffic' | 'landscape';
 
-
-const ROAD_TABS: readonly RoadCategory[] = ['street', 'avenue', 'oneway', 'highway', 'ramp', 'custom'];
-
-const TABS: { id: TabId; label: string; icon: IconName; key?: string }[] = [
-  { id: 'street', label: 'Streets', icon: 'street', key: 'N' },
-  { id: 'avenue', label: 'Avenues', icon: 'avenue' },
-  { id: 'oneway', label: 'One-ways', icon: 'oneway' },
-  { id: 'highway', label: 'Highways', icon: 'highway' },
-  { id: 'ramp', label: 'Ramps', icon: 'ramp' },
-  { id: 'custom', label: 'Custom', icon: 'custom' },
-  { id: 'control', label: 'Traffic Control', icon: 'control', key: 'J' },
-  { id: 'paint', label: 'Paint', icon: 'paint', key: 'P' },
-  { id: 'traffic', label: 'Traffic', icon: 'traffic', key: 'T' },
-  { id: 'rail', label: 'Trains', icon: 'train' },
-];
-
-const DRAW_MODES: { mode: DrawMode; icon: IconName; tip: string; key: string }[] = [
-  { mode: 'straight', icon: 'straight', tip: 'Straight', key: 'Z' },
-  { mode: 'curved', icon: 'curved', tip: 'Curved: start, control, end', key: 'X' },
-  { mode: 'freeform', icon: 'freeform', tip: 'Freeform: continues the last tangent', key: 'C' },
-  { mode: 'upgrade', icon: 'upgrade', tip: 'Upgrade: click or drag over roads', key: 'G' },
-];
 
 const DECAL_CARDS: { kind: DecalKind; name: string }[] = [
   { kind: 'hatch', name: 'Hatched area' },
@@ -72,42 +61,44 @@ export class Toolbar {
   private readonly tray = el('div', { class: 'tray closed' });
   private readonly options = el('div', { class: 'options' });
   private readonly cards = el('div', { class: 'cards' });
+  /** Road-type filter chips, above the cards in Build and Upgrade. */
+  private readonly chips = el('div', { class: 'chips', attrs: { role: 'tablist', 'aria-label': 'Road types' } });
   private tab: TabId | null = null;
+  private chip: RoadCategory = 'street';
+  private renderedMode = '';
   private controlTray: ControlTray | null = null;
 
   constructor(private readonly ui: UiContext) {
     const tabRow = el('div', { class: 'tabs', attrs: { role: 'tablist' } });
-    for (const t of TABS) {
+    for (const g of GROUPS) {
+      if (g.id === 'bulldoze') continue;
       const btn = el('button', {
         class: 'tab',
-        tip: t.label,
-        keyHint: t.key,
-        html: `${ICONS[t.icon]}<span>${t.label}</span>`,
-        attrs: { type: 'button', role: 'tab', 'aria-label': t.label },
-        on: { click: () => this.toggleTab(t.id) },
+        tip: g.label,
+        desc: g.desc,
+        keyHint: keyHint(g.binding),
+        html: `${ICONS[g.icon as IconName] ?? ''}<span>${g.label}</span>`,
+        attrs: { type: 'button', role: 'tab', 'aria-label': g.label },
+        on: { click: () => this.toggleTab(g.id) },
       });
-      this.tabs.set(t.id, btn);
+      this.tabs.set(g.id, btn);
       tabRow.append(btn);
     }
     const cluster = el('div', { class: 'tool-cluster' });
-    const addTool = (id: ToolId, icon: IconName, tip: string, key: string) => {
-      const btn = iconButton(ICONS[icon], { tip, keyHint: key, onClick: () => this.toggleTool(id) });
-      this.toolButtons.set(id, btn);
-      cluster.append(btn);
-    };
-    addTool('select', 'select', 'Inspect', 'V');
-    addTool('move', 'move', 'Move nodes and curves', 'M');
-    addTool('bulldoze', 'bulldoze', 'Bulldoze', 'B');
+    const bulldoze = iconButton(ICONS.bulldoze, { tip: 'Bulldoze', desc: 'Removes whatever is under the cursor', keyHint: keyHint('tool.bulldoze'), onClick: () => this.toggleTool('bulldoze') });
+    this.toolButtons.set('bulldoze', bulldoze);
+    cluster.append(bulldoze);
     tabRow.append(cluster);
 
-    this.tray.append(this.options, this.cards);
+    this.tray.append(this.options, el('div', { class: 'cards-wrap' }, this.chips, this.cards));
     this.root = el('div', { class: 'panel toolbar' }, this.tray, tabRow);
     ui.dock.append(this.root);
     ui.tools.onChange(() => this.syncState());
     initGridPrefs(ui);
+    registerTerrainKeys(ui);
     ui.net.onChange((c) => {
       if (c.settingsChanged || c.reset) {
-        if (this.tab === 'custom') this.render();
+        if (this.tab === 'build' && this.chip === 'custom') this.render();
       }
     });
     this.syncState();
@@ -125,41 +116,191 @@ export class Toolbar {
     this.tools.setTool(this.tools.active.id === id ? 'select' : id);
   }
 
+  private trayCards(): HTMLElement[] {
+    return [...this.cards.querySelectorAll<HTMLElement>('.card')];
+  }
+
+  /** Click the nth card of the open tab, as keys 1 to 9 do. */
+  pickCard(index: number): void {
+    this.trayCards()[index]?.click();
+  }
+
+  /** Move to the next or previous card of the open tab, as Tab does. */
+  cycleCard(step: 1 | -1): void {
+    const cards = this.trayCards();
+    if (!cards.length) return;
+    const at = cards.findIndex((c) => c.classList.contains('active'));
+    const next = cards[(at + step + cards.length) % cards.length];
+    next.click();
+    next.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+
+  /** Number the first nine cards, which keys 1 to 9 pick. */
+  private numberCards(): void {
+    this.trayCards().forEach((card, i) => {
+      card.querySelector('.card-num')?.remove();
+      if (i >= 9) return;
+      card.dataset.key = String(i + 1);
+      if (!card.querySelector('.card-key')) card.append(el('kbd', { class: 'card-key card-num', text: String(i + 1) }));
+    });
+  }
+
   toggleTab(id: TabId): void {
     this.openTab(this.tab === id ? null : id);
   }
 
   openTab(id: TabId | null): void {
-    this.tab = id;
+    if (id === 'intersections') {
+      this.tab = id;
+      this.render();
+      if (this.tools.settings.template.id) this.tools.setTool('template');
+      this.syncState();
+      return;
+    }
+    const target = id === null ? null : legacyTab(id);
+    if (id !== null && !target) return;
+    const g = target?.group ?? null;
+    if (target?.chip) this.chip = target.chip;
+    this.tab = g;
+    const s = this.tools.settings;
+    const active = this.tools.active.id;
+    // Opening a tool picks its first mode, unless one of its modes is already on.
+    if (g && g !== 'transit' && groupOf(active, s.drawMode) !== g) {
+      const first = group(g).modes[0];
+      this.activateMode(first, false);
+    }
+    if (g === 'build' && active === 'road' && s.drawMode === 'upgrade') this.activateMode(group('build').modes[0], false);
     this.render();
-    if (id === 'control' && !['lanes', 'roundabout', 'junction'].includes(this.tools.active.id)) this.tools.setTool('junction');
-    if (id === 'paint') this.tools.setTool('paint');
-    if (id === 'traffic' && this.tools.active.id !== 'zone') this.tools.setTool('traffic');
-    if (id === 'intersections' && this.tools.settings.template.id) this.tools.setTool('template');
     this.syncState();
+  }
+
+  /** Re-read tool state, for changes made outside a tool event. */
+  refresh(): void {
+    this.syncState();
+  }
+
+  /** Switch to one mode of a tool. */
+  activateMode(m: ToolMode, notify = true): void {
+    const s = this.tools.settings;
+    if (m.drawMode) s.drawMode = m.drawMode;
+    else if (m.tool === 'road' && s.drawMode === 'upgrade') s.drawMode = 'straight';
+    this.tools.setTool(m.tool);
+    if (notify || m.drawMode) this.tools.settingsChanged();
   }
 
   private render(): void {
     const id = this.tab;
-    this.tray.classList.toggle('closed', id === null);
+    this.tray.classList.toggle('closed', id === null || id === 'bulldoze');
+    this.tray.dataset.group = id ?? '';
+    if (id !== 'junction') {
+      this.controlTray?.dispose();
+      this.controlTray = null;
+    }
     clear(this.options);
     clear(this.cards);
+    clear(this.chips);
+    this.renderedMode = modeOf(this.tools.active.id, this.tools.settings.drawMode)?.id ?? '';
     if (id === null) return;
-    if ((ROAD_TABS as readonly string[]).includes(id)) this.renderRoads(id as RoadCategory);
+    if (id === 'build') this.renderBuild();
+    else if (id === 'modify') this.renderModify();
     else if (id === 'intersections') this.renderTemplates();
-    else if (id === 'control') this.renderControl();
+    else if (id === 'junction') this.renderControl();
     else if (id === 'paint') this.renderPaint();
-    else if (id === 'traffic') this.renderTraffic();
-    else if (id === 'rail') {
-      this.renderRoads('rail');
+    else if (id === 'zones') this.renderTraffic();
+    else if (id === 'terrain') {
+      renderTerrainTray(this.ui, this.options, this.cards);
+      renderLandscapeTray(this.ui, this.options, this.cards);
+    }
+    else if (id === 'transit') {
       renderRailTray(this.ui, this.options, this.cards);
       this.syncState();
+    }
+    this.numberCards();
+  }
+
+  /** The mode row at the top of the options strip, one button per mode. */
+  private modeRow(g: GroupId): HTMLElement {
+    const row = el('div', { class: 'mode-row', attrs: { role: 'radiogroup', 'aria-label': `${group(g).label} mode` } });
+    for (const m of group(g).modes) {
+      const b = el('button', {
+        class: 'mode-tab',
+        tip: m.label,
+        desc: m.desc,
+        keyHint: m.binding ? keyHint(m.binding) : undefined,
+        html: `${ICONS[m.icon as IconName] ?? ''}<span>${m.label}</span>`,
+        attrs: { type: 'button', role: 'radio', 'aria-label': m.label },
+        dataset: { mode: m.id },
+        on: { click: () => this.activateMode(m) },
+      });
+      row.append(b);
+    }
+    return row;
+  }
+
+  /** The road-type chips and cards, shared by Build and Upgrade. */
+  private renderPicker(): void {
+    for (const c of ROAD_CHIPS) {
+      this.chips.append(
+        el('button', {
+          class: `chip ${c.id === this.chip ? 'active' : ''}`,
+          text: c.label,
+          attrs: { type: 'button', role: 'tab', 'aria-selected': String(c.id === this.chip) },
+          on: {
+            click: () => {
+              this.chip = c.id;
+              this.render();
+              this.syncState();
+            },
+          },
+        }),
+      );
+    }
+    this.renderRoadCards(this.chip);
+  }
+
+  private renderBuild(): void {
+    this.options.append(this.modeRow('build'));
+    this.renderDrawOptions();
+    this.renderPicker();
+  }
+
+  private renderModify(): void {
+    const s = this.tools.settings;
+    const mode = this.renderedMode;
+    this.options.append(this.modeRow('modify'));
+    const note = (text: string) => this.options.append(el('p', { class: 'opt-help', text }));
+    if (mode === 'upgrade') {
+      note('Sweep over roads.');
+      this.options.append(roadStructureOptions(this.ui));
+      this.renderPicker();
+    } else if (mode === 'reverse') {
+      note('Sweep over one-way roads.');
+      this.options.append(row('Whole road', checkbox(s.reverseWholeRoad, (v) => {
+        s.reverseWholeRoad = v;
+        this.tools.settingsChanged();
+      }), 'Turn every connected piece of the road'));
+    } else if (mode === 'move') {
+      note('Drag a node or curve handle. Q and E change its height.');
+    } else if (mode === 'electrify') {
+      note('Sweep over track. Shift removes wires.');
+    } else if (mode === 'align') {
+      note('Click a road to line the grid up with it.');
+    } else {
+      note('Click anything to inspect it.');
     }
   }
 
   private roadCard(def: RoadTypeDef): HTMLElement {
-    const canvas = hiDpiCanvas(102, 52);
-    drawRoadThumb(canvas, def, 102, 52);
+    // A rendered picture of the road where WebGL allows, the drawn cross-section otherwise.
+    const url = roadThumbnail(def);
+    let picture: HTMLElement;
+    if (url) picture = el('img', { class: 'thumb', attrs: { src: url, alt: '', draggable: 'false' } });
+    else {
+      const canvas = hiDpiCanvas(102, 52);
+      drawRoadThumb(canvas, def, 102, 52);
+      picture = canvas;
+    }
+    const badge = def.category === 'rail' ? `${def.lanes.length}` : isOneWay(def) ? `${driveLaneCount(def)}` : `${driveLaneCount(def, 1)}+${driveLaneCount(def, -1)}`;
     const lanes =
       def.category === 'rail'
         ? def.lanes.length === 2 && Math.abs(def.lanes[0].offset) > 0.5
@@ -179,16 +320,18 @@ export class Toolbar {
           click: () => {
             this.tools.settings.roadType = def.id;
             if (this.tools.settings.drawMode === 'upgrade' && this.tools.active.id !== 'road') this.tools.settings.drawMode = 'straight';
-            // The Grid Block tool builds with the selected road, so picking one keeps it.
-            if (this.tools.active.id === 'gridBlock') this.tools.settingsChanged();
+            // The Parallel tool can build with the selected road, so picking one keeps it.
+            if (this.tools.active.id === 'parallel') this.tools.settingsChanged();
             else this.tools.setTool('road');
           },
         },
       },
-      canvas,
+      picture,
+      el('span', { class: 'lane-badge', html: `${isOneWay(def) && def.category !== 'rail' ? ICONS.oneway : ICONS.lanes}${badge}`, attrs: { 'aria-hidden': 'true' } }),
       el('div', { class: 'card-name', text: def.name }),
       el('div', { class: 'card-meta', text: `${lanes}, ${def.speedKmh} km/h` }),
     );
+    card.dataset.desc = `${lanes}, ${def.speedKmh} km/h`;
     if (def.category === 'custom') {
       card.append(
         el('span', {
@@ -206,8 +349,7 @@ export class Toolbar {
     return card;
   }
 
-  private renderRoads(category: RoadCategory): void {
-    this.renderDrawOptions();
+  private renderRoadCards(category: RoadCategory): void {
     const defs = [...BUILTIN_ROAD_TYPES, ...this.ui.net.project.customRoadTypes].filter((d) => d.category === category);
     for (const def of defs) this.cards.append(this.roadCard(def));
     if (category === 'custom') {
@@ -231,43 +373,14 @@ export class Toolbar {
 
   private renderDrawOptions(): void {
     const s = this.tools.settings;
-    const modes = el('div', { class: 'opt-row' });
-    for (const m of DRAW_MODES) {
-      modes.append(
-        Object.assign(
-          iconButton(ICONS[m.icon], {
-            tip: m.tip,
-            keyHint: m.key,
-            class: 'mode-btn',
-            onClick: () => this.setDrawMode(m.mode),
-          }),
-          { value: m.mode },
-        ),
-      );
-    }
-    modes.append(
-      iconButton(ICONS.reverse, {
-        tip: 'Reverse direction: click or drag over roads',
-        keyHint: 'H',
-        class: 'reverse-btn',
-        onClick: () => this.tools.setTool(this.tools.active.id === 'reverse' ? 'road' : 'reverse'),
-      }),
-      iconButton(ICONS.follow, {
-        tip: 'Reverse the whole connected road, not one piece',
-        class: 'reverse-whole-btn',
-        onClick: () => {
-          s.reverseWholeRoad = !s.reverseWholeRoad;
-          this.tools.settingsChanged();
-        },
-      }),
-      gridBlockButton(this.ui),
-    );
+    // The parallel tool's own buttons (offset presets), from the grid module.
+    const parallel = parallelButtons(this.ui);
 
     const snaps = el('div', { class: 'opt-row' });
     const toggle = (key: 'snapNodes' | 'snapSegments' | 'snapAngle' | 'snapLength', icon: IconName, tip: string) => {
       snaps.append(
         iconButton(ICONS[icon], {
-          tip: `${tip}. Ctrl or Cmd turns all snapping off while held`,
+          tip: `${tip}. Hold ${MOD_KEY} to turn all snapping off`,
           class: `snap-btn snap-${key}`,
           onClick: () => {
             s[key] = !s[key];
@@ -284,18 +397,24 @@ export class Toolbar {
 
     const elevation = el(
       'div',
-      { class: 'elevation' },
-      iconButton(ICONS.down, { tip: 'Lower 4 m', keyHint: 'PgDn', onClick: () => this.tools.road.stepElevation(-1) }),
+      { class: 'elevation', tip: 'Elevation', desc: 'Height of the next road end, in 4 m steps' },
+      el('span', { class: 'elevation-icon', html: ICONS.toolTerrain, attrs: { 'aria-hidden': 'true' } }),
+      iconButton(ICONS.down, { tip: 'Lower 4 m', keyHint: 'Q or PgDn', onClick: () => this.tools.road.stepElevation(-1) }),
       el('b', { class: 'elevation-value' }),
-      iconButton(ICONS.up, { tip: 'Raise 4 m', keyHint: 'PgUp', onClick: () => this.tools.road.stepElevation(1) }),
+      iconButton(ICONS.up, { tip: 'Raise 4 m', keyHint: 'E or PgUp', onClick: () => this.tools.road.stepElevation(1) }),
     );
     this.options.append(
-      el('div', { class: 'opt-title', text: 'Draw mode' }),
-      modes,
-      el('div', { class: 'opt-title', text: 'Snapping' }),
+      ...(parallel.length ? [el('div', { class: 'opt-row parallel-row' }, ...parallel)] : []),
       snaps,
-      el('div', { class: 'opt-title', text: 'Elevation' }),
       elevation,
+      el(
+        'details',
+        { class: 'advanced' },
+        el('summary', { text: 'Advanced' }),
+        el('div', { class: 'opt-title', text: 'Guides' }),
+        guideToggleRow(this.ui),
+        roadStructureOptions(this.ui),
+      ),
     );
   }
 
@@ -366,15 +485,16 @@ export class Toolbar {
         { class: 'opt-row' },
         iconButton('[', { tip: 'Rotate left', keyHint: '[', onClick: () => this.tools.template.rotate(-1) }),
         iconButton(']', { tip: 'Rotate right', keyHint: ']', onClick: () => this.tools.template.rotate(1) }),
-        iconButton(ICONS.down, { tip: 'Lower 4 m', keyHint: 'PgDn', onClick: () => this.tools.template.stepElevation(-1) }),
+        iconButton(ICONS.down, { tip: 'Lower 4 m', keyHint: 'Q or PgDn', onClick: () => this.tools.template.stepElevation(-1) }),
         el('b', { class: 'template-elevation' }),
-        iconButton(ICONS.up, { tip: 'Raise 4 m', keyHint: 'PgUp', onClick: () => this.tools.template.stepElevation(1) }),
+        iconButton(ICONS.up, { tip: 'Raise 4 m', keyHint: 'E or PgUp', onClick: () => this.tools.template.stepElevation(1) }),
       ),
     );
     this.syncState();
   }
 
   private renderControl(): void {
+    this.controlTray?.dispose();
     this.controlTray = new ControlTray(this.ui, this.cards, this.options);
     this.controlTray.render();
     this.syncState();
@@ -382,21 +502,7 @@ export class Toolbar {
 
   private renderPaint(): void {
     const p = this.tools.settings.paint;
-    this.cards.append(
-      el(
-        'button',
-        {
-          class: 'card',
-          dataset: { tool: 'nodeMarkings' },
-          tip: 'Click a junction, then click anchors to mark it by hand',
-          keyHint: 'K',
-          attrs: { type: 'button', 'aria-label': 'Node markings' },
-          on: { click: () => this.tools.setTool('nodeMarkings') },
-        },
-        el('div', { class: 'art', html: ICONS.intersections }),
-        el('div', { class: 'card-name', text: 'Node markings' }),
-      ),
-    );
+    // Junction markings and shape moved to the Junction tool.
     const pick = (apply: () => void) => {
       apply();
       this.tools.setTool('paint');
@@ -526,7 +632,7 @@ export class Toolbar {
             },
           },
         },
-        el('div', { class: 'art', html: ICONS[gateway.icon] }),
+        el('div', { class: 'art picture', html: GATEWAY_ART }),
         el('div', { class: 'card-name', text: 'Gateway' }),
         el('div', { class: 'card-meta', text: gateway.meta }),
       ),
@@ -557,7 +663,7 @@ export class Toolbar {
               },
             },
           },
-          el('div', { class: 'art', html: ICONS[z.icon], style: { color: ZONE_COLORS[z.kind] } }),
+          el('div', { class: 'art picture', html: zoneArt(z.kind, z.kind === 'none' ? '#f06257' : ZONE_COLORS[z.kind]) }),
           el('div', { class: 'card-name', text: ZONE_NAMES[z.kind] }),
           el('div', { class: 'card-meta', text: z.meta }),
         ),
@@ -578,6 +684,11 @@ export class Toolbar {
           this.ui.history.hint('Auto gateways');
           this.ui.net.setTraffic({ autoGateways: v });
         }), 'Treat every dead end with no endpoint as a gateway'),
+        el('div', { class: 'opt-title', text: 'Pedestrians' }),
+        row('Stop traffic', checkbox(this.ui.net.traffic.pedestriansStopTraffic !== false, (v) => {
+          this.ui.history.hint('Pedestrians stop traffic');
+          this.ui.net.setTraffic({ pedestriansStopTraffic: v });
+        }), 'Pedestrians stop traffic at crosswalks. Off: they cross only in gaps, and traffic flows a little better'),
         el('div', { class: 'small muted', text: 'Pick a zone to zone land. Click an endpoint or region to edit it.' }),
       );
       return;
@@ -644,20 +755,22 @@ export class Toolbar {
     const s = tools.settings;
     const active = tools.active.id;
     for (const [id, btn] of this.toolButtons) btn.classList.toggle('active', id === active);
+    // The tray follows the tool: a hotkey that switches tool switches the tray too.
+    const g = groupOf(active, s.drawMode);
+    const modeId = modeOf(active, s.drawMode)?.id ?? '';
+    if (this.tab !== null && this.tab !== 'intersections' && g && (g !== this.tab || (g === 'modify' && modeId !== this.renderedMode))) {
+      this.tab = g;
+      this.render();
+    }
     for (const [id, btn] of this.tabs) {
       btn.classList.toggle('active', id === this.tab);
       btn.setAttribute('aria-selected', String(id === this.tab));
     }
-    this.root.querySelectorAll<HTMLButtonElement>('.mode-btn').forEach((b) => b.classList.toggle('active', b.value === s.drawMode && active === 'road'));
-    const reverse = this.root.querySelector<HTMLElement>('.reverse-btn');
-    if (reverse) {
-      reverse.classList.toggle('active', active === 'reverse');
-      const whole = this.root.querySelector<HTMLElement>('.reverse-whole-btn');
-      if (whole) {
-        whole.classList.toggle('active', s.reverseWholeRoad);
-        whole.style.display = active === 'reverse' ? '' : 'none';
-      }
-    }
+    this.root.querySelectorAll<HTMLElement>('.mode-tab').forEach((b) => {
+      const on = b.dataset.mode === modeId;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', String(on));
+    });
     for (const key of ['snapNodes', 'snapSegments', 'snapAngle', 'snapLength'] as const) {
       this.root.querySelector(`.snap-${key}`)?.classList.toggle('active', s[key]);
     }
@@ -677,7 +790,7 @@ export class Toolbar {
     this.cards.querySelectorAll<HTMLElement>('.card').forEach((card) => {
       const d = card.dataset;
       let on = false;
-      if (d.road) on = (active === 'road' || active === 'gridBlock') && s.roadType === d.road;
+      if (d.road) on = (active === 'road' || active === 'parallel') && s.roadType === d.road;
       if (d.template) on = active === 'template' && s.template.id === d.template;
       if (d.decal) on = active === 'paint' && s.paint.kind === d.decal;
       if (d.line) on = active === 'paint' && s.paint.kind === 'line' && s.paint.lineStyle === d.line;
@@ -688,6 +801,6 @@ export class Toolbar {
       card.classList.toggle('active', on);
     });
     this.root.querySelector<HTMLButtonElement>('.reset-lanes')?.toggleAttribute('disabled', tools.lanes.node === null);
-    if (this.tab === 'control') this.controlTray?.sync();
+    if (this.tab === 'junction') this.controlTray?.sync();
   }
 }

@@ -4,8 +4,9 @@
  */
 import type { Cubic } from './bezier';
 import { curvatureXZ, cubicPoint } from './bezier';
+import { cubicFootprint, footprintsClash, kioskFootprints, placedStationFootprint } from './footprint';
 import { maxGrade } from './geometry';
-import { trackSpec } from './railTypes';
+import { segmentElectrification, trackSpec } from './railTypes';
 import type { DraftIssue, RoadAnchor, RoadNetwork } from './RoadNetwork';
 import type { Id, RoadTypeDef } from './types';
 import { GRADE_CLEARANCE } from './terrain';
@@ -32,6 +33,30 @@ function anchorSegments(net: RoadNetwork, a: RoadAnchor): Id[] {
   if (a.kind === 'segment') return [a.id];
   if (a.kind === 'node') return [...(net.getNode(a.id)?.segments ?? [])];
   return [];
+}
+
+/** Clearance between surfaces for a road over wired track: the wires need room. */
+export const CLEARANCE_OVER_WIRES = 6;
+/** Road over unwired track, or track over a road. */
+export const CLEARANCE_RAIL = 5;
+
+/**
+ * The clearance a draft needs to pass over or under an existing segment without
+ * meeting it. Two roads need GRADE_CLEARANCE. Anything over wired track needs room
+ * for the wires; otherwise track and road need CLEARANCE_RAIL.
+ */
+export function crossingClearance(net: RoadNetwork, draft: RoadTypeDef, draftY: number, other: Id, otherY: number): number {
+  const otherDef = net.roadTypeOf(other);
+  const draftRail = draft.category === 'rail';
+  const otherRail = otherDef.category === 'rail';
+  if (!draftRail && !otherRail) return GRADE_CLEARANCE;
+  const draftBelow = draftY < otherY;
+  const lowerDef = draftBelow ? draft : otherDef;
+  if (lowerDef.category === 'rail') {
+    const seg = draftBelow ? undefined : net.getSegment(other);
+    return segmentElectrification(lowerDef, seg?.overrides) === 'overhead' ? CLEARANCE_OVER_WIRES : CLEARANCE_RAIL;
+  }
+  return CLEARANCE_RAIL;
 }
 
 export function railDraftIssues(
@@ -82,7 +107,7 @@ export function railDraftIssues(
   }
 
   const ignore = [start, end].flatMap((a) => (a.kind === 'node' ? [a.id] : []));
-  for (const hit of net.findCrossings(cubic, ignore)) {
+  for (const hit of net.findCrossings(cubic, ignore, def.id)) {
     if (!hit.atGrade) continue;
     const nearEnd = Math.min(hit.t, 1 - hit.t) * length < 0.5;
     if (nearEnd) continue;
@@ -97,6 +122,21 @@ export function railDraftIssues(
         message: `Metro track cannot cross at grade. It needs ${GRADE_CLEARANCE} m of clearance.`,
         at: hit.point,
       });
+    }
+  }
+  // Roads and track pass over or under stations with clearance, never through them.
+  const anchors = new Set<Id>([start, end].flatMap((x) => (x.kind === 'segment' ? [x.id] : x.kind === 'node' ? net.getNode(x.id)?.segments ?? [] : [])));
+  const mine = cubicFootprint(cubic, def.halfWidth + def.sidewalk);
+  for (const st of net.rail.stations) {
+    if (anchors.has(st.segmentId)) continue;
+    const box = placedStationFootprint(net, st);
+    if (box && footprintsClash(mine, box)) {
+      issues.push({ code: 'railCrossing', severity: 'error', message: `Runs through ${st.name} station. Pass over or under it with clearance.` });
+      break;
+    }
+    if (!isRail && kioskFootprints(net, st).some((k) => footprintsClash(mine, k))) {
+      issues.push({ code: 'railCrossing', severity: 'error', message: `Runs through an entrance of ${st.name} station.` });
+      break;
     }
   }
   return issues;

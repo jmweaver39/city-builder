@@ -7,9 +7,11 @@
  * at RAIL_TOP. Trains ride at RAIL_TOP.
  */
 import * as THREE from 'three';
-import { RAIL } from './style';
+import { RAIL, rgb as rgbOf } from './style';
+import { closestPointOnCubic } from '../core/bezier';
+import { stationEntrances, type StationEntrance } from '../rail/lines';
 import type { RoadNetwork } from '../core/RoadNetwork';
-import { riverDistance, RIVER_HALF_WIDTH, terrainHeight } from '../core/terrain';
+import { riverDistance, RIVER_HALF_WIDTH, surfaceLevel, terrainHeight } from '../core/terrain';
 import { RAIL_TOP } from '../rail/constants';
 import type { TrackPiece } from '../rail/TrackGraph';
 import type { TrainSim } from '../rail/TrainSim';
@@ -165,7 +167,15 @@ export class TrackLayer {
       const frames = polyFrames(p.pts);
       if (frames.length < 2) continue;
       this.buildTrack(buf, p, frames, crossingPieces.has(p.id));
-      if (p.electrified) this.buildCatenary(buf, wires, p, frames);
+      if (p.electrified) {
+        this.buildCatenary(buf, wires, p, frames);
+        // Wires stop where the power does: anchor them off to a stout mast.
+        const powered = (state: number) => g.next[state].some((n) => g.pieces[n >> 1].electrified);
+        if (!powered(p.id * 2)) this.wireAnchor(buf, wires, p, frames, true);
+        if (!powered(p.id * 2 + 1)) this.wireAnchor(buf, wires, p, frames, false);
+      } else if (!p.thirdRail && !p.metro && p.kind === 'run' && (p.normal === 0 || p.track === 0) && !crossingPieces.has(p.id)) {
+        this.linesidePoles(buf, wires, p, frames);
+      }
       if (p.thirdRail && !crossingPieces.has(p.id)) {
         const side = p.kind === 'run' && p.track === 0 && p.normal !== 0 ? -1 : 1;
         const x = side * 1.38;
@@ -229,8 +239,10 @@ export class TrackLayer {
       const at = Math.min(s, p.length);
       const f = frameAt(frames, at);
       const zig = (Math.round(at / (span / 2)) % 2 === 0 ? 1 : -1) * 0.2;
-      const cw = [f.x + f.rx * zig, f.y + RAIL_TOP + CONTACT, f.z + f.rz * zig];
-      const mw = [f.x, f.y + RAIL_TOP + MESSENGER, f.z];
+      // Under a bridge the wires dip to pass beneath the deck.
+      const low = this.deckAbove(f.x, f.z, f.y);
+      const cw = [f.x + f.rx * zig, f.y + RAIL_TOP + (low ? Math.min(CONTACT, low - 0.2 - RAIL_TOP) : CONTACT), f.z + f.rz * zig];
+      const mw = [f.x, f.y + RAIL_TOP + (low ? Math.min(MESSENGER, low - 0.05 - RAIL_TOP) : MESSENGER), f.z];
       if (last && lastM) {
         wires.push(...last, ...cw, ...lastM, ...mw);
         // Droppers.
@@ -250,7 +262,9 @@ export class TrackLayer {
     const first = Math.ceil(frames[0].s / span) * span;
     for (let s = first + span / 2; s < p.length - 4; s += span) {
       const f = frameAt(frames, s);
-      if (f.y < -1.5) continue;
+      if (f.y < surfaceLevel(f.x, f.z) - 1.5) continue;
+      // No mast under a bridge deck.
+      if (this.deckAbove(f.x + f.rx * side * 3.3, f.z + f.rz * side * 3.3, f.y)) continue;
       const mx = f.x + f.rx * side * 3.3;
       const mz = f.z + f.rz * side * 3.3;
       const ground = Math.min(f.y, terrainHeight(mx, mz));
@@ -263,6 +277,86 @@ export class TrackLayer {
       buf.box(cx, f.y + RAIL_TOP + CONTACT + 0.3, cz, reach / 2, 0.04, 0.04, f.rx, f.rz, C.galv, M_STEEL);
       buf.box(f.x - f.rx * side * 0.1, f.y + RAIL_TOP + CONTACT + 0.15, f.z - f.rz * side * 0.1, 0.03, 0.18, 0.03, f.rx, f.rz, C.galv, M_STEEL);
     }
+  }
+
+  /** Where an electrified section ends: wires run down to an anchor mast with a guy to the ground. */
+  private wireAnchor(buf: MeshBuf, wires: number[], p: TrackPiece, frames: PFrame[], atEnd: boolean): void {
+    const side = p.kind === 'run' && p.track === 0 && p.normal !== 0 ? -1 : 1;
+    const f = atEnd ? frames[frames.length - 1] : frames[0];
+    const out = atEnd ? 1 : -1;
+    const fx = f.tx * out;
+    const fz = f.tz * out;
+    const h = Math.hypot(fx, fz) || 1;
+    const dx = fx / h;
+    const dz = fz / h;
+    // The mast stands a little past the last piece of wire, off to the side.
+    const mx = f.x + dx * 8 + f.rx * side * 3.4;
+    const mz = f.z + dz * 8 + f.rz * side * 3.4;
+    const ground = Math.min(f.y, terrainHeight(mx, mz));
+    const top = f.y + RAIL_TOP + 7.6;
+    buf.box(mx, (ground + top) / 2, mz, 0.2, (top - ground) / 2, 0.2, f.rx, f.rz, C.galv, M_STEEL);
+    buf.box(mx, top - 0.9, mz, 0.4, 0.06, 0.06, f.rx, f.rz, C.galv, M_STEEL);
+    const cw = [f.x, f.y + RAIL_TOP + CONTACT, f.z];
+    const mw = [f.x, f.y + RAIL_TOP + MESSENGER, f.z];
+    wires.push(...cw, mx, top - 0.9, mz, ...mw, mx, top - 0.5, mz);
+    // Guy wire from the mast head back to a ground anchor.
+    wires.push(mx, top, mz, mx + dx * 6 + f.rx * side * 1.5, ground, mz + dz * 6 + f.rz * side * 1.5);
+  }
+
+  /** Track with no wires: a row of line-side poles carrying signal wires, as on American lines. */
+  private linesidePoles(buf: MeshBuf, wires: number[], p: TrackPiece, frames: PFrame[]): void {
+    const side = p.track === 0 && p.normal !== 0 ? -1 : 1;
+    const off = side * (p.normal === 0 ? 4.6 : 6.9);
+    const spacing = 45;
+    let prev: number[][] | null = null;
+    for (let s = spacing / 2; s < p.length; s += spacing) {
+      const f = frameAt(frames, s);
+      if (f.y < surfaceLevel(f.x, f.z) - 1.5) {
+        prev = null;
+        continue;
+      }
+      const x = f.x + f.rx * off;
+      const z = f.z + f.rz * off;
+      const ground = terrainHeight(x, z);
+      if (f.y - ground > 1.5) {
+        prev = null;
+        continue;
+      }
+      buf.post(x, z, ground - 0.3, ground + 7.4, 0.13, C.wood, M_PLAIN, 6);
+      buf.box(x, ground + 7.0, z, 0.75, 0.06, 0.06, f.rx, f.rz, C.wood, M_PLAIN);
+      const tips = [-0.6, 0.6].map((k) => [x + f.rx * k, ground + 7.1, z + f.rz * k]);
+      if (prev) {
+        for (let i = 0; i < 2; i++) {
+          const a = prev[i];
+          const b = tips[i];
+          // Sagging span in four pieces.
+          let last = a;
+          for (let k = 1; k <= 4; k++) {
+            const t = k / 4;
+            const q = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t - 0.6 * Math.sin(Math.PI * t), a[2] + (b[2] - a[2]) * t];
+            wires.push(...last, ...q);
+            last = q;
+          }
+        }
+      }
+      prev = tips;
+    }
+  }
+
+  /** Height of the underside of a deck passing over (x, z) above y, relative to y, or 0. */
+  private deckAbove(x: number, z: number, y: number): number {
+    let best = 0;
+    for (const id of this.net.segmentsInRegion({ minX: x - 12, minZ: z - 12, maxX: x + 12, maxZ: z + 12 }, true)) {
+      const def = this.net.roadTypeOf(id);
+      const hit = closestPointOnCubic(this.net.cubicOf(id), { x, y, z });
+      const gap = hit.point.y - y;
+      if (gap < 3.5 || gap > 14) continue;
+      if (hit.distance > def.halfWidth + def.sidewalk + 1.5) continue;
+      // Underside of the deck, less its structure.
+      const under = gap - 1.4;
+      if (!best || under < best) best = under;
+    }
+    return best;
   }
 
   /** A steel truss where the track crosses the river on a span. */
@@ -510,55 +604,124 @@ export class TrackLayer {
   private buildStations(trains: TrainSim): void {
     const g = trains.graph;
     for (const st of g.stations.values()) {
-      if (st.kind === 'gateway' || !st.spans.length) continue;
+      if (st.kind === 'gateway' || !st.stops.length) continue;
       const underground = st.kind === 'underground';
+      const elevated = st.kind === 'elevated';
       const buf = new MeshBuf();
-      const spans = st.spans.map((sp) => polyFrames(sp, 8));
-      const double = st.spans.length === 2;
-      spans.forEach((frames, i) => {
-        if (frames.length < 2) return;
-        // Track 0 of double track is the left one: its platform goes on the left.
-        const side = double ? (i === 0 ? -1 : 1) : 1;
-        this.platform(buf, frames, side, underground);
-      });
-      if (underground) this.stationBox(buf, spans, double);
+      const stopFrames = st.spans.map((sp) => polyFrames(sp, 8));
+      const trackFrames = st.trackSpans.map((sp) => polyFrames(sp, 8));
+      const ref = trackFrames[0];
+      if (!ref || ref.length < 2) continue;
+      // Distance from track 0 across to track 1, the station's own width between tracks.
+      const gap = trackFrames.length === 2 ? lateralGap(ref, trackFrames[1]) : 0;
+      let leftReach = 2.6;
+      let rightReach = gap + 2.6;
+      if (st.layout === 'island' && trackFrames.length === 2) {
+        const mid = midFrames(ref, trackFrames[1]);
+        this.islandPlatform(buf, mid, gap / 2 - PLATFORM_EDGE, underground, elevated);
+      } else {
+        stopFrames.forEach((frames, i) => {
+          if (frames.length < 2) return;
+          const stop = st.stops[i];
+          const base = stop.track === 1 ? gap : 0;
+          for (const side of [-1, 1] as const) {
+            if (!(stop.sides & (side < 0 ? 1 : 2))) continue;
+            // Between double tracks there is no room for a side platform.
+            if (trackFrames.length === 2 && ((stop.track === 0 && side > 0) || (stop.track === 1 && side < 0))) continue;
+            this.platform(buf, frames, side, underground, elevated);
+            const reach = base + side * (PLATFORM_EDGE + PLATFORM_WIDTH + 0.6);
+            if (side < 0) leftReach = Math.max(leftReach, -reach);
+            else rightReach = Math.max(rightReach, reach);
+          }
+        });
+      }
+      const length = ref[ref.length - 1].s;
+      const building = st.building ?? (elevated || underground ? 'right' : null);
+      if (underground) this.stationBox(buf, ref, -leftReach, rightReach);
+      if (elevated && building) this.elevatedAccess(buf, ref, building === 'left' ? -leftReach : rightReach, building === 'left' ? -1 : 1);
+      else if (!underground && building) this.stationBuilding(buf, ref, building === 'left' ? -leftReach : rightReach, building === 'left' ? -1 : 1);
       const mesh = new THREE.Mesh(buf.toGeometry(), this.material);
       mesh.castShadow = !underground;
       mesh.receiveShadow = true;
       this.add(underground ? this.under : this.world, mesh);
-      this.nameSigns(st.name, spans, double, underground);
-      if (underground) this.kiosks(st.name, spans[spans.length - 1], double);
+      const signFrames = stopFrames[stopFrames.length - 1] ?? ref;
+      this.nameSigns(st.name, [signFrames], false, underground);
+      if (underground) {
+        const ends = [frameAt(ref, length * 0.15), frameAt(ref, length * 0.85)].map((f) => ({ x: f.x, y: f.y, z: f.z }));
+        const mid = frameAt(ref, length / 2);
+        this.kiosks(st.name, stationEntrances(this.net, ends, { x: mid.rx, z: mid.rz }));
+      }
     }
   }
 
-  /** One side platform along a track. */
-  private platform(buf: MeshBuf, frames: PFrame[], side: -1 | 1, underground: boolean): void {
+  /** One side platform along a track. Elevated ones stand on their own deck and columns. */
+  private platform(buf: MeshBuf, frames: PFrame[], side: -1 | 1, underground: boolean, elevated = false): void {
     const inner = side * PLATFORM_EDGE;
     const outer = side * (PLATFORM_EDGE + PLATFORM_WIDTH);
     const top = RAIL_TOP + PLATFORM_TOP - 0.24;
     const L = (a: number, b: number) => (side > 0 ? ([a, b] as const) : ([b, a] as const));
     const [l, r] = L(inner, outer);
+    const bottom = elevated ? -1.6 : -0.2;
     sweep(buf, frames, [l, top], [r, top], C.tile, underground ? M_TILE : M_CONCRETE);
     // Platform edge face and the coping with its yellow line.
-    if (side > 0) sweep(buf, frames, [inner, top], [inner, -0.2], C.concreteDark, M_CONCRETE);
-    else sweep(buf, frames, [inner, -0.2], [inner, top], C.concreteDark, M_CONCRETE);
+    if (side > 0) sweep(buf, frames, [inner, top], [inner, bottom], C.concreteDark, M_CONCRETE);
+    else sweep(buf, frames, [inner, bottom], [inner, top], C.concreteDark, M_CONCRETE);
     const y0 = side * (PLATFORM_EDGE + 0.45);
     const y1 = side * (PLATFORM_EDGE + 0.6);
     sweep(buf, frames, [Math.min(y0, y1), top + 0.005], [Math.max(y0, y1), top + 0.005], C.yellow, M_PAINT);
-    if (side > 0) sweep(buf, frames, [outer, -0.2], [outer, top], C.concreteDark, M_CONCRETE);
-    else sweep(buf, frames, [outer, top], [outer, -0.2], C.concreteDark, M_CONCRETE);
-    // Canopy over the middle of the platform, on a row of columns.
+    if (side > 0) sweep(buf, frames, [outer, bottom], [outer, top], C.concreteDark, M_CONCRETE);
+    else sweep(buf, frames, [outer, top], [outer, bottom], C.concreteDark, M_CONCRETE);
+    if (elevated) {
+      // Underside, parapet and columns down to the ground.
+      sweep(buf, frames, [r, bottom], [l, bottom], C.concreteDark, M_CONCRETE);
+      if (side > 0) sweep(buf, frames, [outer, top], [outer, top + 1.1], C.concrete, M_CONCRETE);
+      else sweep(buf, frames, [outer, top + 1.1], [outer, top], C.concrete, M_CONCRETE);
+      const length = frames[frames.length - 1].s;
+      for (let s = 8; s < length - 4; s += 16) {
+        const f = frameAt(frames, s);
+        const x = f.x + f.rx * side * (PLATFORM_EDGE + PLATFORM_WIDTH * 0.5);
+        const z = f.z + f.rz * side * (PLATFORM_EDGE + PLATFORM_WIDTH * 0.5);
+        buf.post(x, z, terrainHeight(x, z) - 0.5, f.y + bottom, 0.45, C.concrete, M_CONCRETE, 10);
+      }
+    }
+    this.platformFurniture(buf, frames, side * (PLATFORM_EDGE + PLATFORM_WIDTH * 0.55), side * (PLATFORM_EDGE + 0.9), side * (PLATFORM_EDGE + PLATFORM_WIDTH + 0.3), side, top, underground);
+  }
+
+  /** An island platform between two tracks, its centreline given by frames. */
+  private islandPlatform(buf: MeshBuf, frames: PFrame[], half: number, underground: boolean, elevated: boolean): void {
+    if (frames.length < 2 || half < 1.5) return;
+    const top = RAIL_TOP + PLATFORM_TOP - 0.24;
+    const bottom = elevated ? -1.6 : -0.2;
+    sweep(buf, frames, [-half, top], [half, top], C.tile, underground ? M_TILE : M_CONCRETE);
+    sweep(buf, frames, [half, top], [half, bottom], C.concreteDark, M_CONCRETE);
+    sweep(buf, frames, [-half, bottom], [-half, top], C.concreteDark, M_CONCRETE);
+    for (const side of [-1, 1]) {
+      const a = side * (half - 0.6);
+      const b = side * (half - 0.45);
+      sweep(buf, frames, [Math.min(a, b), top + 0.005], [Math.max(a, b), top + 0.005], C.yellow, M_PAINT);
+    }
+    if (elevated) {
+      sweep(buf, frames, [half, bottom], [-half, bottom], C.concreteDark, M_CONCRETE);
+      const length = frames[frames.length - 1].s;
+      for (let s = 8; s < length - 4; s += 16) {
+        const f = frameAt(frames, s);
+        buf.post(f.x, f.z, terrainHeight(f.x, f.z) - 0.5, f.y + bottom, 0.5, C.concrete, M_CONCRETE, 10);
+      }
+    }
+    this.platformFurniture(buf, frames, 0, -half - 0.3, half + 0.3, 1, top, underground);
+  }
+
+  /** Canopy on a row of columns, lamps and benches. `mid` is the column line. */
+  private platformFurniture(buf: MeshBuf, frames: PFrame[], mid: number, roofA: number, roofB: number, side: number, top: number, underground: boolean): void {
     const length = frames[frames.length - 1].s;
-    const mid = side * (PLATFORM_EDGE + PLATFORM_WIDTH * 0.55);
-    const roofIn = side * (PLATFORM_EDGE + 0.9);
-    const roofOut = side * (PLATFORM_EDGE + PLATFORM_WIDTH + 0.3);
     const c0 = length * 0.18;
     const c1 = length * 0.82;
     const i0 = frames.findIndex((f) => f.s >= c0);
     let i1 = frames.length - 1;
     while (i1 > 0 && frames[i1].s > c1) i1--;
+    const a = Math.min(roofA, roofB);
+    const b = Math.max(roofA, roofB);
     if (!underground && i1 > i0) {
-      const [a, b] = L(roofIn, roofOut);
       sweep(buf, frames, [a, top + 4.0], [b, top + 4.25], C.roof, M_STEEL, i0, i1);
       sweep(buf, frames, [b, top + 4.25], [a, top + 4.0], lin(0xc9ccd0), M_PLAIN, i0, i1);
     }
@@ -569,11 +732,10 @@ export class TrackLayer {
       const inCanopy = s >= c0 && s <= c1;
       if (inCanopy && !underground) buf.post(x, z, f.y + top, f.y + top + 4.05, 0.1, C.steel, M_STEEL, 8);
       else {
-        // Lamp post with a warm head.
         buf.post(x, z, f.y + top, f.y + top + 3.6, 0.05, C.steel, M_STEEL, 6);
         buf.box(x, f.y + top + 3.6, z, 0.18, 0.06, 0.18, f.rx, f.rz, C.lamp, M_LAMP);
       }
-      if (inCanopy) buf.box(f.x + f.rx * (mid - side * 0.2), f.y + top + 3.85, f.z + f.rz * (mid - side * 0.2), 0.25, 0.04, 0.6, f.rx, f.rz, C.lamp, M_LAMP);
+      if (inCanopy) buf.box(x, f.y + top + 3.85, z, 0.25, 0.04, 0.6, f.rx, f.rz, C.lamp, M_LAMP);
       if (Math.round(s / 12) % 2 === 0) {
         const bx = f.x + f.rx * (mid + side * 1.2);
         const bz = f.z + f.rz * (mid + side * 1.2);
@@ -584,53 +746,120 @@ export class TrackLayer {
     }
   }
 
-  /** The concrete box a subway station sits in, open on top for the underground view. */
-  private stationBox(buf: MeshBuf, spans: PFrame[][], double: boolean): void {
-    const frames = spans[0];
-    const far = double ? 2 * 2.2 + PLATFORM_EDGE + PLATFORM_WIDTH + 0.5 : PLATFORM_EDGE + PLATFORM_WIDTH + 0.5;
-    const near = double ? -(PLATFORM_EDGE + PLATFORM_WIDTH + 0.5) : -2.6;
+  /**
+   * The concrete box of a subway station, open on top for the underground view,
+   * with a concourse deck over the middle of the platforms.
+   */
+  private stationBox(buf: MeshBuf, frames: PFrame[], near: number, far: number): void {
     const H = 7;
     sweep(buf, frames, [near, H], [near, -0.3], lin(0x5b6068), M_CONCRETE);
     sweep(buf, frames, [far, -0.3], [far, H], lin(0x5b6068), M_CONCRETE);
     sweep(buf, frames, [near, -0.3], [far, -0.3], lin(0x3c4046), M_CONCRETE);
-    // Strip lights along the walls.
     sweep(buf, frames, [near + 0.05, H - 1.2], [near + 0.05, H - 1.4], C.lamp, M_LAMP);
     sweep(buf, frames, [far - 0.05, H - 1.4], [far - 0.05, H - 1.2], C.lamp, M_LAMP);
+    // Concourse: a mezzanine over the middle third, ticket hall and stairs down.
+    const length = frames[frames.length - 1].s;
+    const i0 = frames.findIndex((f) => f.s >= length * 0.35);
+    let i1 = frames.length - 1;
+    while (i1 > 0 && frames[i1].s > length * 0.65) i1--;
+    if (i1 > i0) {
+      sweep(buf, frames, [near, H - 1.6], [far, H - 1.6], C.tile, M_TILE, i0, i1);
+      sweep(buf, frames, [far, H - 1.9], [near, H - 1.9], lin(0x4a4f56), M_CONCRETE, i0, i1);
+      for (const s of [length * 0.36, length * 0.64]) {
+        const f = frameAt(frames, s);
+        const cx = f.x + f.rx * ((near + far) / 2);
+        const cz = f.z + f.rz * ((near + far) / 2);
+        buf.box(cx, f.y + RAIL_TOP + 2.6, cz, 1.2, 2.6, 0.2, f.rx, f.rz, lin(0x8a9098), M_STEEL);
+      }
+      const m = frameAt(frames, length / 2);
+      buf.box(m.x + m.rx * ((near + far) / 2), m.y + H - 1.1, m.z + m.rz * ((near + far) / 2), 3, 0.5, 1.2, m.rx, m.rz, lin(0x3a78d0), M_PAINT);
+    }
   }
 
-  private kiosks(name: string, frames: PFrame[], double: boolean): void {
-    if (frames.length < 2) return;
+  /** Street entrances to a subway: glass kiosks with a sign, beside the road. */
+  private kiosks(name: string, entrances: readonly StationEntrance[]): void {
     const buf = new MeshBuf();
-    const length = frames[frames.length - 1].s;
-    for (const s of [length * 0.15, length * 0.85]) {
-      const f = frameAt(frames, s);
-      const off = (double ? 2.2 : 0) + PLATFORM_EDGE + PLATFORM_WIDTH + 6;
-      const x = f.x + f.rx * off;
-      const z = f.z + f.rz * off;
+    for (const e of entrances) {
+      const { x, z } = e.pos;
       const y = terrainHeight(x, z);
-      // Glass entrance with a flat roof and stairs going down.
-      buf.box(x, y + 1.4, z, 1.8, 1.4, 3.2, f.rx, f.rz, C.glass, M_GLASS);
-      buf.box(x, y + 2.95, z, 2.1, 0.15, 3.5, f.rx, f.rz, C.roof, M_STEEL);
-      buf.box(x + f.rx * 2.6, y + 1.8, z + f.rz * 2.6, 0.08, 1.8, 0.08, f.rx, f.rz, C.steel, M_STEEL);
-      buf.box(x + f.rx * 2.6, y + 3.8, z + f.rz * 2.6, 0.45, 0.45, 0.08, f.rx, f.rz, lin(0x1f5fbf), M_LAMP);
-      this.sign('M', x + f.rx * 2.6, y + 3.8, z + f.rz * 2.6, 0.9, '#ffffff', '#1f5fbf', this.world);
+      // Facing the street: right vector across the door.
+      const rx = -e.facing.z;
+      const rz = e.facing.x;
+      buf.box(x, y + 1.4, z, 1.8, 1.4, 3.2, rx, rz, C.glass, M_GLASS);
+      buf.box(x, y + 2.95, z, 2.1, 0.15, 3.5, rx, rz, C.roof, M_STEEL);
+      const px = x + e.facing.x * 3.6;
+      const pz = z + e.facing.z * 3.6;
+      buf.box(px, y + 1.8, pz, 0.08, 1.8, 0.08, rx, rz, C.steel, M_STEEL);
+      buf.box(px, y + 3.8, pz, 0.45, 0.45, 0.08, rx, rz, lin(0x1f5fbf), M_LAMP);
+      this.sign('M', px, y + 3.8, pz, 0.9, '#ffffff', '#1f5fbf', this.world);
     }
     const mesh = new THREE.Mesh(buf.toGeometry(), this.material);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     this.add(this.world, mesh);
-    this.sign(name, frameAt(frames, length * 0.15).x, terrainHeight(frameAt(frames, length * 0.15).x, frameAt(frames, length * 0.15).z) + 5.2, frameAt(frames, length * 0.15).z, 0, '#ffffff', '#1d2a3a', this.world);
+    const first = entrances[0];
+    if (first) this.sign(name, first.pos.x, terrainHeight(first.pos.x, first.pos.z) + 5.2, first.pos.z, 0, '#ffffff', '#1d2a3a', this.world);
   }
 
-  private nameSigns(name: string, spans: PFrame[][], double: boolean, underground: boolean): void {
-    const frames = spans[spans.length - 1];
-    if (frames.length < 2) return;
+  /** A station building beside a surface station, sized to the platform. */
+  private stationBuilding(buf: MeshBuf, frames: PFrame[], at: number, side: -1 | 1): void {
     const length = frames[frames.length - 1].s;
-    const off = (double ? 1 : 1) * (PLATFORM_EDGE + PLATFORM_WIDTH * 0.55);
-    for (const s of [length * 0.5]) {
-      const f = frameAt(frames, s);
-      this.sign(name, f.x + f.rx * off, f.y + 6.2, f.z + f.rz * off, 0, '#ffffff', '#1d2a3a', underground ? this.under : this.world);
-    }
+    const f = frameAt(frames, length / 2);
+    const depth = 9;
+    const long = Math.min(48, Math.max(18, length * 0.25));
+    const off = at + side * (depth / 2 + 0.5);
+    const x = f.x + f.rx * off;
+    const z = f.z + f.rz * off;
+    const y = terrainHeight(x, z);
+    buf.box(x, y + 2.6, z, depth / 2, 2.6, long / 2, f.rx, f.rz, rgbOf('wallCream'), M_PLAIN);
+    buf.box(x, y + 5.45, z, depth / 2 + 0.5, 0.25, long / 2 + 0.5, f.rx, f.rz, rgbOf('roofSlate'), M_PLAIN);
+    // A row of tall windows and a door to the street side.
+    buf.box(x + f.rx * side * (depth / 2 + 0.02), y + 2.4, z + f.rz * side * (depth / 2 + 0.02), 0.03, 1.4, long / 2 - 2, f.rx, f.rz, C.glass, M_GLASS);
+    buf.box(x - f.rx * side * (depth / 2 + 0.02), y + 1.3, z - f.rz * side * (depth / 2 + 0.02), 0.03, 1.3, 1.6, f.rx, f.rz, C.glass, M_GLASS);
+  }
+
+  /** Lift tower, stairs and a street-level hall for a station on a viaduct. */
+  private elevatedAccess(buf: MeshBuf, frames: PFrame[], at: number, side: -1 | 1): void {
+    const length = frames[frames.length - 1].s;
+    const f = frameAt(frames, length / 2);
+    const deck = f.y + RAIL_TOP + PLATFORM_TOP - 0.24;
+    const off = at + side * 3;
+    const tx = f.x + f.rx * off;
+    const tz = f.z + f.rz * off;
+    const ground = terrainHeight(tx, tz);
+    // Glass lift tower with a link bridge to the platform.
+    buf.box(tx, (ground + deck + 3) / 2, tz, 2, (deck + 3 - ground) / 2, 2, f.rx, f.rz, C.glass, M_GLASS);
+    buf.box(tx, deck + 3.15, tz, 2.3, 0.15, 2.3, f.rx, f.rz, C.roof, M_STEEL);
+    buf.box(f.x + f.rx * (at + side * 0.6), deck - 0.1, f.z + f.rz * (at + side * 0.6), 1.2, 0.15, 1.6, f.rx, f.rz, C.concrete, M_CONCRETE);
+    // Stairs alongside the tower, rising with the track.
+    const run = Math.max(8, (deck - ground) * 1.8);
+    const s0 = frameAt(frames, Math.max(0, length / 2 - 4 - run));
+    const s1 = frameAt(frames, length / 2 - 4);
+    const so = off;
+    const p = (fr: PFrame, h: number, k: number) => [fr.x + fr.rx * (so + side * k), h, fr.z + fr.rz * (so + side * k)];
+    // Both windings, so the flight reads from above and below.
+    const flight = [p(s0, ground, -1), p(s0, ground, 1), p(s1, deck, 1), p(s1, deck, -1)];
+    buf.face(flight, C.concrete, M_CONCRETE);
+    buf.face([flight[0], flight[3], flight[2], flight[1]], C.concreteDark, M_CONCRETE);
+    // Side walls of the stair, so it has some body.
+    buf.face([p(s0, ground, 1), p(s0, ground - 0.1, 1), p(s1, deck - 1.2, 1), p(s1, deck, 1)], C.concrete, M_CONCRETE);
+    buf.face([p(s1, deck, -1), p(s1, deck - 1.2, -1), p(s0, ground - 0.1, -1), p(s0, ground, -1)], C.concrete, M_CONCRETE);
+    // Street-level hall at the foot of the tower.
+    const hx = tx + f.rx * side * 7;
+    const hz = tz + f.rz * side * 7;
+    const hy = terrainHeight(hx, hz);
+    buf.box(hx, hy + 2.2, hz, 5, 2.2, Math.min(20, Math.max(10, length * 0.12)), f.rx, f.rz, rgbOf('wallWhite'), M_PLAIN);
+    buf.box(hx, hy + 4.55, hz, 5.4, 0.2, Math.min(20, Math.max(10, length * 0.12)) + 0.4, f.rx, f.rz, rgbOf('roofSlate'), M_PLAIN);
+    buf.box(hx + f.rx * side * 5.02, hy + 1.6, hz + f.rz * side * 5.02, 0.03, 1.2, 3, f.rx, f.rz, C.glass, M_GLASS);
+  }
+
+  private nameSigns(name: string, spans: PFrame[][], _double: boolean, underground: boolean): void {
+    const frames = spans[spans.length - 1];
+    if (!frames || frames.length < 2) return;
+    const length = frames[frames.length - 1].s;
+    const off = PLATFORM_EDGE + PLATFORM_WIDTH * 0.55;
+    const f = frameAt(frames, length * 0.5);
+    this.sign(name, f.x + f.rx * off, f.y + 6.2, f.z + f.rz * off, 0, '#ffffff', '#1d2a3a', underground ? this.under : this.world);
   }
 
   private sign(text: string, x: number, y: number, z: number, square: number, fg: string, bg: string, parent: THREE.Object3D): void {
@@ -704,6 +933,34 @@ export class TrackLayer {
   get underground(): boolean {
     return this.undergroundOn;
   }
+}
+
+/** Signed distance from track a's centreline across to track b's, at the middle. */
+function lateralGap(a: PFrame[], b: PFrame[]): number {
+  const f = frameAt(a, a[a.length - 1].s / 2);
+  let best = Infinity;
+  let sign = 1;
+  for (const q of b) {
+    const d = Math.hypot(q.x - f.x, q.z - f.z);
+    if (d < best) {
+      best = d;
+      sign = (q.x - f.x) * f.rx + (q.z - f.z) * f.rz >= 0 ? 1 : -1;
+    }
+  }
+  return best * sign;
+}
+
+/** The centreline halfway between two parallel tracks. */
+function midFrames(a: PFrame[], b: PFrame[]): PFrame[] {
+  const la = a[a.length - 1].s;
+  const lb = b[b.length - 1].s;
+  const pts: number[] = [];
+  for (let i = 0; i <= 40; i++) {
+    const p = frameAt(a, (la * i) / 40);
+    const q = frameAt(b, (lb * i) / 40);
+    pts.push((p.x + q.x) / 2, (p.y + q.y) / 2, (p.z + q.z) / 2);
+  }
+  return polyFrames(pts, 8);
 }
 
 function frameAt(frames: readonly PFrame[], s: number): PFrame {

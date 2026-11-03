@@ -29,6 +29,8 @@ import {
 } from './math';
 import { lanesMirror, sidewalkOn, totalHalfWidth } from './roadTypes';
 import { GRADE_CLEARANCE } from './terrain';
+import type { JunctionShape } from './types';
+import { applyShapeTrims, hasShape, shapeOutlineHooks } from './junctionShape';
 
 /** Longest trim for one road end, per ARCHITECTURE.md. */
 export const MAX_TRIM = 80;
@@ -291,7 +293,7 @@ function headOnTaper(a: ArmLayout, b: ArmLayout): number {
 }
 
 /** Lay out a node. Arms may arrive in any order. */
-export function computeNodeLayout(nodeId: Id, sources: ArmSource[]): NodeLayout {
+export function computeNodeLayout(nodeId: Id, sources: ArmSource[], shape?: JunctionShape): NodeLayout {
   const arms: ArmLayout[] = sources.map((source) => {
     const dir = armDirection(source);
     return {
@@ -353,6 +355,11 @@ export function computeNodeLayout(nodeId: Id, sources: ArmSource[]): NodeLayout 
 
   const taper = n === 2 ? Math.max(widthTaper(arms[0].source.def, arms[1].source.def), headOnTaper(arms[0], arms[1])) : MIN_TRIM;
   for (const arm of arms) arm.rawTrim = clamp(Math.max(arm.rawTrim, taper), 0, MAX_TRIM);
+  // Junction shape: trim deltas and room for kerb radii. See junctionShape.ts.
+  if (shape && hasShape(shape)) {
+    const kerbMeet = (i: number, j: number, wi: number, wj: number) => outermostCrossing(edgeLine(arms[i], 1, wi, back, limit), edgeLine(arms[j], -1, wj, back, limit));
+    applyShapeTrims(arms, shape, kerbMeet, MIN_TRIM, MAX_TRIM);
+  }
   return { nodeId, kind: 'junction', arms };
 }
 
@@ -507,6 +514,8 @@ function buildOutline(
   nodePos: Vec3,
   /** Widths on each side of an arm, where they differ from `widths`. */
   sides?: { left: number; right: number }[],
+  /** Replaces a corner's points, given the automatic ones. From a junction shape. */
+  corner?: (i: number, j: number, a: Corner, b: Corner, base: Vec3[]) => Vec3[] | null,
 ): { points: Vec3[]; simplified: boolean } {
   const n = arms.length;
   const lefts = arms.map((a, i) => addScaled(a.centre, a.outRight, sides?.[i].left ?? widths[i]));
@@ -543,7 +552,13 @@ function buildOutline(
     if (keepLeft[i]) raw.push(lefts[i]);
     if (keepLeft[i] && keepRight[j]) {
       const theta = wrapPositive(arms[j].angle - arms[i].angle);
-      cornerPoints({ p: lefts[i], dir: arms[i].cutDir }, { p: rights[j], dir: arms[j].cutDir }, theta, nodePos, raw);
+      const a = { p: lefts[i], dir: arms[i].cutDir };
+      const b = { p: rights[j], dir: arms[j].cutDir };
+      if (corner) {
+        const base: Vec3[] = [];
+        cornerPoints(a, b, theta, nodePos, base);
+        raw.push(...(corner(i, j, a, b, base) ?? base));
+      } else cornerPoints(a, b, theta, nodePos, raw);
     }
   }
   const clean: Vec3[] = [];
@@ -567,7 +582,7 @@ function outerWidths(arm: ArmLayout): { left: number; right: number } {
 }
 
 /** Cut points and outline for a node, once final trims are in `geomOf`. */
-export function buildNodeGeom(layout: NodeLayout, nodePos: Vec3, geomOf: (id: Id) => SegmentGeom | undefined): NodeGeom {
+export function buildNodeGeom(layout: NodeLayout, nodePos: Vec3, geomOf: (id: Id) => SegmentGeom | undefined, shape?: JunctionShape): NodeGeom {
   const cuts = layout.arms.map((arm) => ({ ...cutOf(arm, geomOf(arm.segmentId), nodePos), angle: arm.angle }));
   const arms: NodeArm[] = layout.arms.map((arm, i) => {
     const cut = cuts[i];
@@ -584,9 +599,16 @@ export function buildNodeGeom(layout: NodeLayout, nodePos: Vec3, geomOf: (id: Id
     };
   });
   const hasSurface = layout.kind === 'junction';
-  const inner = hasSurface ? buildOutline(cuts, layout.arms.map((a) => a.source.def.halfWidth), nodePos) : null;
+  // Junction shape: kerb radii, moved kerbs and corners without sidewalk. See junctionShape.ts.
+  const hooks = hasSurface && shape && hasShape(shape) ? shapeOutlineHooks(layout.arms.map((a) => ({ segmentId: a.segmentId, atStart: a.atStart, def: a.source.def })), cuts, shape) : null;
+  hooks?.kerbs.forEach((k, i) => {
+    if (k?.left) arms[i].kerbLeft = k.left;
+    if (k?.right) arms[i].kerbRight = k.right;
+  });
+  const widths = layout.arms.map((a) => a.source.def.halfWidth);
+  const inner = hasSurface ? buildOutline(cuts, widths, nodePos, hooks?.innerSides, hooks?.innerCorner) : null;
   const outerSides = layout.arms.map((a) => outerWidths(a));
-  const outer = hasSurface ? buildOutline(cuts, layout.arms.map((a) => totalHalfWidth(a.source.def)), nodePos, outerSides) : null;
+  const outer = hasSurface ? buildOutline(cuts, layout.arms.map((a) => totalHalfWidth(a.source.def)), nodePos, outerSides, hooks?.outerCorner) : null;
   return {
     nodeId: layout.nodeId,
     arms,

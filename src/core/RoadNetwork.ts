@@ -8,12 +8,19 @@
  * matching commit() and carries everything dirtied since beginBatch().
  */
 import type {
+  AutoMarkingRef,
   CrosswalkStyle,
   Decal,
   Id,
   JunctionControl,
+  JunctionShape,
   LaneGraph,
   MarkingAnchor,
+  MarkingHost,
+  MarkingLibrary,
+  MarkingPointSetting,
+  MarkingPreset,
+  MarkingTemplate,
   NodeFillerMarking,
   NodeGeom,
   NodeLineMarking,
@@ -26,11 +33,15 @@ import type {
   SegmentGeom,
   SegmentOverrides,
   SignKind,
+  TerrainData,
   TrafficEndpoint,
   TrafficSettings,
   Vec3,
   ZoneRegion,
 } from './types';
+import type { Quay } from './wallTypes';
+import { mirrorBarriers, mirrorStructure } from './walls';
+import { quaySamples } from './quays';
 import {
   closestPointOnCubic,
   cubicPoint,
@@ -45,9 +56,10 @@ import {
 } from './bezier';
 import { buildSegmentCurve, buildSegmentGeom, maxGrade, type SegmentCurve } from './geometry';
 import { buildNodeGeom, computeNodeLayout, finalizeTrims, type ArmSource, type NodeLayout } from './junction';
+import { normaliseShape, renameShapeSegment, stripShapeSegment } from './junctionShape';
 import type { PossibleConnection } from './connectors';
-import { railDraftIssues } from './railValidate';
-import type { RailData, RailLine, RailStation } from './railTypes';
+import { crossingClearance, railDraftIssues } from './railValidate';
+import { mirrorSide, type RailData, type RailLine, type RailStation } from './railTypes';
 import {
   assembleLaneGraph,
   buildNodeLanes,
@@ -82,11 +94,13 @@ import {
   isSymmetricRoad,
   mirrorLaneLinks,
   mirrorMarkings,
+  mirrorSegmentMarkings,
   reconcileLaneLinks,
   reconcileSignal,
   strandedNodes,
   type ReverseReport,
 } from './reverse';
+import { autoRefSegments, renameAutoRef, sameAutoRef } from './autoMarkings';
 import { SpatialHash } from './spatial';
 import { attachAt, attachedCubic, attachPointFrom, hostDirection, pickHost, rampEndIssues, type AttachAccess } from './ramps';
 import { draftOverlapIssues } from './overlap';
@@ -145,8 +159,15 @@ export interface CrossingInfo {
   point: Vec3;
   /** Height gap between the two surfaces. */
   clearance: number;
-  /** True when the clearance is under GRADE_CLEARANCE, so a junction is needed. */
+  /** True when the clearance is under what is needed, so a junction is needed. */
   atGrade: boolean;
+  /**
+   * Clearance this pair needs to pass without meeting: GRADE_CLEARANCE for two roads,
+   * less or more where track is involved (see crossingClearance).
+   */
+  required: number;
+  /** The other surface is track. */
+  overRail?: boolean;
 }
 
 export type DraftIssueCode =
@@ -164,7 +185,9 @@ export type DraftIssueCode =
   /** A one-way road joining a highway against its traffic. */
   | 'wrongWay'
   /** A two-way road joining a highway at grade: right in, right out only. */
-  | 'atGradeHighway';
+  | 'atGradeHighway'
+  /** An embankment, wall or cut beside the road reaching another road. See core/walls.ts. */
+  | 'structureFootprint';
 
 export interface DraftIssue {
   code: DraftIssueCode;
@@ -214,6 +237,10 @@ export interface NetworkChange {
   settingsChanged: boolean;
   /** Stations or train lines changed. */
   railChanged?: boolean;
+  /** Quay walls changed. */
+  quaysChanged?: boolean;
+  /** Landscaping (Project.terrain) changed. Roads over the edited area are in dirtySegments. */
+  terrainChanged?: boolean;
   /** The whole project was replaced by load(). Rebuild everything. */
   reset: boolean;
   /** Set on a reset when the caller said why. See ResetReason. */
@@ -289,6 +316,8 @@ export class RoadNetwork {
   private evtDecals = false;
   private evtSettings = false;
   private evtRail = false;
+  private evtQuays = false;
+  private evtTerrain = false;
   private readonly evtReversed = new Set<Id>();
   private evtReset = false;
   private evtReason: ResetReason | undefined = undefined;
@@ -411,6 +440,8 @@ export class RoadNetwork {
       decalsChanged: this.evtDecals,
       settingsChanged: this.evtSettings,
       railChanged: this.evtRail,
+      quaysChanged: this.evtQuays,
+      terrainChanged: this.evtTerrain,
       reversedSegments: [...this.evtReversed],
       reset: this.evtReset,
       reason: this.evtReason,
@@ -428,6 +459,8 @@ export class RoadNetwork {
     this.evtDecals = false;
     this.evtSettings = false;
     this.evtRail = false;
+    this.evtQuays = false;
+    this.evtTerrain = false;
     this.evtReversed.clear();
     this.evtReset = false;
     this.evtReason = undefined;
@@ -591,7 +624,7 @@ export class RoadNetwork {
     for (const id of layoutNodes) {
       const node = this.nodeIndex.get(id);
       if (!node) continue;
-      const layout = computeNodeLayout(id, this.armSources(node));
+      const layout = computeNodeLayout(id, this.armSources(node), node.control.shape);
       this.layouts.set(id, layout);
       rebuildNodes.add(id);
       for (const seg of node.segments) check.add(seg);
@@ -635,10 +668,10 @@ export class RoadNetwork {
       const node = this.nodeIndex.get(id);
       if (!node) continue;
       if (!this.layouts.has(id)) {
-        this.layouts.set(id, computeNodeLayout(id, this.armSources(node)));
+        this.layouts.set(id, computeNodeLayout(id, this.armSources(node), node.control.shape));
       }
       const layout = this.layouts.get(id)!;
-      const geom = buildNodeGeom(layout, node.pos, (s) => this.geoms.get(s));
+      const geom = buildNodeGeom(layout, node.pos, (s) => this.geoms.get(s), node.control.shape);
       this.nodeGeoms.set(id, geom);
       this.nodeLanes.set(
         id,
@@ -892,7 +925,16 @@ export class RoadNetwork {
     const rightOverrides = structuredClone(seg.overrides);
     delete rightOverrides.attachA;
     delete seg.overrides.attachB;
+    // Markings along the segment carry on along both halves, each with ids of its own.
+    if (rightOverrides.handMarkings) rightOverrides.handMarkings = this.freshMarkingIds(rightOverrides.handMarkings);
     const rightId = this.createSegment(nodeId, seg.b, right.p1, right.p2, seg.roadType, rightOverrides);
+    // The copied segment markings now belong to the new half.
+    const ro = this.requireSegment(rightId).overrides;
+    if (ro.handMarkings) {
+      const own = (a: MarkingAnchor): MarkingAnchor => ({ ...a, segmentId: rightId });
+      ro.handMarkings = ro.handMarkings.map((m) => (m.kind === 'line' ? { ...m, from: own(m.from), to: own(m.to) } : { ...m, anchors: m.anchors.map(own) }));
+    }
+    if (ro.markingPoints) ro.markingPoints = ro.markingPoints.map((p) => ({ ...p, segmentId: rightId }));
     this.renameInControl(farNode, id, rightId);
 
     seg.b = nodeId;
@@ -949,12 +991,15 @@ export class RoadNetwork {
     const c = node.control;
     renameKey(c.signs, from, to);
     renameKey(c.crosswalks, from, to);
+    renameShapeSegment(c, from, to);
     if (c.markings) {
       const rename = (a: MarkingAnchor): MarkingAnchor => (a.segmentId === from ? { ...a, segmentId: to } : a);
       c.markings = c.markings.map((m) =>
         m.kind === 'line' ? { ...m, from: rename(m.from), to: rename(m.to) } : { ...m, anchors: m.anchors.map(rename) },
       );
     }
+    if (c.markingPoints) c.markingPoints = c.markingPoints.map((p) => (p.segmentId === from ? { ...p, segmentId: to } : p));
+    if (c.autoOff) c.autoOff = c.autoOff.map((r) => renameAutoRef(r, from, to));
     if (c.laneLinks) {
       c.laneLinks = c.laneLinks.map((l) => ({
         from: renameLaneRef(l.from, from, to),
@@ -974,10 +1019,19 @@ export class RoadNetwork {
     const c = node.control;
     delete c.signs[id];
     delete c.crosswalks[id];
+    stripShapeSegment(c, id);
     if (c.markings) {
       c.markings = c.markings.filter((m) =>
         (m.kind === 'line' ? [m.from, m.to] : m.anchors).every((a) => a.segmentId !== id),
       );
+    }
+    if (c.markingPoints) {
+      c.markingPoints = c.markingPoints.filter((p) => p.segmentId !== id);
+      if (!c.markingPoints.length) delete c.markingPoints;
+    }
+    if (c.autoOff) {
+      c.autoOff = c.autoOff.filter((r) => !autoRefSegments(r).includes(id));
+      if (!c.autoOff.length) delete c.autoOff;
     }
     if (c.laneLinks) {
       const prefix = `${id}:`;
@@ -1059,6 +1113,90 @@ export class RoadNetwork {
   }
 
   // -------------------------------------------------------------------------
+  // Quay walls
+  // -------------------------------------------------------------------------
+
+  get quays(): readonly Quay[] {
+    return this.p.quays ?? [];
+  }
+
+  /** Roads over the land a quay holds up stand on new ground, so they rebuild. */
+  private touchRoadsByQuay(q: Pick<Quay, 'bank' | 'x0' | 'x1'>): void {
+    let minX = Infinity;
+    let minZ = Infinity;
+    let maxX = -Infinity;
+    let maxZ = -Infinity;
+    for (const p of quaySamples(q, 8)) {
+      minX = Math.min(minX, p.x);
+      minZ = Math.min(minZ, p.z);
+      maxX = Math.max(maxX, p.x);
+      maxZ = Math.max(maxZ, p.z);
+    }
+    const pad = 24;
+    for (const id of this.segmentsInRegion({ minX: minX - pad, minZ: minZ - pad, maxX: maxX + pad, maxZ: maxZ + pad }, true)) {
+      this.touchSeg(id);
+    }
+  }
+
+  /** Build a quay wall along the river bank. See core/quays.ts. */
+  addQuay(init: Omit<Quay, 'id'>): Id {
+    if (!(init.x1 > init.x0)) throw new NetworkError('A quay needs two different ends');
+    return this.batch(() => {
+      const id = this.p.nextId++;
+      this.p.quays = [...(this.p.quays ?? []), { ...structuredClone(init), id }];
+      this.touchRoadsByQuay(init);
+      this.evtQuays = true;
+      this.markEdit();
+      return id;
+    });
+  }
+
+  updateQuay(id: Id, patch: Partial<Omit<Quay, 'id'>>): void {
+    const quays = this.p.quays ?? [];
+    const i = quays.findIndex((q) => q.id === id);
+    if (i < 0) throw new NetworkError(`No quay ${id}`);
+    this.batch(() => {
+      this.touchRoadsByQuay(quays[i]);
+      quays[i] = { ...quays[i], ...structuredClone(patch), id };
+      this.touchRoadsByQuay(quays[i]);
+      this.evtQuays = true;
+      this.markEdit();
+    });
+  }
+
+  removeQuay(id: Id): void {
+    const quays = this.p.quays ?? [];
+    if (!quays.some((q) => q.id === id)) throw new NetworkError(`No quay ${id}`);
+    this.batch(() => {
+      const kept = quays.filter((q) => q.id !== id);
+      this.touchRoadsByQuay(quays.find((q) => q.id === id)!);
+      if (kept.length) this.p.quays = kept;
+      else delete this.p.quays;
+      this.evtQuays = true;
+      this.markEdit();
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Landscaping
+  // -------------------------------------------------------------------------
+
+  /**
+   * Store packed landscaping (core/terrainEdit.ts owns the format). Roads in `box`
+   * are touched so everything built on the ground under them rebuilds; their
+   * curves never move. Undefined removes it.
+   */
+  setTerrain(data: TerrainData | undefined, box?: { minX: number; minZ: number; maxX: number; maxZ: number }): void {
+    this.batch(() => {
+      if (data) this.p.terrain = structuredClone(data);
+      else delete this.p.terrain;
+      if (box) for (const id of this.segmentsInRegion(box, true)) this.touchSeg(id);
+      this.evtTerrain = true;
+      this.markEdit();
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Zoned regions
   // -------------------------------------------------------------------------
 
@@ -1128,7 +1266,10 @@ export class RoadNetwork {
     return this.batch(() => {
       const report: ReverseReport = { segmentId: id, changes: [], stranded: [], looksTheSame: isSymmetricRoad(this.roadTypeOf(id), seg.overrides) };
       const ends = [seg.a, seg.b];
-      for (const nodeId of ends) mirrorMarkings(this.requireNode(nodeId), id, boundaryOffsets(this.roadTypeOf(id), seg.overrides).length);
+      const count = boundaryOffsets(this.roadTypeOf(id), seg.overrides).length;
+      const lanesNow = effectiveLanes(this.roadTypeOf(id), seg.overrides);
+      for (const nodeId of ends) mirrorMarkings(this.requireNode(nodeId), id, count, lanesNow);
+      mirrorSegmentMarkings(seg.overrides, id, count);
       const links = ends.map((nodeId) => mirrorLaneLinks(this, nodeId, id));
 
       [seg.a, seg.b] = [seg.b, seg.a];
@@ -1141,6 +1282,9 @@ export class RoadNetwork {
         if (attachB) seg.overrides.attachA = { ...attachB, hostSide: attachB.hostSide === 1 ? -1 : 1 };
         if (attachA) seg.overrides.attachB = { ...attachA, hostSide: attachA.hostSide === 1 ? -1 : 1 };
       }
+      // Walls and barriers stay on the same side in the world, so they swap sides of the road.
+      if (seg.overrides.structure) seg.overrides.structure = mirrorStructure(seg.overrides.structure);
+      if (seg.overrides.barriers) seg.overrides.barriers = mirrorBarriers(seg.overrides.barriers);
       this.touchSeg(id);
       for (const nodeId of ends) this.touchNode(nodeId);
       this.graphTopologyChanged = true;
@@ -1155,6 +1299,9 @@ export class RoadNetwork {
       for (const st of this.p.rail?.stations ?? []) {
         if (st.segmentId !== id) continue;
         st.t = flipT(st.t);
+        // Left and right are seen from a to b, so they swap with the ends.
+        if (st.layout) st.layout = mirrorSide(st.layout);
+        if (st.building) st.building = mirrorSide(st.building);
         this.evtRail = true;
       }
       for (const d of this.p.decals) {
@@ -1287,6 +1434,25 @@ export class RoadNetwork {
    * Merge fields into a node's junction control. Setting `laneLinks` replaces the
    * automatic connectors there; set it to null to go back to automatic.
    */
+  /**
+   * Set or clear (null) a junction's hand-edited shape. Trims, outline and
+   * connectors follow. Unchecked: junctionShape.applyJunctionShape validates first.
+   */
+  setJunctionShape(id: Id, shape: JunctionShape | null): void {
+    const node = this.requireNode(id);
+    this.batch(() => {
+      const next = normaliseShape(shape);
+      if (next) node.control = { ...node.control, shape: next };
+      else {
+        const { shape: _drop, ...rest } = node.control;
+        node.control = rest;
+      }
+      this.touchNode(id);
+      // Kerbs moved at an arm end show on the road too, even when no trim changes.
+      for (const s of node.segments) this.evtSegs.add(s);
+    });
+  }
+
   setJunctionControl(id: Id, patch: Partial<JunctionControl>): void {
     const node = this.requireNode(id);
     this.batch(() => {
@@ -1347,7 +1513,7 @@ export class RoadNetwork {
     const { node, index } = this.findMarking(nodeId, id);
     this.batch(() => {
       const next = [...node.control.markings!];
-      next[index] = { ...next[index], ...structuredClone(patch), id, kind: next[index].kind } as NodeMarking;
+      next[index] = dropUndefined({ ...next[index], ...structuredClone(patch), id, kind: next[index].kind }) as NodeMarking;
       node.control.markings = next;
       this.touchNodePaint(nodeId);
     });
@@ -1379,6 +1545,191 @@ export class RoadNetwork {
       else delete node.control.hideAutoMarkings;
       this.touchNodePaint(nodeId);
     });
+  }
+
+  /**
+   * Take one automatic marking away (`on` false) or bring it back. Arrows and stop
+   * lines are painted with the road, so its ends repaint too.
+   */
+  setAutoMarking(nodeId: Id, ref: AutoMarkingRef, on: boolean): void {
+    const node = this.requireNode(nodeId);
+    for (const s of autoRefSegments(ref)) if (!node.segments.includes(s)) throw new NetworkError(`Segment ${s} is not at node ${nodeId}`);
+    this.batch(() => {
+      const list = (node.control.autoOff ?? []).filter((r) => !sameAutoRef(r, ref));
+      if (!on) list.push(structuredClone(ref));
+      if (list.length) node.control.autoOff = list;
+      else delete node.control.autoOff;
+      this.touchNodePaint(nodeId);
+      for (const s of node.segments) this.evtSegs.add(s);
+    });
+  }
+
+  /** Bring back every automatic marking taken away at a node, crosswalks too. */
+  restoreAutoMarkings(nodeId: Id): void {
+    const node = this.requireNode(nodeId);
+    this.batch(() => {
+      delete node.control.autoOff;
+      for (const [seg, style] of Object.entries(node.control.crosswalks)) if (style === 'none') delete node.control.crosswalks[Number(seg)];
+      delete node.control.hideAutoMarkings;
+      this.touchNode(nodeId);
+      for (const s of node.segments) this.evtSegs.add(s);
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Markings along a segment, and either kind through one interface
+  // -------------------------------------------------------------------------
+
+  /** New ids for a copied list, with parts that name a crossing line following it. */
+  freshMarkingIds(list: readonly NodeMarking[]): NodeMarking[] {
+    const ids = new Map<Id, Id>();
+    for (const m of list) ids.set(m.id, this.p.nextId++);
+    return list.map((m) => {
+      const copy = structuredClone(m);
+      copy.id = ids.get(m.id)!;
+      if (copy.kind === 'line' && copy.rules) {
+        copy.rules = copy.rules.map((r) => ({
+          ...r,
+          from: 'cross' in r.from && ids.has(r.from.cross) ? { cross: ids.get(r.from.cross)! } : r.from,
+          to: 'cross' in r.to && ids.has(r.to.cross) ? { cross: ids.get(r.to.cross)! } : r.to,
+        }));
+      }
+      return copy;
+    });
+  }
+
+  /** The markings of a node or a segment. */
+  markingsOf(host: MarkingHost): readonly NodeMarking[] {
+    if (host.kind === 'node') return this.getNode(host.id)?.control.markings ?? [];
+    return this.getSegment(host.id)?.overrides.handMarkings ?? [];
+  }
+
+  pointsOf(host: MarkingHost): readonly MarkingPointSetting[] {
+    if (host.kind === 'node') return this.getNode(host.id)?.control.markingPoints ?? [];
+    return this.getSegment(host.id)?.overrides.markingPoints ?? [];
+  }
+
+  private touchHost(host: MarkingHost): void {
+    if (host.kind === 'node') this.touchNodePaint(host.id);
+    else {
+      this.evtSegs.add(host.id);
+      this.markEdit();
+    }
+  }
+
+  private writeHost(host: MarkingHost, markings: NodeMarking[] | undefined, points?: MarkingPointSetting[]): void {
+    if (host.kind === 'node') {
+      const c = this.requireNode(host.id).control;
+      if (markings) {
+        if (markings.length) c.markings = markings;
+        else delete c.markings;
+      }
+      if (points) {
+        if (points.length) c.markingPoints = points;
+        else delete c.markingPoints;
+      }
+    } else {
+      const o = this.requireSegment(host.id).overrides;
+      if (markings) {
+        if (markings.length) o.handMarkings = markings;
+        else delete o.handMarkings;
+      }
+      if (points) {
+        if (points.length) o.markingPoints = points;
+        else delete o.markingPoints;
+      }
+    }
+    this.touchHost(host);
+  }
+
+  private checkHostAnchors(host: MarkingHost, anchors: readonly MarkingAnchor[]): void {
+    if (host.kind === 'node') {
+      const node = this.requireNode(host.id);
+      for (const a of anchors) if (!node.segments.includes(a.segmentId)) throw new NetworkError(`Segment ${a.segmentId} is not at node ${host.id}`);
+    } else {
+      this.requireSegment(host.id);
+      for (const a of anchors) {
+        if (a.segmentId !== host.id || (a.end !== 'a' && a.end !== 'b')) throw new NetworkError(`Anchor is not on an end of segment ${host.id}`);
+      }
+    }
+  }
+
+  addMarking(host: MarkingHost, init: NodeMarkingInit): Id {
+    if (host.kind === 'node') return this.addNodeMarking(host.id, init);
+    this.checkHostAnchors(host, init.kind === 'line' ? [init.from, init.to] : init.anchors);
+    return this.batch(() => {
+      const id = this.p.nextId++;
+      this.writeHost(host, [...this.markingsOf(host), { ...structuredClone(init), id } as NodeMarking]);
+      return id;
+    });
+  }
+
+  updateMarking(
+    host: MarkingHost,
+    id: Id,
+    patch: Partial<Omit<NodeLineMarking, 'id' | 'kind'>> | Partial<Omit<NodeFillerMarking, 'id' | 'kind'>>,
+  ): void {
+    if (host.kind === 'node') {
+      this.updateNodeMarking(host.id, id, patch);
+      return;
+    }
+    const list = this.markingsOf(host);
+    const index = list.findIndex((m) => m.id === id);
+    if (index < 0) throw new NetworkError(`No marking ${id} on segment ${host.id}`);
+    const p = patch as Partial<NodeLineMarking>;
+    const anchors = [p.from, p.to, ...((patch as Partial<NodeFillerMarking>).anchors ?? [])].filter((a): a is MarkingAnchor => !!a);
+    this.checkHostAnchors(host, anchors);
+    this.batch(() => {
+      const next = [...list];
+      next[index] = dropUndefined({ ...next[index], ...structuredClone(patch), id, kind: next[index].kind }) as NodeMarking;
+      this.writeHost(host, next);
+    });
+  }
+
+  removeMarking(host: MarkingHost, id: Id): void {
+    if (host.kind === 'node') {
+      this.removeNodeMarking(host.id, id);
+      return;
+    }
+    const list = this.markingsOf(host);
+    if (!list.some((m) => m.id === id)) throw new NetworkError(`No marking ${id} on segment ${host.id}`);
+    this.batch(() => this.writeHost(host, list.filter((m) => m.id !== id)));
+  }
+
+  /** Replace all markings of a node or segment, and optionally its point settings, in one go. */
+  setMarkings(host: MarkingHost, markings: readonly NodeMarking[], points?: readonly MarkingPointSetting[]): void {
+    const anchors = markings.flatMap((m) => (m.kind === 'line' ? [m.from, m.to] : m.anchors));
+    this.checkHostAnchors(host, anchors);
+    this.batch(() => this.writeHost(host, structuredClone([...markings]), points ? structuredClone([...points]) : undefined));
+  }
+
+  /** Change one point's offset, side or switch. A setting with nothing left in it is dropped. */
+  setMarkingPoint(host: MarkingHost, setting: MarkingPointSetting): void {
+    this.checkHostAnchors(host, [{ segmentId: setting.segmentId, boundary: setting.boundary, ...(setting.end ? { end: setting.end } : {}) }]);
+    this.batch(() => {
+      const same = (p: MarkingPointSetting) => p.segmentId === setting.segmentId && p.boundary === setting.boundary && p.end === setting.end;
+      const list = this.pointsOf(host).filter((p) => !same(p));
+      const clean = dropUndefined({ ...structuredClone(setting) }) as MarkingPointSetting;
+      if (!clean.offset) delete clean.offset;
+      if (clean.offset !== undefined || clean.place || clean.off) list.push(clean);
+      this.writeHost(host, undefined, list);
+    });
+  }
+
+  /** Keep a preset or template in the map, so it travels with it. Same id replaces. */
+  saveToLibrary(item: { preset: MarkingPreset } | { template: MarkingTemplate }): void {
+    this.batch(() => {
+      const lib: MarkingLibrary = structuredClone(this.p.markingLibrary ?? {});
+      if ('preset' in item) lib.presets = [...(lib.presets ?? []).filter((p) => p.id !== item.preset.id), structuredClone(item.preset)];
+      else lib.templates = [...(lib.templates ?? []).filter((t) => t.id !== item.template.id), structuredClone(item.template)];
+      this.p.markingLibrary = lib;
+      this.evtSettings = true;
+      this.markEdit();
+    });
+  }
+
+  get markingLibrary(): Readonly<MarkingLibrary> {
+    return this.p.markingLibrary ?? {};
   }
 
   // -------------------------------------------------------------------------
@@ -1443,7 +1794,8 @@ export class RoadNetwork {
    * 0.5 m of a node in `ignoreAt` is left out when the existing road is attached
    * to that node, since that is just where the curve joins it.
    */
-  findCrossings(cubic: Cubic, ignoreAt: readonly Id[] = []): CrossingInfo[] {
+  findCrossings(cubic: Cubic, ignoreAt: readonly Id[] = [], roadType?: string): CrossingInfo[] {
+    const draftDef = roadType ? this.roadType(roadType) : undefined;
     const out: CrossingInfo[] = [];
     const xs = [cubic.p0.x, cubic.p1.x, cubic.p2.x, cubic.p3.x];
     const zs = [cubic.p0.z, cubic.p1.z, cubic.p2.z, cubic.p3.z];
@@ -1465,6 +1817,7 @@ export class RoadNetwork {
         if (attached) continue;
         const onSeg = cubicPoint(this.cubicOf(id), hit.tb);
         const clearance = Math.abs(hit.point.y - onSeg.y);
+        const required = draftDef ? crossingClearance(this, draftDef, hit.point.y, id, onSeg.y) : GRADE_CLEARANCE;
         out.push({
           segmentId: id,
           t: hit.ta,
@@ -1472,7 +1825,9 @@ export class RoadNetwork {
           point: { x: onSeg.x, y: onSeg.y, z: onSeg.z },
           clearance,
           // The tolerance keeps a crossing at exactly the limit on the separated side.
-          atGrade: clearance < GRADE_CLEARANCE - 1e-6,
+          atGrade: clearance < required - 1e-6,
+          required,
+          ...(this.roadTypeOf(id).category === 'rail' ? { overRail: true } : {}),
         });
       }
     }
@@ -1510,7 +1865,7 @@ export class RoadNetwork {
         b: to.t === 1 && to.node === endNode ? endAttach : undefined,
       });
 
-      const hits = this.findCrossings(cubic, [startNode, endNode]).filter((h) => h.atGrade);
+      const hits = this.findCrossings(cubic, [startNode, endNode], roadType).filter((h) => h.atGrade);
       const stops = this.cutCrossedSegments(hits);
 
       // Assemble the chain of nodes along the new road.
@@ -1781,14 +2136,15 @@ export class RoadNetwork {
 
     const anchorNodes = [draft.start, draft.end].flatMap((a) => (a.kind === 'node' ? [a.id] : []));
     const anchorSegs = [draft.start, draft.end].flatMap((a) => (a.kind === 'segment' ? [a.id] : []));
-    for (const hit of this.findCrossings(cubic, anchorNodes)) {
+    for (const hit of this.findCrossings(cubic, anchorNodes, draft.roadType)) {
       const nearEnd = Math.min(hit.t, 1 - hit.t) * L < 0.5;
       if (anchorSegs.includes(hit.segmentId) && nearEnd) continue;
       if (hit.atGrade && hit.clearance > LEVEL_TOLERANCE) {
+        const what = hit.overRail ? 'track' : 'a road';
         issues.push({
           code: 'insufficientClearance',
           severity: 'error',
-          message: `Only ${hit.clearance.toFixed(1)} m clearance over a road, ${GRADE_CLEARANCE} m is needed.`,
+          message: `Only ${hit.clearance.toFixed(1)} m clearance ${hit.point.y < cubicPoint(cubic, hit.t).y ? 'over' : 'under'} ${what}, ${hit.required} m is needed.`,
           at: hit.point,
         });
       }
@@ -1821,7 +2177,10 @@ export class RoadNetwork {
       }
       if (!host || !hostDir) continue;
       const pos = leaving ? cubic.p0 : cubic.p3;
-      out.push(...rampEndIssues(def, cubic, { hostDef: this.requireRoadType(host.roadType), hostDir, pos, leaving }));
+      for (const issue of rampEndIssues(def, cubic, { hostDef: this.requireRoadType(host.roadType), hostDir, pos, leaving })) {
+        // Both ends joining a highway at grade is one piece of advice, not two.
+        if (!out.some((o) => o.message === issue.message)) out.push(issue);
+      }
     }
     return out;
   }
@@ -1868,7 +2227,7 @@ export class RoadNetwork {
         const otherTangent = cubicTangentXZ(other, hit.t);
         const angle = Math.acos(clamp(Math.abs(dotXZ(tangent, otherTangent)), 0, 1));
         if (angle > PARALLEL_ANGLE) continue;
-        if (Math.abs(hit.point.y - p.y) >= GRADE_CLEARANCE) continue;
+        if (Math.abs(hit.point.y - p.y) >= crossingClearance(this, def, p.y, id, hit.point.y)) continue;
         // Roads leaving a shared node are side by side for a while by design.
         const sharesNode = [seg.a, seg.b].find((n) => ownNodes.has(n));
         if (sharesNode !== undefined && distXZ(this.requireNode(sharesNode).pos, p) < PARALLEL_GRACE) continue;
@@ -2087,6 +2446,8 @@ export class RoadNetwork {
     if (!st) throw new NetworkError(`No station ${id}`);
     this.batch(() => {
       Object.assign(st, patch);
+      // Setting a field to undefined clears it, so old-shaped stations stay old-shaped.
+      for (const key of Object.keys(st) as (keyof RailStation)[]) if (st[key] === undefined) delete st[key];
       this.evtRail = true;
       this.markEdit();
     });
@@ -2179,6 +2540,13 @@ function pct(grade: number): string {
 function renameLaneRef(ref: string, from: Id, to: Id): string {
   const [seg, lane] = ref.split(':');
   return Number(seg) === from ? `${to}:${lane}` : ref;
+}
+
+/** A copy without keys whose value is undefined, so clearing a field leaves no trace. */
+function dropUndefined<T extends object>(o: T): T {
+  const out = { ...o } as Record<string, unknown>;
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+  return out as T;
 }
 
 function tToLength(curve: SegmentCurve, t: number): number {

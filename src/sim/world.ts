@@ -59,6 +59,8 @@ export interface World {
   rng: Rng;
   /** 1 for lanes closed from outside, as by a level crossing. */
   blocked: Uint8Array;
+  /** Metres short of a road lane's end to stop, as before a crosswalk. See SimApi.setStopBack. */
+  stopBack?: Float32Array;
   tick: number;
   time: number;
   counters: Counters;

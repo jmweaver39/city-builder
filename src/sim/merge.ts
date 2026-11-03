@@ -3,15 +3,15 @@
  * in one total order, and each follows the one before it, projected from the other
  * feeder. A total order has no cycles, which is why zipper merges cannot deadlock.
  *
- * Free-flowing merges order by time to the merge point. Inside a controlled junction
- * that would fight the rule that crossings go in order of entry: a car waiting at a
+ * Vehicles still approaching order by time to the merge point. Once inside, that would
+ * fight the rule that crossings go in order of entry: a car waiting at a
  * crossing for one that entered earlier could be the leader of that very car here,
- * by way of a third, and all three would sit still with an empty road ahead. So there
+ * by way of a third, and all three would sit still with an empty road ahead. So inside
  * the order is entry order too, except that a vehicle already past the merge point
  * goes first, because its body is physically in the way.
  */
 import { ENTRY_REAL, ENTRY_REAR } from './buckets';
-import { FREE_MERGE_HORIZON, MAX_DECEL } from './constants';
+import { DT, FREE_MERGE_HORIZON, LONG_BODY, MAX_DECEL } from './constants';
 import { CTL_NONE } from './junctions';
 import { nextOf } from './pathing';
 import type { World } from './world';
@@ -30,9 +30,12 @@ const listHold = new Float64Array(MAX_LIST);
  * too low a floor, a stopped queue loses to every moving car on the other feeder.
  */
 const ORDER_SPEED_FLOOR = 12;
-/** Sort keys for controlled merges, so the three classes never mix. */
+/** Sort key of vehicles past the merge point, ahead of everything keyed by entry step. */
 const PAST_BASE = -1e9;
+/** Sort key base for permit holders, after everyone inside. */
 const HOLDER_BASE = 1e9;
+/** Extra room behind a long leader at a merge, metres. */
+const LONG_LEADER_MARGIN = 5;
 
 function etaOf(d: number, v: number): number {
   return d / (v > ORDER_SPEED_FLOOR ? v : ORDER_SPEED_FLOOR);
@@ -63,7 +66,9 @@ export function mergePass(w: World): void {
         listD[count] = d;
         listEta[count] = eta;
         // Past the merge point the body is in the way, whatever else: distance decides.
-        listKey[count] = d <= zone ? PAST_BASE + d : free ? eta : enterTick[u];
+        // Inside, entry order decides, free merge or not, so that it agrees with the
+        // guard; anything else lets two vehicles each defer to the other.
+        listKey[count] = d <= zone ? PAST_BASE + d : enterTick[u];
         listHold[count] = d - zone;
         listF[count++] = k;
       }
@@ -81,17 +86,24 @@ export function mergePass(w: World): void {
           listV[count] = u;
           listD[count] = d;
           listEta[count] = eta;
-          listKey[count] = eta;
+          // When it will be inside: the same scale as entry steps of those already in,
+          // so the order does not flip at the moment someone crosses the line.
+          listKey[count] = tick + etaOf(toEnd, speed[u]) / DT;
           listHold[count] = d - zone;
           listF[count++] = k;
         }
       } else {
         for (let u = jn.claimHead[c]; u >= 0 && count < MAX_LIST; u = veh.claimNext[u]) {
+          // A waiting claim is not coming in yet, so it leads nobody into the merge.
+          if (veh.claimWait[u]) continue;
           const d = permitDist[u] + laneLen[c];
           const eta = etaOf(d, speed[u]);
           listV[count] = u;
           listD[count] = d;
           listEta[count] = eta;
+          // Cleared at a controlled junction: after everyone inside. The permit check has
+          // already ordered these against each other, and ranking them by predicted entry
+          // instead locks a busy roundabout.
           listKey[count] = HOLDER_BASE + eta;
           listHold[count] = d - zone;
           listF[count++] = k;
@@ -130,20 +142,23 @@ export function mergePass(w: World): void {
       // A tail is listed only to lead; it never follows anything.
       if (veh.lane[u] !== prevList[listF[a]] && veh.permit[u] !== prevList[listF[a]] && listD[a] < 0) continue;
       const lead = listV[a - 1];
-      const spatial = listD[a] - listD[a - 1] - len[lead];
-      const timed = (listEta[a] - listEta[a - 1]) * (speed[u] > ORDER_SPEED_FLOOR ? speed[u] : ORDER_SPEED_FLOOR) - len[lead];
+      // A long leader's tail cuts inwards across the converging paths: keep further back.
+      const extra = len[lead] >= LONG_BODY ? LONG_LEADER_MARGIN : 0;
+      const spatial = listD[a] - listD[a - 1] - len[lead] - extra;
+      const timed = (listEta[a] - listEta[a - 1]) * (speed[u] > ORDER_SPEED_FLOOR ? speed[u] : ORDER_SPEED_FLOOR) - len[lead] - extra;
       let gap = spatial > timed ? spatial : timed;
       // A follower level with its leader may come up to its own merge point, rather than
       // braking for a body it is not yet near, but only as far as the leader's tail has
       // passed the leader's merge point. Otherwise it arrives beside that tail.
-      const leaderTail = listHold[a - 1] + len[lead];
+      const leaderTail = listHold[a - 1] + len[lead] + extra;
       const hold = listHold[a] - (leaderTail > 0 ? leaderTail : 0) - 1;
       if (hold > gap) gap = hold;
       if (vlTick[u] !== tick || gap < vlGap[u]) {
         vlTick[u] = tick;
         vlGap[u] = gap;
         vlV[u] = speed[lead];
-        vlFloor[u] = listD[a] < 20 || hold < 25 ? -MAX_DECEL : -3.5;
+        // Gentle while there is room; as hard as it takes once the gap is nearly gone.
+        vlFloor[u] = listD[a] < 20 || hold < 25 || gap < 10 ? -MAX_DECEL : -3.5;
       }
     }
   }

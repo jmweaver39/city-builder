@@ -29,9 +29,9 @@ const PRESETS: { value: SignalPreset; label: string; tip: string }[] = [
 
 const DIAGRAM_SIZE = 240;
 const STATE_STYLE = {
-  red: { color: '#ff6b6b', width: 1.5, dash: [3, 4] },
-  permissive: { color: '#ffc857', width: 2.2, dash: [7, 4] },
-  protected: { color: '#58e6a9', width: 2.8, dash: [] as number[] },
+  red: { color: '#f06257', width: 1.5, dash: [3, 4] },
+  permissive: { color: '#f2b53a', width: 2.2, dash: [7, 4] },
+  protected: { color: '#4cd28c', width: 2.8, dash: [] as number[] },
 };
 
 const STAGE_NAMES: Record<string, string> = { green: 'green', yellow: 'yellow', allRed: 'all red' };
@@ -361,7 +361,7 @@ export class JunctionEditor {
     if (!canvas || !ctx || !d || !plan) return;
     const phase = plan.phases[this.phaseIndex];
     ctx.clearRect(0, 0, d.size, d.size);
-    ctx.strokeStyle = '#2c3a50';
+    ctx.strokeStyle = '#3a5574';
     ctx.lineCap = 'butt';
     for (const arm of d.arms) {
       ctx.lineWidth = arm.half * 2;
@@ -370,7 +370,7 @@ export class JunctionEditor {
       ctx.lineTo(arm.tip.x, arm.tip.y);
       ctx.stroke();
     }
-    ctx.fillStyle = '#2c3a50';
+    ctx.fillStyle = '#3a5574';
     ctx.beginPath();
     ctx.arc(d.centre.x, d.centre.y, Math.max(...d.arms.map((a) => a.half)), 0, Math.PI * 2);
     ctx.fill();

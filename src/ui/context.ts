@@ -26,6 +26,8 @@ export interface RailUi {
 export interface UiContext {
   /** Present when the app runs trains. */
   rail?: RailUi;
+  /** Pedestrians near the camera (src/peds), when street life runs. */
+  peds?: { readonly count: number; readonly counts: { crossed: number; held: number } };
   net: RoadNetwork;
   sim: SimApi;
   renderer: RendererApi;

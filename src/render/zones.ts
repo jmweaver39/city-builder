@@ -4,7 +4,7 @@
  */
 import * as THREE from 'three';
 import type { RoadNetwork } from '../core/RoadNetwork';
-import { terrainHeight } from '../core/terrain';
+import { surfaceLevel } from '../core/terrain';
 import type { ZoneKind } from '../core/types';
 import { ZONE_STEP, zoneCoverage } from '../core/zones';
 import type { ZoneGhost } from './api';
@@ -63,7 +63,7 @@ export class ZoneLayer {
       const c = new THREE.Color(TINT[z.kind]);
       if (!z.enabled) c.multiplyScalar(0.5);
       for (const cell of zoneCoverage(this.net, z.id).cells) {
-        const y = Math.max(terrainHeight(cell.x, cell.z), 0) + LIFT;
+        const y = surfaceLevel(cell.x, cell.z) + LIFT;
         const corners = [
           [cell.x - h, cell.z - h],
           [cell.x + h, cell.z - h],
@@ -103,7 +103,7 @@ export class ZoneLayer {
       for (const face of THREE.ShapeUtils.triangulateShape(contour, [])) {
         for (const i of face) {
           const p = g.points[i];
-          pos.push(p.x, Math.max(terrainHeight(p.x, p.z), 0) + LIFT + 0.05, p.z);
+          pos.push(p.x, surfaceLevel(p.x, p.z) + LIFT + 0.05, p.z);
           col.push(c.r, c.g, c.b);
         }
       }

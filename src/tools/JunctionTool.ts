@@ -4,10 +4,10 @@
  * a street. Hovering shows a ghost of the result. With 'inspect' (the Advanced
  * card), a click opens the junction's detailed editor instead.
  */
-import { applyControl, armTargetFromRoad, CONTROL_CARDS, controlCard, controlGhost, planControl, type ControlPlan, type ControlTarget } from './junctionControl';
+import { applyControl, armTargetFromRoad, controlCard, controlGhost, planControl, type ControlPlan, type ControlTarget } from './junctionControl';
 import { castRay, chooseHit, isJunctionNode, metresPerPixel, pickNode, pickRoad } from './pick';
 import { Tool } from './Tool';
-import { COLORS, type ToolId, type ToolKey, type ToolPointer } from './types';
+import { COLORS, type ToolId, type ToolPointer } from './types';
 import type { Id } from '../core/types';
 import type { NetworkChange } from '../core/RoadNetwork';
 
@@ -136,17 +136,6 @@ export class JunctionTool extends Tool {
     this.ctx.view.setHighlight(null);
     this.ctx.inspect({ kind: 'junction', id });
     this.show();
-  }
-
-  /** Pick a card by its hotkey. */
-  keyDown(e: ToolKey): boolean {
-    if (e.ctrl || e.alt) return false;
-    const card = CONTROL_CARDS.find((c) => c.key.toLowerCase() === e.key.toLowerCase());
-    if (!card) return false;
-    this.ctx.settings.junctionControl = card.kind;
-    this.settingsChanged();
-    this.ctx.changed();
-    return true;
   }
 
   settingsChanged(): void {

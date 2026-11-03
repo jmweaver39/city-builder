@@ -10,6 +10,7 @@ import type { ToolMark } from '../render/api';
 import { segmentOverlapIssues } from '../core/overlap';
 import { pickNode, pickRoad } from './pick';
 import { Tool } from './Tool';
+import { MOD_KEY } from './platform';
 import { COLORS, type ToolId, type ToolKey, type ToolPointer } from './types';
 
 /** Screen distance that catches a handle. */
@@ -87,7 +88,7 @@ export class MoveTool extends Tool {
         tone: 'ok',
       });
     } else if (this.hoverHandle) {
-      this.ctx.setHud({ x: e.x, y: e.y, lines: ['Curve handle'], notes: ['Drag to bend. Ctrl leaves the joint unsmoothed'], tone: 'ok' });
+      this.ctx.setHud({ x: e.x, y: e.y, lines: ['Curve handle'], notes: [`Drag to bend. ${MOD_KEY} leaves the joint unsmoothed`], tone: 'ok' });
     } else {
       this.ctx.setHud({ x: e.x, y: e.y, lines: ['Move'], notes: seg ? [] : ['Hover a road or node'], tone: 'ok' });
     }
@@ -220,6 +221,10 @@ export class MoveTool extends Tool {
         return;
       }
     }
+  }
+
+  usesElevationKeys(): boolean {
+    return true;
   }
 
   keyDown(e: ToolKey): boolean {

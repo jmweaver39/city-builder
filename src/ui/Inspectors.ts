@@ -1,6 +1,8 @@
 /** Floating inspectors for segments, junctions, endpoints and vehicles. */
 import type { Id, LaneKind, LineStyle, MarkingStyle, PaintColor, SegmentOverrides, TrafficEndpoint, ZoneRegion } from '../core/types';
 import { BUILTIN_ROAD_TYPES, effectiveLanes, effectiveMarkings, effectiveSpeedKmh, laneSpeedKmh } from '../core/roadTypes';
+import { isStraightCubic } from '../core/bezier';
+import { smoothSegment } from '../core/curveChain';
 import { connectedRoad, connectedRoadOriented, mirroredLane } from '../tools/roadOps';
 import { reverseMessages, reverseRoads, strandedMarks } from '../tools/ReverseTool';
 import { syncZoneAccess, ZONE_NAMES, zoneStats } from '../tools/zoneOps';
@@ -9,9 +11,14 @@ import type { InspectTarget } from '../tools/types';
 import type { UiContext } from './context';
 import { checkbox, clear, el, numberInput, row, selectInput, sliderInput, textInput, visualSelect, type VisualOption } from './dom';
 import { JunctionEditor } from './JunctionEditor';
+import { structureSection } from './WallControls';
 import { NodeMarkingPanel } from './NodeMarkingPanel';
+import { JunctionShapePanel } from './JunctionShapePanel';
 import { Panel } from './Panel';
-import { StationInspector, TrainInspector } from './RailPanels';
+import { roadThumbnail } from './roadThumbs3d';
+import { CONTROL_ART } from './cardArt';
+import { effectiveControl } from '../core/signals';
+import { RailSegmentInspector, StationInspector, TrainInspector } from './RailPanels';
 import { colorArt, crosswalkArt, lineStyleArt, surfaceArt } from './thumbnails';
 
 const LINE_LABELS: Record<LineStyle, string> = {
@@ -269,6 +276,7 @@ class SegmentInspector extends Inspector {
       );
     });
     body.append(el('div', { class: 'section-title', text: 'Lanes: use and speed' }), laneRows);
+    body.append(structureSection(this.ui, this.id, () => this.whole, () => this.render()));
 
     const reverse = el('button', {
       class: 'btn',
@@ -312,7 +320,26 @@ class SegmentInspector extends Inspector {
     if (geom && Number.isFinite(geom.minRadius)) add('Tightest radius', `${geom.minRadius.toFixed(0)} m`);
     this.liveTraffic = el('dd', { text: '' });
     details.append(el('dt', { text: 'Traffic' }), this.liveTraffic);
-    body.append(el('div', { class: 'section-title', text: 'Details' }), details, el('div', { class: 'btn-row', style: { marginTop: '8px' } }, reverse, reset));
+    // Refit a lopsided curve as tangent, spirals and arc, keeping its ends (core/curveChain.ts).
+    const smooth = isStraightCubic(net.cubicOf(this.id), 0.05)
+      ? null
+      : el('button', {
+          class: 'btn',
+          text: 'Smooth curve',
+          tip: 'Refit this curve as an even arc eased in and out, keeping its ends and their directions',
+          attrs: { type: 'button' },
+          on: {
+            click: () => {
+              this.ui.history.hint('Smooth curve');
+              const res = smoothSegment(net, this.id);
+              this.ui.toast(res.message, res.changed ? 'info' : res.fit && !res.fit.ok ? 'warning' : 'info');
+              this.render();
+            },
+          },
+        });
+    const buttons = el('div', { class: 'btn-row', style: { marginTop: '8px' } }, reverse, reset);
+    if (smooth) buttons.append(smooth);
+    body.append(el('div', { class: 'section-title', text: 'Details' }), details, buttons);
     this.tick();
   }
 
@@ -555,9 +582,37 @@ class NodeMarkingInspector extends Inspector {
   private readonly content: NodeMarkingPanel;
   private readonly off: () => void;
 
+  constructor(ui: UiContext, private readonly id: Id, private readonly onSegment = false) {
+    super(ui, onSegment ? 'Road markings' : 'Junction markings');
+    this.content = new NodeMarkingPanel(ui, onSegment ? { kind: 'segment', id } : { kind: 'node', id }, this.panel);
+    this.off = ui.tools.onChange(() => this.content.sync());
+  }
+
+  refresh(): boolean {
+    if (this.onSegment ? !this.ui.net.getSegment(this.id) : !this.ui.net.getNode(this.id)) return false;
+    if (!this.editing) this.content.sync();
+    return true;
+  }
+
+  protected dispose(): void {
+    this.off();
+    this.content.dispose();
+  }
+
+  protected closed(): void {
+    this.dispose();
+    if (this.ui.tools.active.id === 'nodeMarkings') this.ui.tools.setTool('select');
+    super.closed();
+  }
+}
+
+class JunctionShapeInspector extends Inspector {
+  private readonly content: JunctionShapePanel;
+  private readonly off: () => void;
+
   constructor(ui: UiContext, private readonly id: Id) {
-    super(ui, 'Node markings');
-    this.content = new NodeMarkingPanel(ui, id, this.panel);
+    super(ui, 'Junction shape');
+    this.content = new JunctionShapePanel(ui, id, this.panel);
     this.off = ui.tools.onChange(() => this.content.sync());
   }
 
@@ -573,7 +628,7 @@ class NodeMarkingInspector extends Inspector {
 
   protected closed(): void {
     this.dispose();
-    if (this.ui.tools.active.id === 'nodeMarkings') this.ui.tools.setTool('select');
+    if (this.ui.tools.active.id === 'junctionShape') this.ui.tools.setTool('select');
     super.closed();
   }
 }
@@ -607,6 +662,26 @@ export class Inspectors {
     ui.net.onChange(() => this.networkChanged());
   }
 
+  /** What is being inspected, for the keymap's selection scope. */
+  get currentKind(): InspectTarget['kind'] | null {
+    return this.current ? (this.target?.kind ?? null) : null;
+  }
+
+  /** Delete the inspected road or endpoint, as one undo step. Returns false when nothing was. */
+  deleteCurrent(): boolean {
+    const t = this.target;
+    const { net, history } = this.ui;
+    if (t?.kind === 'segment' && net.getSegment(t.id)) {
+      history.hint('Delete road');
+      net.removeSegment(t.id);
+    } else if (t?.kind === 'endpoint' && net.endpoints.some((e) => e.id === t.id)) {
+      history.hint('Remove endpoint');
+      net.removeEndpoint(t.id);
+    } else return false;
+    this.open(null);
+    return true;
+  }
+
   open(target: InspectTarget | null): void {
     if (target && this.target && target.kind === this.target.kind && target.id === this.target.id) return;
     this.current?.close();
@@ -615,7 +690,10 @@ export class Inspectors {
     if (!target) return;
     switch (target.kind) {
       case 'segment':
-        this.current = new SegmentInspector(this.ui, target.id);
+        this.current =
+          this.ui.net.getSegment(target.id) && this.ui.net.roadTypeOf(target.id).category === 'rail'
+            ? (new RailSegmentInspector(this.ui, target.id) as unknown as Inspector)
+            : new SegmentInspector(this.ui, target.id);
         break;
       case 'junction':
         this.current = new JunctionInspector(this.ui, target.id);
@@ -635,14 +713,41 @@ export class Inspectors {
       case 'nodeMarkings':
         this.current = new NodeMarkingInspector(this.ui, target.id);
         break;
+      case 'segmentMarkings':
+        this.current = new NodeMarkingInspector(this.ui, target.id, true);
+        break;
+      case 'junctionShape':
+        this.current = new JunctionShapeInspector(this.ui, target.id);
+        break;
       case 'zone':
         this.current = new ZoneInspector(this.ui, target.id);
         break;
     }
+    this.showPicture();
   }
 
   private networkChanged(): void {
     if (this.current && !this.current.refresh()) this.open(null);
+    else this.showPicture();
+  }
+
+  /** The picture at the top of the open inspector: the road itself, or the junction's sign or signal. */
+  private showPicture(): void {
+    const panel = (this.current as unknown as { panel?: Panel } | null)?.panel;
+    const t = this.target;
+    if (!panel || !t) return;
+    const { net } = this.ui;
+    let picture: Node | null = null;
+    if (t.kind === 'segment' && net.getSegment(t.id)) {
+      const url = roadThumbnail(net.roadTypeOf(t.id));
+      if (url) picture = el('img', { attrs: { src: url, alt: '' } });
+    } else if (t.kind === 'junction' && net.nodeGeom(t.id)?.kind === 'junction') {
+      const ctl = effectiveControl(net, t.id);
+      const signs = Object.values(ctl.signs);
+      const art = ctl.kind === 'signal' ? 'signal' : ctl.kind === 'allStop' ? 'allStop' : signs.includes('stop') ? 'stop' : signs.includes('yield') ? 'yield' : ctl.kind === 'priority' ? 'priority' : null;
+      if (art) picture = el('div', { class: 'inspector-sign', html: CONTROL_ART[art] });
+    }
+    panel.setPicture(picture);
   }
 
   tick(): void {

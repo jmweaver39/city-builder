@@ -104,6 +104,9 @@ function resolveEnds(net: RoadNetwork, start: RoadAnchor, end: RoadAnchor): { st
   return { start: s, end: resolve(end) };
 }
 
+/** Smooth curve refuses a refit longer than this many times the road it replaces. */
+const MAX_GROWTH = 1.6;
+
 export interface SmoothResult {
   /** True when the road changed. */
   changed: boolean;
@@ -123,9 +126,28 @@ export function smoothSegment(net: RoadNetwork, id: Id): SmoothResult {
   if (!seg) return { changed: false, segments: [], fit: null, message: 'No such road.' };
   const def = net.roadTypeOf(id);
   const cubic = net.cubicOf(id);
-  const fit = refitCubic(cubic, { minRadius: hardMinRadius(def), comfortRadius: comfortRadius(def) });
+  const opts = { minRadius: hardMinRadius(def), comfortRadius: comfortRadius(def) };
+  let fit = refitCubic(cubic, opts);
+  // With both end directions fixed, spirals make a loop swing wider. Where that costs
+  // a lot of extra road, a plain arc stays closer to what was there.
+  if (fit.kind === 'loop') {
+    const plain = refitCubic(cubic, { ...opts, spirals: false });
+    if (plain.ok && plain.length * 1.15 < fit.length) fit = plain;
+  }
   if (fit.kind === 'straight') return { changed: false, segments: [id], fit, message: 'This road is already straight.' };
   if (!fit.ok) return { changed: false, segments: [id], fit, message: fit.reason ?? 'No smooth curve fits this road.' };
+  // Ends and end directions fixed, an even arc can need far more room than a cramped
+  // cubic took, as when a tight loop is squeezed between close ends. Say so rather than
+  // throwing the road across the map.
+  const before = cubicLength(cubic, 128);
+  if (fit.length > before * MAX_GROWTH) {
+    return {
+      changed: false,
+      segments: [id],
+      fit,
+      message: `Keeping these ends and directions, an even curve would be ${fit.length.toFixed(0)} m long against ${before.toFixed(0)} m now. Redraw it with Freeform for a compact loop.`,
+    };
+  }
   const pieces = fit.cubics;
   // A curve already close to its smooth fit, or whose curvature already runs evenly
   // from end to end as on an arc or a spiral (any piece of a fitted chain), stays.

@@ -5,21 +5,30 @@
  * pick an end. Placing continues from the new end. Right click steps back one
  * stage at a time.
  */
-import type { Cubic } from '../core/bezier';
+import { cubicPoint, type Cubic } from '../core/bezier';
 import type { CrossingInfo, DraftIssue, RoadAnchor } from '../core/RoadNetwork';
-import { addScaled, clamp, distXZ, dotXZ, sub } from '../core/math';
+import { addScaled, clamp, distXZ, dotXZ, normalizeXZ, sub } from '../core/math';
 import { isOneWay } from '../core/roadTypes';
-import { ELEVATION_STEP, MAX_ELEVATION, MIN_ELEVATION } from '../core/terrain';
+import { ELEVATION_STEP, hasTerrainEdits, MAX_ELEVATION, MIN_ELEVATION, surfaceLevel, terrainEditDelta } from '../core/terrain';
+import { followTerrain, pickGround, roadBed } from './terrainFollow';
 import type { Id, RampAttach, Vec3 } from '../core/types';
 import type { RoadPreview, ToolMark } from '../render/api';
-import { buildCubic, endState, formatReadout, readout } from './draft';
+import { buildCubic, endState, formatReadout, readout, usableEndDir } from './draft';
 import { castRay, chooseHit, nodesNearRay, pickRoad } from './pick';
 import { upgradeSegment } from './roadOps';
 import { groundPixelSize, snapGridAt, type GridSettings } from './grid';
+import { parallelDistanceInfo, type GuideContext } from './guides';
 import { formatSpacing } from '../render/gridLevels';
 import { continuationAt, NODE_CATCH, referenceDirection, snapRoadPoint, type SnapHit } from './snap';
 import { attachFor, flipAttach, laneChoiceAt, reverseCubic, travelChevrons, type LaneChoice } from './laneSnap';
+import { drawChain } from '../core/curveChain';
+import type { FitResult } from '../core/curveFit';
+import { chainLines, chainReadout, checkChain, fitDraft, reverseChain } from './curveDraft';
 import { Tool } from './Tool';
+import { MOD_KEY } from './platform';
+import { applyBarriers, applyStructure, barriersFromSettings, drawOverrides, structureFromSettings } from './wallOps';
+import { isEarthwork, mirrorStructure, structureFootprint } from '../core/walls';
+import { BARRIER_KINDS, STRUCTURE_MODES } from '../core/wallTypes';
 import { COLORS, type ToolId, type ToolKey, type ToolPointer, type Tone } from './types';
 
 interface StartPoint {
@@ -35,7 +44,12 @@ interface StartPoint {
 }
 
 export interface DraftState {
+  /** The first piece. A fitted curve has more, in `cubics`. */
   cubic: Cubic;
+  /** Every piece, start to end. Curved and Freeform fit a chain (core/curveFit.ts). */
+  cubics: Cubic[];
+  /** The fitted alignment behind `cubics`, when there is one. */
+  fit?: FitResult | null;
   start: RoadAnchor;
   end: RoadAnchor;
   issues: DraftIssue[];
@@ -46,6 +60,8 @@ export interface DraftState {
   endAttach?: RampAttach;
   /** Drawn against the traffic it joins, so it will be built the other way round. */
   flipped?: boolean;
+  /** Outer edge of an embankment or cut on each side, for the preview. */
+  footprint?: { left: Vec3[]; right: Vec3[] };
 }
 
 export function formatElevation(y: number): string {
@@ -120,7 +136,11 @@ export class RoadTool extends Tool {
     if (this.ctx.settings.drawMode === 'upgrade') {
       this.painting = true;
       this.painted.clear();
-      this.ctx.history.begin('Upgrade road');
+      this.sweepFrom = null;
+      this.sweepDir = null;
+      this.sweepPending = null;
+      const what = this.ctx.settings.walls.upgrade;
+      this.ctx.history.begin(what === 'barriers' ? 'Add sound barriers' : what === 'structure' ? 'Change road structure' : 'Upgrade road');
       this.paintAt(e);
       this.refresh();
       return;
@@ -141,6 +161,9 @@ export class RoadTool extends Tool {
   pointerUp(e: ToolPointer): void {
     if (this.painting) {
       this.painting = false;
+      // A click with no sweep paints what it pressed, the road's own way round.
+      if (this.sweepPending !== null) this.paintWallOn(this.sweepPending);
+      this.sweepPending = null;
       this.painted.clear();
       this.ctx.history.end();
       this.refresh();
@@ -157,6 +180,10 @@ export class RoadTool extends Tool {
     return used;
   }
 
+  usesElevationKeys(): boolean {
+    return this.ctx.settings.drawMode !== 'upgrade';
+  }
+
   keyDown(e: ToolKey): boolean {
     if (e.key === 'PageUp' || e.key === 'PageDown') {
       this.stepElevation(e.key === 'PageUp' ? 1 : -1);
@@ -167,12 +194,22 @@ export class RoadTool extends Tool {
       this.refresh();
       return false;
     }
+    if (e.key === 'Shift') {
+      // Shift locks the current guide direction while held.
+      if (this.pointer) this.pointer = { ...this.pointer, shift: true };
+      this.refresh();
+      return false;
+    }
     return false;
   }
 
   keyUp(e: ToolKey): boolean {
     if (e.key === 'Control' || e.key === 'Meta') {
       if (this.pointer) this.pointer = { ...this.pointer, ctrl: false };
+      this.refresh();
+    }
+    if (e.key === 'Shift') {
+      if (this.pointer) this.pointer = { ...this.pointer, shift: false };
       this.refresh();
     }
     return false;
@@ -189,7 +226,9 @@ export class RoadTool extends Tool {
 
   private snapAt(e: ToolPointer): SnapHit | null {
     const { net, view, settings } = this.ctx;
-    const raw = view.pickPlane(e.x, e.y, settings.elevation);
+    // On landscaped land the elevation is above the ground under the cursor (terrainFollow.ts).
+    const landscaped = hasTerrainEdits();
+    const raw = (landscaped ? pickGround(this.ctx, e, settings.elevation) : null) ?? view.pickPlane(e.x, e.y, settings.elevation);
     if (!raw) return null;
     // Snap candidates come from a ray cast, at the true height of what is under the
     // cursor, so raised roads and junctions snap whatever the elevation setting.
@@ -201,12 +240,12 @@ export class RoadTool extends Tool {
       if (top && top.point.y > near.point.y + 1.5) continue;
       picks.push({ level: near.point.y, pos: near.point });
     }
-    if (!picks.length) picks.push({ level: settings.elevation, pos: raw });
+    if (!picks.length) picks.push({ level: raw.y, pos: raw });
     const start = this.start;
     const ignoreNodes = start?.anchor.kind === 'node' ? [start.anchor.id] : [];
     let ref: Vec3 | null = null;
     if (start) ref = start.dir ?? start.ref;
-    return snapRoadPoint(net, {
+    const hit = snapRoadPoint(net, {
       picks,
       raw,
       from: start ? { pos: start.pos, ref } : null,
@@ -219,7 +258,14 @@ export class RoadTool extends Tool {
       disabled: e.ctrl,
       ignoreNodes,
       ...this.gridQuery(e),
+      guides: this.guideContext(e, start?.anchor ?? null),
     });
+    if (hit && landscaped && hit.anchor.kind === 'free' && terrainEditDelta(hit.pos.x, hit.pos.z) !== 0) {
+      // A free end stands on the landscaped ground where it snapped, not where the cursor ray met it.
+      const pos = { ...hit.pos, y: clamp(roadBed(hit.pos.x, hit.pos.z) + settings.elevation, MIN_ELEVATION, MAX_ELEVATION) };
+      return { ...hit, pos, anchor: { kind: 'free', pos: { ...pos } } };
+    }
+    return hit;
   }
 
   private startFrom(hit: SnapHit): StartPoint {
@@ -252,9 +298,10 @@ export class RoadTool extends Tool {
     this.start = this.startFrom(hit);
     this.control = null;
     // Picking up an elevated road carries on at its height until told otherwise.
-    if (hit.anchor.kind !== 'free' && Math.abs(hit.pos.y) > 1) {
+    const above = hasTerrainEdits() ? hit.pos.y - surfaceLevel(hit.pos.x, hit.pos.z) : hit.pos.y;
+    if (hit.anchor.kind !== 'free' && Math.abs(above) > 1) {
       this.ctx.settings.elevation = clamp(
-        Math.round(hit.pos.y / ELEVATION_STEP) * ELEVATION_STEP,
+        Math.round(above / ELEVATION_STEP) * ELEVATION_STEP,
         MIN_ELEVATION,
         MAX_ELEVATION,
       );
@@ -313,22 +360,72 @@ export class RoadTool extends Tool {
     );
     const startAttach = startLane ? attachFor(startLane, startDir ?? startLane.chosen.travel) : undefined;
     const endAttach = endLane && endDir ? attachFor(endLane, endDir) : undefined;
-    const evaluate = (c: Cubic, a: RoadAnchor, b: RoadAnchor, sa: RampAttach | undefined, ea: RampAttach | undefined, flipped: boolean): DraftState => {
+    // Curved and Freeform fit tangents, spirals and an arc, as a chain of pieces.
+    // A parallel guide gives the exact offset shape (guides.ts).
+    const follow = !ctrl && mode !== 'curved' && !startLane && !endLane ? (hit.guides?.cubic ?? null) : null;
+    const fit =
+      mode === 'straight' || follow
+        ? null
+        : fitDraft(
+            net,
+            {
+              start: start.pos,
+              end: endPos,
+              startDir: mode === 'curved' ? null : startDir,
+              endDir: usableEndDir(start.pos, endPos, endDir) ? endDir : null,
+              startSlope: ctrl ? null : start.slope,
+              endSlope,
+              control: mode === 'curved' ? this.control : null,
+            },
+            settings.roadType,
+          );
+    const plan = follow ? [follow] : fit && fit.cubics.length ? fit.cubics : [cubic];
+    // On landscaped land the road follows the ground within its grade, bridging what it cannot follow.
+    const category = net.roadType(settings.roadType)?.category;
+    const chain = followTerrain(plan, { elevation: settings.elevation, grade: category === 'highway' || category === 'rail' ? 0.06 : 0.09 });
+    const evaluate = (cs: Cubic[], a: RoadAnchor, b: RoadAnchor, sa: RampAttach | undefined, ea: RampAttach | undefined, flipped: boolean): DraftState => {
+      const c = cs[0];
+      if (cs.length > 1 || fit) {
+        const check = checkChain(net, cs, a, b, settings.roadType, sa, ea, fit);
+        return { cubic: c, cubics: cs, fit, start: a, end: b, ...check, startAttach: sa, endAttach: ea, flipped };
+      }
       const params = { start: a, end: b, c1: c.p1, c2: c.p2, roadType: settings.roadType, startAttach: sa, endAttach: ea };
       const issues = net.validateDraft(params);
       const ignore = [a, b].flatMap((x) => (x.kind === 'node' ? [x.id] : []));
-      const crossings = net.findCrossings(c, ignore).filter((x) => !this.isEndHit(x, c, a, b));
+      const crossings = net.findCrossings(c, ignore, settings.roadType).filter((x) => !this.isEndHit(x, c, a, b));
       const state: Tone = issues.some((i) => i.severity === 'error') ? 'error' : issues.length ? 'warning' : 'ok';
-      return { cubic: c, start: a, end: b, issues, crossings, state, startAttach: sa, endAttach: ea, flipped };
+      return { cubic: c, cubics: cs, start: a, end: b, issues, crossings, state, startAttach: sa, endAttach: ea, flipped };
     };
-    const drawn = evaluate(cubic, start.anchor, hit.anchor, startAttach, endAttach, false);
+    const drawn = evaluate(chain, start.anchor, hit.anchor, startAttach, endAttach, false);
     const def = net.roadType(settings.roadType);
     if (def && isOneWay(def) && drawn.issues.some((i) => i.code === 'wrongWay')) {
       // Drawn against the traffic it meets: the same road the other way round may work.
-      const flipped = evaluate(reverseCubic(cubic), hit.anchor, start.anchor, flipAttach(endAttach), flipAttach(startAttach), true);
+      const back = chain.length > 1 ? reverseChain(chain) : [reverseCubic(chain[0])];
+      const flipped = evaluate(back, hit.anchor, start.anchor, flipAttach(endAttach), flipAttach(startAttach), true);
       if (!flipped.issues.some((i) => i.code === 'wrongWay')) return flipped;
     }
     return drawn;
+  }
+
+  /** Embankments and cuts take ground beside the road: check it and outline it. */
+  private withFootprint(draft: DraftState | null): DraftState | null {
+    if (!draft) return draft;
+    const { net, settings } = this.ctx;
+    const spec = structureFromSettings(settings.walls);
+    if (!isEarthwork(spec.mode)) return draft;
+    const ignoreSegments = [draft.start, draft.end].flatMap((a) => (a.kind === 'segment' ? [a.id] : []));
+    const ignoreNodes = [draft.start, draft.end].flatMap((a) => (a.kind === 'node' ? [a.id] : []));
+    const left: Vec3[] = [];
+    const right: Vec3[] = [];
+    const issues = [...draft.issues];
+    for (const cubic of draft.cubics) {
+      const f = structureFootprint(net, { cubic, roadType: settings.roadType, structure: draft.flipped ? mirrorStructure(spec) : spec, ignoreSegments, ignoreNodes });
+      left.push(...f.left);
+      right.push(...f.right);
+      for (const i of f.issues) if (!issues.some((x) => x.code === i.code && x.severity === i.severity)) issues.push(i);
+    }
+    const state: Tone = issues.some((i) => i.severity === 'error') ? 'error' : issues.length ? 'warning' : 'ok';
+    return { ...draft, issues, state, footprint: { left, right } };
   }
 
   private isEndHit(c: CrossingInfo, cubic: Cubic, start: RoadAnchor, end: RoadAnchor): boolean {
@@ -346,14 +443,15 @@ export class RoadTool extends Tool {
       return;
     }
     this.ctx.history.hint('Draw road');
-    const result = net.drawRoad({
+    // A fitted curve is several pieces joined by plain joints, drawn as one step.
+    const result = drawChain(net, {
       start: draft.start,
       end: draft.end,
-      c1: draft.cubic.p1,
-      c2: draft.cubic.p2,
+      cubics: draft.cubics,
       roadType: settings.roadType,
       startAttach: draft.startAttach,
       endAttach: draft.endAttach,
+      overrides: this.drawnOverrides(draft),
     });
     if (draft.flipped) {
       // The far end is where this road begins, so there is nothing to carry on from.
@@ -369,7 +467,7 @@ export class RoadTool extends Tool {
       this.control = null;
       return;
     }
-    const carry = endState(draft.cubic);
+    const carry = endState(draft.cubics[draft.cubics.length - 1]);
     this.start = {
       anchor: { kind: 'node', id: last },
       pos: { ...node.pos },
@@ -380,8 +478,66 @@ export class RoadTool extends Tool {
     this.control = null;
   }
 
+  /** The structure the road panel asks for, sides swapped when the road is built the other way. */
+  private drawnOverrides(draft: DraftState) {
+    const o = drawOverrides(this.ctx.settings.walls);
+    if (o?.structure && draft.flipped) o.structure = mirrorStructure(o.structure);
+    return o;
+  }
+
+  /** Last drag position on the ground, so Upgrade's left and right follow the sweep. */
+  private sweepFrom: Vec3 | null = null;
+
+  /** The segment under the press, held until the sweep shows which way it runs. */
+  private sweepPending: Id | null = null;
+  private sweepDir: Vec3 | null = null;
+
+  /** Upgrade painting structure or barriers: left and right are as swept. */
+  private paintWalls(e: ToolPointer): void {
+    const hit = pickRoad(this.ctx, e);
+    const ground = this.ctx.view.pickPlane(e.x, e.y, hit?.point.y ?? 0);
+    if (ground && this.sweepFrom && distXZ(ground, this.sweepFrom) > 1.5) {
+      this.sweepDir = sub(ground, this.sweepFrom);
+      this.sweepFrom = ground;
+    } else if (ground && !this.sweepFrom) {
+      this.sweepFrom = ground;
+    }
+    if (!this.sweepDir) {
+      // No direction yet: remember what was pressed, and paint it once there is one.
+      if (hit && this.sweepPending === null) this.sweepPending = hit.segmentId;
+      return;
+    }
+    if (this.sweepPending !== null) {
+      this.paintWallOn(this.sweepPending);
+      this.sweepPending = null;
+    }
+    if (hit) this.paintWallOn(hit.segmentId);
+  }
+
+  private paintWallOn(id: Id): void {
+    const { net, settings, toast } = this.ctx;
+    if (!net.getSegment(id) || this.painted.has(id)) return;
+    this.painted.add(id);
+    // Left and right follow the sweep. A click on its own takes the road's own way.
+    let flipped = false;
+    if (this.sweepDir) {
+      const t = net.cubicOf(id);
+      flipped = dotXZ(this.sweepDir, sub(t.p3, t.p0)) < 0;
+    }
+    if (settings.walls.upgrade === 'barriers') {
+      applyBarriers(net, id, barriersFromSettings(settings.walls), flipped);
+    } else {
+      const problem = applyStructure(net, id, structureFromSettings(settings.walls), flipped);
+      if (problem) toast(problem.message, 'error');
+    }
+  }
+
   private paintAt(e: ToolPointer): void {
     const { net, settings } = this.ctx;
+    if (settings.walls.upgrade !== 'road') {
+      this.paintWalls(e);
+      return;
+    }
     const hit = pickRoad(this.ctx, e);
     if (!hit || this.painted.has(hit.segmentId)) return;
     // Upgrade never turns track into road or road into track.
@@ -423,7 +579,7 @@ export class RoadTool extends Tool {
       this.draft = null;
       this.showControl(e);
     } else {
-      this.draft = this.buildDraft(this.hit, e.ctrl);
+      this.draft = this.withFootprint(this.buildDraft(this.hit, e.ctrl));
       this.showDraft(e);
     }
   }
@@ -436,6 +592,7 @@ export class RoadTool extends Tool {
     if (hit.guide) {
       marks.push({ kind: 'line', points: [hit.guide.from, hit.guide.to], color: COLORS.guide, width: 0.4, dashed: true });
     }
+    if (hit.guides) marks.push(...hit.guides.marks);
     return marks;
   }
 
@@ -444,7 +601,7 @@ export class RoadTool extends Tool {
       case 'node':
         return 'Snap: node';
       case 'segment':
-        return 'Snap: on road, splits it';
+        return hit.guides ? `On road: ${hit.guides.label}` : 'Snap: on road, splits it';
       case 'angle':
         return 'Snap: angle guide';
       case 'length':
@@ -455,6 +612,8 @@ export class RoadTool extends Tool {
         return 'Snap: grid point';
       case 'gridLine':
         return 'Snap: grid line';
+      case 'guide':
+        return hit.guides?.label ?? 'Guide';
       default:
         return 'No snap';
     }
@@ -462,8 +621,38 @@ export class RoadTool extends Tool {
 
   private elevationLine(hit: SnapHit | null): string {
     const y = hit ? hit.pos.y : this.ctx.settings.elevation;
-    const elevation = formatElevation(Math.round(y * 10) / 10);
+    // On landscaped land: height above the ground, then the absolute height.
+    const above = hit && hasTerrainEdits() && terrainEditDelta(hit.pos.x, hit.pos.z) !== 0 ? Math.round((y - surfaceLevel(hit.pos.x, hit.pos.z)) * 10) / 10 : null;
+    const elevation = above === null ? formatElevation(Math.round(y * 10) / 10) : `${formatElevation(above)}${above === 0 ? '' : ' from ground'} · ${y.toFixed(1)} m`;
     return this.gridSpacing === null ? elevation : `${elevation} · Grid ${formatSpacing(this.gridSpacing)}`;
+  }
+
+  /** Shift held while drawing: the direction locked to (guides.ts). */
+  private lockDir: Vec3 | null = null;
+
+  /** Smart guides for this cursor, with Shift locking the current direction. */
+  private guideContext(e: ToolPointer, fromAnchor: RoadAnchor | null): GuideContext | null {
+    const { view, settings } = this.ctx;
+    const start = this.start;
+    if (!e.shift || !start) this.lockDir = null;
+    else if (!this.lockDir && this.hit) {
+      const draft = sub(this.hit.pos, start.pos);
+      let dir = this.hit.guides?.dir ?? (Math.hypot(draft.x, draft.z) > 1e-6 ? normalizeXZ(draft) : null);
+      if (dir && dir.x * draft.x + dir.z * draft.z < 0) dir = { x: -dir.x, y: 0, z: -dir.z };
+      this.lockDir = dir;
+    }
+    const g = settings.guides;
+    if (!this.lockDir && !Object.values(g).some(Boolean)) return null;
+    const mpp = groundPixelSize(view, e.x, e.y, settings.elevation);
+    return {
+      toggles: g,
+      mpp,
+      roadType: settings.roadType,
+      grid: settings.grid.enabled ? settings.grid : null,
+      snapGrid: settings.grid.enabled ? snapGridAt(settings.grid, mpp) : null,
+      lock: this.lockDir,
+      fromAnchor,
+    };
   }
 
   /** Spacing grid snapping uses at the current zoom, for the readout. Null with the grid off. */
@@ -498,7 +687,7 @@ export class RoadTool extends Tool {
       x: e.x,
       y: e.y,
       lines: [this.elevationLine(hit), lane ? this.laneLabel(lane) : this.snapLabel(hit)],
-      notes: [lane ? 'Click to start a ramp from this lane. Ctrl snaps to the centreline' : 'Click to start the road'],
+      notes: [lane ? `Click to start a ramp from this lane. ${MOD_KEY} snaps to the centreline` : 'Click to start the road'],
       tone: 'ok',
     });
   }
@@ -530,7 +719,8 @@ export class RoadTool extends Tool {
   private laneLabel(lane: LaneChoice): string {
     const c = lane.chosen;
     const name = c.fromEdge === 0 ? 'outside lane' : `lane ${c.fromEdge + 1} in from the edge`;
-    return `Snap: ${name}, ${c.fromEdge + 1} of ${c.count} lanes feed the ramp`;
+    const feeds = c.fromEdge === 0 ? 'it feeds the ramp' : `it and the ${c.fromEdge === 1 ? 'lane' : `${c.fromEdge} lanes`} outside it feed the ramp`;
+    return `Snap: ${name}, ${feeds}`;
   }
 
   private showControl(e: ToolPointer): void {
@@ -547,7 +737,7 @@ export class RoadTool extends Tool {
       x: e.x,
       y: e.y,
       lines: [`Length ${distXZ(start.pos, pos).toFixed(1)} m`, this.elevationLine(hit)],
-      notes: [start.dir ? 'Click to set the curve, tangent kept. Ctrl frees it' : 'Click to set the curve'],
+      notes: [start.dir ? `Click to set the curve, tangent kept. ${MOD_KEY} frees it` : 'Click to set the curve'],
       tone: 'ok',
     });
   }
@@ -558,7 +748,7 @@ export class RoadTool extends Tool {
     const hit = this.hit!;
     const start = this.start!;
     if (!draft) return;
-    const previews: RoadPreview[] = [{ curves: [draft.cubic], roadType: settings.roadType, state: draft.state }];
+    const previews: RoadPreview[] = [{ curves: draft.cubics, roadType: settings.roadType, state: draft.state }];
     view.setPreview(previews);
     const marks = this.snapMarks(hit);
     if (this.control) {
@@ -569,7 +759,14 @@ export class RoadTool extends Tool {
       const bad = c.atGrade && c.clearance > 1.5;
       const color = bad ? COLORS.bad : c.atGrade ? COLORS.warn : COLORS.ok;
       marks.push({ kind: 'ring', pos: c.point, color, radius: 5 });
-      if (!c.atGrade) marks.push({ kind: 'label', pos: c.point, text: `${c.clearance.toFixed(1)} m clear`, color });
+      // Clearance to whatever it passes over or under, red when there is not enough.
+      const rail = c.overRail || this.ctx.net.roadType(settings.roadType)?.category === 'rail';
+      if (!c.atGrade || bad) {
+        const under = c.point.y > cubicPoint(draft.cubic, c.t).y;
+        const what = c.overRail ? 'rail' : 'road';
+        const text = rail ? `Clearance ${c.clearance.toFixed(1)} m ${under ? 'under' : 'over'} ${what}${bad ? `, needs ${c.required} m` : ''}` : `${c.clearance.toFixed(1)} m clear`;
+        marks.push({ kind: 'label', pos: c.point, text, color });
+      }
     }
     for (const issue of draft.issues) {
       const color = issue.severity === 'error' ? COLORS.bad : COLORS.warn;
@@ -579,18 +776,35 @@ export class RoadTool extends Tool {
         marks.push({ kind: 'line', points: issue.stretch.map((p) => ({ ...p, y: p.y + 0.5 })), color, width: 2.2 });
       }
     }
+    if (draft.footprint) {
+      const color = draft.state === 'error' ? COLORS.bad : draft.state === 'warning' ? COLORS.warn : COLORS.guide;
+      for (const side of [draft.footprint.left, draft.footprint.right]) {
+        if (side.length > 1) marks.push({ kind: 'line', points: side.map((p) => ({ ...p, y: p.y + 0.3 })), color, width: 0.35, dashed: true });
+      }
+    }
     const endLane = this.laneChoiceFor(hit);
     if (endLane) marks.push(...this.laneMarks(endLane));
     const def = net.roadType(settings.roadType);
     if (def && isOneWay(def)) {
       // Travel arrows, the way the road will be built.
-      for (const pts of travelChevrons(draft.cubic)) {
-        marks.push({ kind: 'line', points: pts, color: draft.flipped ? COLORS.warn : COLORS.neutral, width: 0.5 });
+      for (const piece of draft.cubics) {
+        for (const pts of travelChevrons(piece)) {
+          marks.push({ kind: 'line', points: pts, color: draft.flipped ? COLORS.warn : COLORS.neutral, width: 0.5 });
+        }
       }
     }
     this.ctx.setMarks(marks);
-    const lines = formatReadout(readout(draft.cubic), hit.angle);
+    // A fitted curve reads its radius from the true arc, not from the pieces.
+    const chainInfo = draft.fit ? chainReadout(draft.cubics, draft.fit) : null;
+    // A road split to follow landscaped ground reads as one: total length, tightest radius, steepest grade.
+    const pieces = draft.cubics.map(readout);
+    const whole = pieces.length > 1 ? { length: pieces.reduce((n, r) => n + r.length, 0), radius: Math.min(...pieces.map((r) => r.radius)), grade: Math.max(...pieces.map((r) => r.grade)) } : pieces[0];
+    const lines = formatReadout(chainInfo ?? whole ?? readout(draft.cubic), hit.angle);
+    if (chainInfo) lines.push(...chainLines(chainInfo));
     lines.push(this.elevationLine(hit));
+    const parallelInfo = this.ctx.settings.guides.parallel && !e.ctrl ? parallelDistanceInfo(this.ctx.net, hit.pos, { pos: start.pos, ref: null }, start.anchor) : null;
+    if (hit.guides?.label) lines.unshift(hit.guides.label);
+    else if (parallelInfo) lines.push(parallelInfo);
     const atGrade = draft.crossings.filter((c) => c.atGrade).length;
     const over = draft.crossings.length - atGrade;
     if (atGrade) lines.push(`Junctions: ${atGrade}`);
@@ -637,6 +851,17 @@ export class RoadTool extends Tool {
       return;
     }
     view.setHighlight({ segments: [hit.segmentId], color: COLORS.snap });
+    const what = settings.walls.upgrade;
+    if (what !== 'road') {
+      const label = (list: readonly { value: string; label: string }[], v: string) => list.find((o) => o.value === v)?.label ?? v;
+      const seg = net.getSegment(hit.segmentId)!;
+      const lines =
+        what === 'barriers'
+          ? [`Sound barriers: ${label(BARRIER_KINDS, settings.walls.barrier)}`, settings.walls.barrier === 'none' ? 'Removes them' : `${settings.walls.barrierHeight} m, ${settings.walls.barrierSides === 'both' ? 'both sides' : `${settings.walls.barrierSides} side`}`]
+          : [`${label(STRUCTURE_MODES, seg.overrides.structure?.mode ?? 'auto')} to ${label(STRUCTURE_MODES, settings.walls.mode)}`];
+      this.ctx.setHud({ x: e.x, y: e.y, lines, notes: ['Drag along roads. Left and right follow the sweep'], tone: 'ok' });
+      return;
+    }
     const now = net.roadTypeOf(hit.segmentId).name;
     const next = net.roadType(settings.roadType)?.name ?? settings.roadType;
     view.setPreview([{ curves: [net.cubicOf(hit.segmentId)], roadType: settings.roadType, state: 'ok' }]);

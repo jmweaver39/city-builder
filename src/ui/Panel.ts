@@ -1,0 +1,101 @@
+/** Floating draggable panels. */
+import { el } from './dom';
+import { ICONS } from './icons';
+
+let nextZ = 12;
+let cascade = 0;
+
+export class Panel {
+  readonly root: HTMLElement;
+  readonly body: HTMLElement;
+  private readonly titleEl: HTMLElement;
+  private dragStart: { x: number; y: number; left: number; top: number } | null = null;
+  onClose: (() => void) | null = null;
+
+  constructor(host: HTMLElement, title: string, opts: { wide?: boolean; left?: number; top?: number } = {}) {
+    this.titleEl = el('div', { class: 'inspector-title', text: title });
+    const close = el('button', {
+      class: 'icon-btn',
+      tip: 'Close',
+      html: ICONS.close,
+      attrs: { type: 'button', 'aria-label': 'Close' },
+      on: { click: () => this.close() },
+    });
+    close.style.minWidth = '26px';
+    close.style.height = '26px';
+    const head = el('div', { class: 'inspector-head' }, this.titleEl, close);
+    this.body = el('div', { class: 'inspector-body' });
+    this.root = el('div', { class: `panel inspector ${opts.wide ? 'wide' : ''}` }, head, this.body);
+    const width = opts.wide ? 350 : 300;
+    const left = opts.left ?? Math.max(60, window.innerWidth - width - 16 - cascade * 24);
+    const top = opts.top ?? 66 + cascade * 24;
+    cascade = (cascade + 1) % 5;
+    this.root.style.left = `${left}px`;
+    this.root.style.top = `${top}px`;
+    this.root.style.zIndex = String(nextZ++);
+    host.append(this.root);
+    this.root.addEventListener('pointerdown', () => {
+      this.root.style.zIndex = String(nextZ++);
+    });
+    head.addEventListener('pointerdown', (e) => this.startDrag(e, head));
+    head.addEventListener('pointermove', (e) => this.drag(e));
+    head.addEventListener('pointerup', () => (this.dragStart = null));
+    head.addEventListener('pointercancel', () => (this.dragStart = null));
+  }
+
+  private startDrag(e: PointerEvent, head: HTMLElement): void {
+    if ((e.target as HTMLElement).closest('button')) return;
+    const r = this.root.getBoundingClientRect();
+    this.dragStart = { x: e.clientX, y: e.clientY, left: r.left, top: r.top };
+    head.setPointerCapture(e.pointerId);
+  }
+
+  private drag(e: PointerEvent): void {
+    if (!this.dragStart) return;
+    const r = this.root.getBoundingClientRect();
+    const left = this.dragStart.left + e.clientX - this.dragStart.x;
+    const top = this.dragStart.top + e.clientY - this.dragStart.y;
+    this.root.style.left = `${Math.max(0, Math.min(window.innerWidth - r.width, left))}px`;
+    this.root.style.top = `${Math.max(0, Math.min(window.innerHeight - 40, top))}px`;
+  }
+
+  setTitle(title: string): void {
+    this.titleEl.textContent = title;
+  }
+
+  close(): void {
+    this.root.remove();
+    this.onClose?.();
+  }
+}
+
+/** A modal dialog. Returns its close function. */
+export function modal(host: HTMLElement, title: string, body: HTMLElement, foot: HTMLElement | null, narrow = false): () => void {
+  const close = (): void => {
+    back.remove();
+    window.removeEventListener('keydown', esc, true);
+  };
+  const esc = (e: KeyboardEvent): void => {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      close();
+    }
+  };
+  const closeBtn = el('button', { class: 'icon-btn', tip: 'Close', html: ICONS.close, attrs: { type: 'button', 'aria-label': 'Close' }, on: { click: close } });
+  closeBtn.style.minWidth = '26px';
+  closeBtn.style.height = '26px';
+  const dialog = el(
+    'div',
+    { class: `panel dialog ${narrow ? 'narrow' : ''}`, attrs: { role: 'dialog', 'aria-label': title } },
+    el('div', { class: 'inspector-head', style: { cursor: 'default' } }, el('div', { class: 'inspector-title', text: title }), closeBtn),
+    body,
+    foot,
+  );
+  const back = el('div', { class: 'modal-back' }, dialog);
+  back.addEventListener('pointerdown', (e) => {
+    if (e.target === back) close();
+  });
+  window.addEventListener('keydown', esc, true);
+  host.append(back);
+  return close;
+}

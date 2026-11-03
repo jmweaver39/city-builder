@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cloverleaf render sandbox</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0c1626; overflow: hidden; }
+      #stage { position: fixed; inset: 0; }
+      #bar {
+        position: fixed; left: 10px; top: 10px; z-index: 5; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+        padding: 4px 8px; border-radius: 7px; background: rgba(14, 26, 46, 0.82);
+        color: #dcecf6; font: 10px/1.2 system-ui, -apple-system, sans-serif; max-width: calc(100vw - 44px);
+      }
+      #hud { font-variant-numeric: tabular-nums; }
+      label { display: flex; gap: 4px; align-items: center; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <div id="bar">
+      <span id="hud">starting</span>
+      <label>time <input id="time" type="range" min="0" max="24" step="0.1" value="10.5" /></label>
+      <label>overlay
+        <select id="overlay">
+          <option>none</option><option>traffic</option><option>speedLimit</option><option>lanes</option><option>roadType</option>
+        </select>
+      </label>
+      <label><input id="under" type="checkbox" /> underground</label>
+      <label><input id="debug" type="checkbox" /> lanes</label>
+      <label><input id="shadows" type="checkbox" checked /> shadows</label>
+    </div>
+    <script type="module" src="/src/render/sandbox.ts"></script>
+  </body>
+</html>

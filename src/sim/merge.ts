@@ -1,0 +1,144 @@
+/**
+ * Merge ordering. All vehicles about to join a lane from different feeders are put
+ * in one total order, and each follows the one before it, projected from the other
+ * feeder. A total order has no cycles, which is why zipper merges cannot deadlock.
+ *
+ * Free-flowing merges order by time to the merge point. Inside a controlled junction
+ * that would fight the rule that crossings go in order of entry: a car waiting at a
+ * crossing for one that entered earlier could be the leader of that very car here,
+ * by way of a third, and all three would sit still with an empty road ahead. So there
+ * the order is entry order too, except that a vehicle already past the merge point
+ * goes first, because its body is physically in the way.
+ */
+import { ENTRY_REAL } from './buckets';
+import { FREE_MERGE_HORIZON, MAX_DECEL } from './constants';
+import { CTL_NONE } from './junctions';
+import { nextOf } from './pathing';
+import type { World } from './world';
+
+const MAX_LIST = 128;
+const listV = new Int32Array(MAX_LIST);
+const listD = new Float64Array(MAX_LIST);
+const listKey = new Float64Array(MAX_LIST);
+const listEta = new Float64Array(MAX_LIST);
+const listF = new Int32Array(MAX_LIST);
+const listHold = new Float64Array(MAX_LIST);
+
+/**
+ * Speeds below this rank as this, so in slow traffic the order is simply distance
+ * and feeders alternate. Above it the faster vehicle arrives first and leads. With
+ * too low a floor, a stopped queue loses to every moving car on the other feeder.
+ */
+const ORDER_SPEED_FLOOR = 12;
+/** Sort keys for controlled merges, so the three classes never mix. */
+const PAST_BASE = -1e9;
+const HOLDER_BASE = 1e9;
+
+function etaOf(d: number, v: number): number {
+  return d / (v > ORDER_SPEED_FLOOR ? v : ORDER_SPEED_FLOOR);
+}
+
+export function mergePass(w: World): void {
+  const { g, veh, bk, jn, tick } = w;
+  const { mergeLanes, prevStart, prevList, isConn, fromLane, len: laneLen, mergeFrom } = g;
+  const { start, eV, eS, eT } = bk;
+  const { v: speed, permitDist, len, vlGap, vlV, vlFloor, vlTick, id, enterTick } = veh;
+
+  for (let i = 0; i < mergeLanes.length; i++) {
+    const x = mergeLanes[i];
+    let count = 0;
+    for (let k = prevStart[x]; k < prevStart[x + 1]; k++) {
+      const c = prevList[k];
+      if (!isConn[c]) continue;
+      const free = jn.ctl[c] === CTL_NONE;
+      const zone = laneLen[c] - mergeFrom[c];
+      for (let e = start[c]; e < start[c + 1]; e++) {
+        if (eT[e] !== ENTRY_REAL || count >= MAX_LIST) continue;
+        const u = eV[e];
+        const d = laneLen[c] - eS[e];
+        const eta = etaOf(d, speed[u]);
+        listV[count] = u;
+        listD[count] = d;
+        listEta[count] = eta;
+        // Past the merge point the body is in the way, whatever else: distance decides.
+        listKey[count] = d <= zone ? PAST_BASE + d : free ? eta : enterTick[u];
+        listHold[count] = d - zone;
+        listF[count++] = k;
+      }
+      if (free) {
+        const from = fromLane[c];
+        const horizon = FREE_MERGE_HORIZON - laneLen[c];
+        for (let e = start[from]; e < start[from + 1]; e++) {
+          if (eT[e] !== ENTRY_REAL) continue;
+          const toEnd = laneLen[from] - eS[e];
+          if (toEnd > horizon || count >= MAX_LIST) break;
+          const u = eV[e];
+          if (nextOf(w, u) !== c) continue;
+          const d = toEnd + laneLen[c];
+          const eta = etaOf(d, speed[u]);
+          listV[count] = u;
+          listD[count] = d;
+          listEta[count] = eta;
+          listKey[count] = eta;
+          listHold[count] = d - zone;
+          listF[count++] = k;
+        }
+      } else {
+        for (let u = jn.claimHead[c]; u >= 0 && count < MAX_LIST; u = veh.claimNext[u]) {
+          const d = permitDist[u] + laneLen[c];
+          const eta = etaOf(d, speed[u]);
+          listV[count] = u;
+          listD[count] = d;
+          listEta[count] = eta;
+          listKey[count] = HOLDER_BASE + eta;
+          listHold[count] = d - zone;
+          listF[count++] = k;
+        }
+      }
+    }
+    if (count < 2) continue;
+    // Small list: insertion sort, by key, then distance, then identity.
+    for (let a = 1; a < count; a++) {
+      const kv = listV[a];
+      const kd = listD[a];
+      const ke = listEta[a];
+      const kk = listKey[a];
+      const kf = listF[a];
+      const kh = listHold[a];
+      let b = a - 1;
+      while (b >= 0 && (listKey[b] > kk || (listKey[b] === kk && (listD[b] > kd || (listD[b] === kd && id[listV[b]] > id[kv]))))) {
+        listV[b + 1] = listV[b];
+        listD[b + 1] = listD[b];
+        listEta[b + 1] = listEta[b];
+        listKey[b + 1] = listKey[b];
+        listF[b + 1] = listF[b];
+        listHold[b + 1] = listHold[b];
+        b--;
+      }
+      listV[b + 1] = kv;
+      listD[b + 1] = kd;
+      listEta[b + 1] = ke;
+      listKey[b + 1] = kk;
+      listF[b + 1] = kf;
+      listHold[b + 1] = kh;
+    }
+    for (let a = 1; a < count; a++) {
+      if (listF[a] === listF[a - 1]) continue;
+      const u = listV[a];
+      const lead = listV[a - 1];
+      const spatial = listD[a] - listD[a - 1] - len[lead];
+      const timed = (listEta[a] - listEta[a - 1]) * (speed[u] > ORDER_SPEED_FLOOR ? speed[u] : ORDER_SPEED_FLOOR) - len[lead];
+      let gap = spatial > timed ? spatial : timed;
+      // A follower level with its leader holds at the merge point rather than braking
+      // for a body it is not yet near. Close to that point it brakes as hard as it must.
+      const hold = listHold[a];
+      if (hold > gap) gap = hold;
+      if (vlTick[u] !== tick || gap < vlGap[u]) {
+        vlTick[u] = tick;
+        vlGap[u] = gap;
+        vlV[u] = speed[lead];
+        vlFloor[u] = listD[a] < 20 || hold < 25 ? -MAX_DECEL : -3.5;
+      }
+    }
+  }
+}

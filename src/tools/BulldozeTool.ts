@@ -1,6 +1,7 @@
 /** Bulldoze: hover highlights, click deletes, drag sweeps. One drag is one undo step. */
 import type { Id } from '../core/types';
 import { pickDecal, pickEndpoint, pickRoad } from './pick';
+import { pruneZones, syncAllZoneAccess } from './zoneOps';
 import { Tool } from './Tool';
 import { COLORS, type ToolId, type ToolPointer } from './types';
 
@@ -84,6 +85,11 @@ export class BulldozeTool extends Tool {
     if (!this.sweeping) return;
     this.sweeping = false;
     this.last = null;
+    // Roads gone may have been some region's access, or its edge.
+    if (this.removed && this.ctx.net.project.zones?.length) {
+      pruneZones(this.ctx.net);
+      syncAllZoneAccess(this.ctx.net);
+    }
     this.ctx.history.end();
     this.show(e);
   }

@@ -3,7 +3,8 @@
  * clusters for zones, sized by rate and set back from the road.
  */
 import * as THREE from 'three';
-import type { EndpointKind, Id, TrafficEndpoint } from '../core/types';
+import type { EndpointKind, Id, TrafficEndpoint, ZoneDensity, ZoneKind, ZoneRegion } from '../core/types';
+import { zoneCoverage, zonePolygon, ZONE_STEP } from '../core/zones';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { cubicPoint, cubicTangentXZ } from '../core/bezier';
 import { totalHalfWidth } from '../core/roadTypes';
@@ -12,6 +13,9 @@ import type { AttrSpec, Piece } from './batch';
 import { ChunkBatch } from './batch';
 import { ROAD_LIFT, hexRGB, type RGB } from './constants';
 import type { Shared } from './materials';
+import { PALETTE } from './style';
+
+const P = PALETTE;
 
 const SCHEMA: AttrSpec[] = [
   { name: 'position', size: 3 },
@@ -87,6 +91,18 @@ export class BuildingBuf {
     }
   }
 
+  /**
+   * Ground cover lying on the terrain: one upward face, no edges, so a lawn blends
+   * into the grass around it instead of standing on a slab.
+   */
+  flat(cx: number, y: number, cz: number, hw: number, hd: number, fx: number, fz: number, color: RGB): void {
+    const rx = -fz;
+    const rz = fx;
+    const c = (sr: number, sf: number): number[] => [cx + rx * sr * hw + fx * sf * hd, y, cz + rz * sr * hw + fz * sf * hd];
+    // Same corner order as a block's roof, which faces up.
+    this.quad([c(-1, -1), c(1, -1), c(1, 1), c(-1, 1)], color, [[0, 0], [0, 0], [0, 0], [0, 0]], 0, 0);
+  }
+
   /** Flat ground patch, as a thin slab. */
   pad(cx: number, y: number, cz: number, hw: number, hd: number, fx: number, fz: number, color: RGB): void {
     this.block(cx, y - 0.2, cz, hw, hd, 0.28, fx, fz, color, color, 0, 0);
@@ -143,8 +159,15 @@ export class BuildingBuf {
   }
 }
 
+const glsl = (hex: number) => {
+  const c = new THREE.Color(hex);
+  return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+};
+const WINDOW_GLSL = glsl(PALETTE.window);
+const WINDOW_LIT_GLSL = glsl(PALETTE.windowLit);
+
 function buildingMaterial(shared: Shared): THREE.MeshStandardMaterial {
-  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0 });
+  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 });
   m.onBeforeCompile = (s) => {
     s.uniforms.uNight = shared.uNight;
     s.uniforms.uNoise = shared.uNoise;
@@ -171,9 +194,6 @@ float rnd(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453
         '#include <color_fragment>',
         /* glsl */ `#include <color_fragment>
 {
-  // Weathering: stains run down from the top of a wall, dirt collects at its foot.
-  float n = texture2D(uNoise, (vPos.xz + vPos.yy * 0.4) / 9.0).g;
-  diffuseColor.rgb *= 0.88 + 0.22 * n;
   if (vWinKind > 0.5) {
     float kind = vWinKind;
     vec2 cellSize = kind > 3.5 ? vec2(3.0, 3.6) : kind > 2.5 ? vec2(3.2, 3.6) : kind > 1.5 ? vec2(5.2, 4.6) : vec2(3.3, 3.0);
@@ -191,12 +211,12 @@ float rnd(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453
     // Shop fronts: the ground floor is one band of glass.
     float shop = (kind > 2.5 && kind < 3.5) ? (1.0 - step(0.62, vWinUv.y / 4.2)) * step(0.5, fract(vWinUv.x / 7.0) * 2.0 + 0.3) : 0.0;
     win = max(win, shop * sharp);
-    diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.42, 0.5, 0.56) * (0.85 + 0.3 * rnd(id + 3.0)), win);
-    gRough = mix(gRough, 0.1 + 0.12 * rnd(id), win);
-    gMetal = mix(gMetal, 0.7, win);
-    float lit = step(0.62, rnd(id + vSeed));
-    float average = size.x * size.y * 0.4 * (1.0 - sharp);
-    gWinGlow = vec3(1.0, 0.68, 0.34) * (win * lit + average) * uNight * 1.3;
+    // Simple insets: flat blue-grey panes, a darker frame around them.
+    diffuseColor.rgb = mix(diffuseColor.rgb, ${WINDOW_GLSL}, win);
+    gRough = mix(gRough, 0.4, win);
+    float lit = step(0.55, rnd(id + vSeed));
+    float average = size.x * size.y * 0.45 * (1.0 - sharp);
+    gWinGlow = ${WINDOW_LIT_GLSL} * (win * lit + average) * uNight * 1.6;
   } else if (vWinKind < -0.5) {
     gRough = 0.92;
   }
@@ -207,15 +227,15 @@ float rnd(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453
       .replace('#include <metalnessmap_fragment>', `#include <metalnessmap_fragment>\nmetalnessFactor = gMetal;`)
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\ntotalEmissiveRadiance += gWinGlow;`);
   };
-  m.customProgramCacheKey = () => 'cl-building-2';
+  m.customProgramCacheKey = () => 'cl-building-lp';
   return m;
 }
 
-const PALETTE: Record<Exclude<EndpointKind, 'gateway'>, { walls: number[]; roofs: number[]; win: number }> = {
-  residential: { walls: [0xd8cdb8, 0xc9b49a, 0xb9c0c2, 0xd9bfa6, 0xa9a48f, 0xa26a52], roofs: [0x8a4a3a, 0x6f4034, 0x4f4d52], win: 1 },
-  commercial: { walls: [0xd2cfc6, 0xbfc7cf, 0xc9b9a4, 0xa8b8b8], roofs: [0x65676b, 0x77787a], win: 3 },
-  industrial: { walls: [0x9ca3a6, 0x8d8a7f, 0xa7a191, 0x7f8b8f], roofs: [0x6a6e72, 0x57595c], win: 2 },
-  office: { walls: [0x7f97ab, 0x8ea6b5, 0x6f8799, 0x9aa8b2], roofs: [0x55595e, 0x4c5056], win: 3 },
+const ZONE_PALETTE: Record<Exclude<EndpointKind, 'gateway'>, { walls: number[]; roofs: number[]; win: number }> = {
+  residential: { walls: [P.wallCream, P.wallWhite, P.wallPeach, P.wallBrick, P.wallSage, P.wallSky], roofs: [P.roofRed, P.roofTerracotta, P.roofSlate], win: 1 },
+  commercial: { walls: [P.wallWhite, P.wallCream, P.wallSky, P.wallPeach], roofs: [P.roofDark, P.roofSlate], win: 3 },
+  industrial: { walls: [P.wallGrey, P.wallSage, P.wallCream, 0xb8c4cc], roofs: [P.roofSlate, P.roofDark], win: 2 },
+  office: { walls: [P.wallSky, P.wallGrey, 0x9cb8d0, P.wallWhite], roofs: [P.roofDark, P.roofSlate], win: 3 },
 };
 
 function rngOf(seed: number): () => number {
@@ -233,14 +253,16 @@ export interface ZoneFootprint {
   r: number;
 }
 
-const ASPHALT = hexRGB(0x3c3e42);
-const CONCRETE_PAD = hexRGB(0x8e8c84);
-const STRIPE = hexRGB(0xdedcd2);
-const HEDGE = hexRGB(0x2e4a22);
-const GRASS_PAD = hexRGB(0x4c6a34);
-const PARKED = [0xc9ccd0, 0x24262a, 0x8e1a18, 0x2a64aa, 0xeeece6, 0x7c8086, 0xdc9e20].map(hexRGB);
-const GLASS_DARK = hexRGB(0x20262c);
-const STEEL = hexRGB(0x8a8f94);
+const ASPHALT = hexRGB(0x5d6168);
+const CONCRETE_PAD = hexRGB(0xd8d2c4);
+const STRIPE = hexRGB(0xf4f2ec);
+const HEDGE = hexRGB(0x4f8f44);
+const GRASS_PAD = hexRGB(0x84b266);
+/** Close to the terrain's own grass, a touch fresher, so a lawn reads but does not stand out. */
+const LAWN = hexRGB(0x5d8a45);
+const PARKED = [0xf4f2ec, 0xe24a3a, 0x3a78d0, 0xf6c444, 0x3aa070, 0x8c939a, 0xf0803a].map(hexRGB);
+const GLASS_DARK = hexRGB(0x30445a);
+const STEEL = hexRGB(0xb8c0c6);
 
 /** Rows of bays with a few parked cars. */
 function parking(buf: BuildingBuf, cx: number, y: number, cz: number, hw: number, hd: number, fx: number, fz: number, rng: () => number): void {
@@ -374,7 +396,7 @@ export function buildZone(net: RoadNetwork, ep: TrafficEndpoint, buf: BuildingBu
   const cx = p.x + rx * (setback + depth / 2);
   const cz = p.z + rz * (setback + depth / 2);
   const ground = Math.max(terrainHeight(cx, cz), 0) + 0.08;
-  const pal = PALETTE[ep.kind];
+  const pal = ZONE_PALETTE[ep.kind];
   const rng = rngOf(ep.id + 1);
   const pick = <T,>(a: T[]): T => a[Math.floor(rng() * a.length) % a.length];
   // Building plot faces the road. v runs from the road (-1) to the back of the plot (1).
@@ -389,7 +411,7 @@ export function buildZone(net: RoadNetwork, ep: TrafficEndpoint, buf: BuildingBu
   buf.pad(drive.x, ground, drive.z, 3.2, (setback - roadEdge + 8) / 2, fx, fz, ASPHALT);
   const count = Math.round(2 + scale * 2);
   if (ep.kind === 'residential') {
-    buf.pad(cx, ground - 0.03, cz, width / 2, depth / 2, fx, fz, GRASS_PAD);
+    buf.flat(cx, Math.max(terrainHeight(cx, cz), 0) + 0.03, cz, width / 2, depth / 2, fx, fz, LAWN);
     // Lots of different widths, so a street is not a row of copies.
     let walk = -width / 2 + 2;
     let guard = 0;
@@ -468,6 +490,152 @@ export function buildZone(net: RoadNetwork, ep: TrafficEndpoint, buf: BuildingBu
   return { x: cx, z: cz, r: Math.hypot(width, depth) / 2 };
 }
 
+// ---------------------------------------------------------------------------
+// Zoned regions: lots facing the nearest road
+// ---------------------------------------------------------------------------
+
+/** Lot width along the road and depth away from it, by kind and density. */
+const LOTS: Record<ZoneKind, Record<ZoneDensity, [number, number]>> = {
+  residential: { low: [17, 26], medium: [22, 22], high: [30, 30] },
+  commercial: { low: [24, 28], medium: [28, 30], high: [32, 32] },
+  industrial: { low: [36, 40], medium: [38, 40], high: [40, 42] },
+  office: { low: [28, 30], medium: [30, 32], high: [34, 34] },
+};
+const MAX_LOTS = 400;
+
+/** Changes whenever the region, or a road it could see, changes shape. */
+function regionKey(net: RoadNetwork, region: ZoneRegion): string {
+  const poly = zonePolygon(net, region);
+  let minX = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxZ = -Infinity;
+  for (const p of poly) {
+    minX = Math.min(minX, p.x);
+    minZ = Math.min(minZ, p.z);
+    maxX = Math.max(maxX, p.x);
+    maxZ = Math.max(maxZ, p.z);
+  }
+  const roads = net
+    .segmentsInRegion({ minX: minX - 40, minZ: minZ - 40, maxX: maxX + 40, maxZ: maxZ + 40 }, true)
+    .map((id) => {
+      const c = net.cubicOf(id);
+      return `${id}:${c.p0.x.toFixed(1)},${c.p0.z.toFixed(1)},${c.p3.x.toFixed(1)},${c.p3.z.toFixed(1)},${c.p1.x.toFixed(1)},${c.p2.z.toFixed(1)}`;
+    })
+    .sort()
+    .join('|');
+  const later = (net.project.zones ?? []).map((z) => z.id).join(',');
+  return JSON.stringify([region.kind, region.density, region.enabled, poly.map((p) => [Math.round(p.x * 10), Math.round(p.z * 10)]), roads, later]);
+}
+
+/** One building on a lot. (tx, tz) runs along the road, (fx, fz) away from it. */
+function lotBuilding(buf: BuildingBuf, kind: ZoneKind, density: ZoneDensity, x: number, ground: number, z: number, w: number, d: number, tx: number, tz: number, fx: number, fz: number, rng: () => number): void {
+  const pal = ZONE_PALETTE[kind as Exclude<EndpointKind, 'gateway'>];
+  const pick = <T,>(a: T[]): T => a[Math.floor(rng() * a.length) % a.length];
+  const wall = hexRGB(pick(pal.walls));
+  const roof = hexRGB(pick(pal.roofs));
+  const flatRoof = hexRGB(0x5c5e62);
+  // Half sizes across the road (hw) and along it (hd), kept inside the lot.
+  const hd = w * (0.3 + rng() * 0.08);
+  const hw = d * (0.26 + rng() * 0.08);
+  const back = d * 0.08;
+  const bx = x + fx * back;
+  const bz = z + fz * back;
+  if (kind === 'residential') {
+    if (density === 'low') {
+      buf.flat(x, Math.max(terrainHeight(x, z), 0) + 0.03, z, w / 2, d / 2, tx, tz, LAWN);
+      house(buf, bx, ground, bz, w, tx, tz, fx, fz, pal, rng, pick, d / 2 + back);
+      return;
+    }
+    const floors = density === 'medium' ? 3 + Math.floor(rng() * 2) : 6 + Math.floor(rng() * 8);
+    const h = floors * 3;
+    buf.block(bx, ground - 0.2, bz, hw + 0.2, hd + 0.2, 0.3, tx, tz, CONCRETE_PAD, CONCRETE_PAD, 0, 0);
+    buf.block(bx, ground, bz, hw, hd, h, tx, tz, wall, roof, pal.win, rng() * 40);
+    if (density === 'medium') buf.gable(bx, ground + h, bz, hw, hd, 2.2, tx, tz, roof, wall);
+    else parapet(buf, bx, ground + h, bz, hw, hd, tx, tz, wall, flatRoof);
+    return;
+  }
+  if (kind === 'industrial') {
+    const h = (density === 'high' ? 10 : density === 'medium' ? 8 : 6.5) + rng() * 3;
+    buf.pad(x, ground - 0.01, z, w / 2, d / 2, fx, fz, CONCRETE_PAD);
+    buf.block(bx, ground, bz, hw, hd, h, tx, tz, wall, roof, pal.win, rng() * 40);
+    buf.gable(bx, ground + h, bz, hw * 1.02, hd * 1.02, 1.7, fx, fz, roof, wall);
+    if (rng() < 0.5) {
+      const r = 2 + rng() * 1.5;
+      buf.drum(x + fx * (d / 2 - r - 1) + tx * (w / 2 - r - 1), ground, z + fz * (d / 2 - r - 1) + tz * (w / 2 - r - 1), r, 6 + rng() * 5, hexRGB(0xb8bab6), hexRGB(0x8a8c8a));
+    }
+    return;
+  }
+  const floorsBy: Record<ZoneDensity, [number, number]> =
+    kind === 'commercial' ? { low: [1, 2], medium: [3, 5], high: [8, 16] } : { low: [3, 4], medium: [6, 10], high: [14, 28] };
+  const [lo, hi] = floorsBy[density];
+  const floors = lo + Math.floor(rng() * (hi - lo + 1));
+  const h = floors * 3.6;
+  if (density === 'low') parking(buf, x - fx * (d * 0.3), ground, z - fz * (d * 0.3), w * 0.42, d * 0.16, fx, fz, rng);
+  buf.block(bx, ground - 0.2, bz, hw + 0.15, hd + 0.15, 0.3, tx, tz, CONCRETE_PAD, CONCRETE_PAD, 0, 0);
+  buf.block(bx, ground, bz, hw, hd, h, tx, tz, wall, flatRoof, pal.win, rng() * 40);
+  parapet(buf, bx, ground + h, bz, hw, hd, tx, tz, wall, flatRoof);
+  roofKit(buf, bx, ground + h, bz, hw * 0.6, hd * 0.6, tx, tz, rng);
+  if (kind === 'commercial') {
+    buf.block(bx - fx * (hw + 1.4), ground + 3.2, bz - fz * (hw + 1.4), 1.4, hd * 0.9, 0.22, tx, tz, hexRGB(pick([0x8e2a22, 0x1f5a7a, 0x2a6a44, 0xc8a030])), flatRoof, 0, 0);
+  }
+}
+
+/**
+ * Buildings over a region's zoned cells, on lots facing the nearest road. Lots go
+ * nearest the road first, so frontage fills before the back of a deep block.
+ */
+export function buildRegion(net: RoadNetwork, region: ZoneRegion, buf: BuildingBuf): ZoneFootprint[] {
+  if (region.kind === 'none') return [];
+  const kind = region.kind;
+  const cells = zoneCoverage(net, region.id).cells;
+  if (!cells.length) return [];
+  const cellKey = (x: number, z: number) => `${Math.floor(x / ZONE_STEP)},${Math.floor(z / ZONE_STEP)}`;
+  const have = new Set(cells.map((c) => cellKey(c.x, c.z)));
+  const zoned = (x: number, z: number) => have.has(cellKey(x, z));
+  const [w, d] = LOTS[kind][region.density];
+  const rng = rngOf(region.id + 7);
+  const scored = cells.map((c) => {
+    const hit = net.nearestSegment({ x: c.x, y: 0, z: c.z }, 120);
+    return { c, hit, d: hit ? hit.distance : 1e9 };
+  });
+  scored.sort((a, b) => a.d - b.d);
+  const placed: ZoneFootprint[] = [];
+  const r = Math.min(w, d) / 2;
+  for (const { c, hit } of scored) {
+    if (placed.length >= MAX_LOTS) break;
+    let tx = 1;
+    let tz = 0;
+    let fx = 0;
+    let fz = 1;
+    if (hit) {
+      const t = cubicTangentXZ(net.cubicOf(hit.segmentId), hit.t);
+      tx = t.x;
+      tz = t.z;
+      // Away from the road, on whichever side the lot is.
+      const side = hit.lateral >= 0 ? 1 : -1;
+      fx = -t.z * side;
+      fz = t.x * side;
+    }
+    // Put the lot's front at this cell, so it backs away from the road.
+    const cx = c.x + fx * (d / 2 - ZONE_STEP / 2);
+    const cz = c.z + fz * (d / 2 - ZONE_STEP / 2);
+    if (placed.some((p) => Math.hypot(p.x - cx, p.z - cz) < (p.r + r) * 0.98)) continue;
+    let ok = true;
+    for (const [su, sv] of [[0, 0], [-0.45, -0.45], [0.45, -0.45], [-0.45, 0.45], [0.45, 0.45], [0, 0.45], [0, -0.45]]) {
+      if (!zoned(cx + tx * su * w + fx * sv * d, cz + tz * su * w + fz * sv * d)) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    const ground = Math.max(terrainHeight(cx, cz), 0) + 0.08;
+    lotBuilding(buf, kind, region.density, cx, ground, cz, w, d, tx, tz, fx, fz, rng);
+    placed.push({ x: cx, z: cz, r });
+  }
+  return placed;
+}
+
 /** Gantry over a dead end: a sign bridging the road, with a big arrow pointing the way out. */
 function buildGateway(net: RoadNetwork, ep: TrafficEndpoint, nodeId: Id, bars: number[]): void {
   const g = net.nodeGeom(nodeId);
@@ -491,6 +659,7 @@ export class EndpointLayer {
   private arrowMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true, transparent: true, opacity: 0.92, side: THREE.DoubleSide, depthWrite: false });
   private arrows: THREE.Mesh | null = null;
   footprints: ZoneFootprint[] = [];
+  private regionCache = new Map<Id, { key: string; footprints: ZoneFootprint[] }>();
 
   constructor(
     private readonly net: RoadNetwork,
@@ -512,11 +681,32 @@ export class EndpointLayer {
         if (ep.nodeId !== null) buildGateway(this.net, ep, ep.nodeId, bars);
         continue;
       }
+      // A region draws its own buildings, so its access points draw none.
+      if (ep.regionId !== undefined) {
+        this.batch.set(ep.id, null);
+        continue;
+      }
       const buf = new BuildingBuf();
       const fp = buildZone(this.net, ep, buf);
       if (fp) this.footprints.push(fp);
       this.batch.set(ep.id, buf.toPiece());
     }
+    for (const region of this.net.project.zones ?? []) {
+      if (region.kind === 'none') continue;
+      seen.add(region.id);
+      const key = regionKey(this.net, region);
+      const cached = this.regionCache.get(region.id);
+      if (cached && cached.key === key) {
+        this.footprints.push(...cached.footprints);
+        continue;
+      }
+      const buf = new BuildingBuf();
+      const footprints = buildRegion(this.net, region, buf);
+      this.regionCache.set(region.id, { key, footprints });
+      this.footprints.push(...footprints);
+      this.batch.set(region.id, buf.toPiece());
+    }
+    for (const id of this.regionCache.keys()) if (!seen.has(id)) this.regionCache.delete(id);
     for (const id of this.known) if (!seen.has(id)) this.batch.set(id, null);
     this.known = seen;
     this.batch.flush();

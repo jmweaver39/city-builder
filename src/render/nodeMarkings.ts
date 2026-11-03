@@ -3,7 +3,7 @@
  * a marking follows its road: the layer rebuilds any node a network change touches.
  */
 import * as THREE from 'three';
-import { fillerPolygon, lineCurve, polygonCentre, sampleCurve } from '../core/nodeMarkings';
+import { fillerPolygon, markingPath, polygonCentre } from '../core/nodeMarkings';
 import type { NetworkChange, RoadNetwork } from '../core/RoadNetwork';
 import type { Id, LineStyle, NodeFillStyle, NodeFillerMarking, NodeLineMarking, NodeLineStyle, Vec3 } from '../core/types';
 import { ChunkBatch, PAINT_SCHEMA, PaintBuf, type LinePoint } from './batch';
@@ -43,17 +43,16 @@ function ribbonPoints(pts: readonly Vec3[], shift: number): LinePoint[] {
 const lifted = (p: Vec3): Vec3 => ({ x: p.x, y: p.y + ROAD_LIFT, z: p.z });
 
 function buildLine(net: RoadNetwork, nodeId: Id, m: NodeLineMarking, buf: PaintBuf): void {
-  const curve = lineCurve(net, nodeId, m);
-  if (!curve) return;
+  const pts = markingPath(net, nodeId, m);
+  if (!pts || pts.length < 2) return;
   const color = PAINT_COL[m.color];
   const stroked = LINE_STROKES[m.style];
   if (stroked) {
-    const pts = sampleCurve(curve, 0.8);
     for (const k of strokesOf(stroked)) buf.ribbon(ribbonPoints(pts, k.shift * (m.width / 0.16)), m.width, color, k.period, k.duty);
     return;
   }
-  const a = lifted(curve.p0);
-  const b = lifted(curve.p3);
+  const a = lifted(pts[0]);
+  const b = lifted(pts[pts.length - 1]);
   if (m.style === 'stopLine') {
     buf.bar(a.x, a.y, a.z, b.x, b.y, b.z, m.width, color);
     return;
@@ -64,7 +63,7 @@ function buildLine(net: RoadNetwork, nodeId: Id, m: NodeLineMarking, buf: PaintB
   const depth = Math.max(m.width, 1);
   let shiftX = 0;
   let shiftZ = 0;
-  if (m.from.segmentId === m.to.segmentId) {
+  if (m.from.segmentId === m.to.segmentId && !m.from.back) {
     const node = net.getNode(nodeId);
     const dx = b.x - a.x;
     const dz = b.z - a.z;

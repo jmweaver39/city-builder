@@ -3,7 +3,7 @@ import { SLOT_COUNT } from '../app/storage';
 import type { UiContext } from './context';
 import { clear, el, iconButton } from './dom';
 import { ICONS } from './icons';
-import { modal } from './Panel';
+import { confirmDialog, modal } from './Panel';
 
 const KEYS: [string, string][] = [
   ['W A S D', 'Pan'],
@@ -18,13 +18,18 @@ const KEYS: [string, string][] = [
   ['B', 'Bulldoze'],
   ['M', 'Move'],
   ['V', 'Inspect'],
-  ['J', 'Junction control'],
+  ['J', 'Traffic control'],
+  ['G X C Y I Z', 'Light, stop, all-way, yield, priority, auto'],
+  ['O', 'Roundabout'],
+  ['[ ] Wheel', 'Roundabout radius'],
+  ['Del', 'Delete roundabout'],
   ['L', 'Lane connector'],
   ['P', 'Paint'],
   ['T', 'Traffic'],
   ['Z X C G', 'Draw modes'],
   ['PgUp PgDn', 'Elevation 4 m'],
   ['Ctrl or Cmd', 'Hold: no snapping'],
+  ['Shift+G', 'Grid snapping'],
   ['K', 'Node markings'],
   ['H', 'Reverse direction'],
   ['Enter', 'Close a filler'],
@@ -62,8 +67,16 @@ export class Menu {
         change: async () => {
           const file = importInput.files?.[0];
           if (!file) return;
-          actions.importJson(await file.text());
+          const text = await file.text();
+          importInput.value = '';
           this.close();
+          const ok = await confirmDialog(this.ui.host, {
+            title: 'Import map?',
+            message: `Replace the current map with ${file.name}? Unsaved changes will be lost, though Undo brings the map back.`,
+            confirm: 'Replace',
+            danger: true,
+          });
+          if (ok) actions.importJson(text);
         },
       },
     });
@@ -101,12 +114,13 @@ export class Menu {
 
   private confirmNew(): void {
     const { actions } = this.ui;
-    const body = el('div', { class: 'dialog-body', text: 'Start a new map? Anything not saved in a slot is lost, and this cannot be undone.' });
+    const body = el('div', { class: 'dialog-body' }, el('p', { class: 'dialog-message', text: 'Replace the current map with a new one? Unsaved changes will be lost, though Undo brings the map back.' }));
     const foot = el(
       'div',
       { class: 'dialog-foot' },
       el('button', { class: 'btn', text: 'Cancel', attrs: { type: 'button' }, on: { click: () => this.close() } }),
       el('button', { class: 'btn', text: 'Starter town', attrs: { type: 'button' }, on: { click: () => { actions.newProject('Starter town', true); this.close(); } } }),
+      this.ui.rail ? el('button', { class: 'btn', text: 'Rail demo', attrs: { type: 'button' }, on: { click: () => { this.ui.rail?.loadDemo({ confirmed: true }); this.close(); } } }) : null,
       el('button', { class: 'btn primary', text: 'Empty map', attrs: { type: 'button' }, on: { click: () => { actions.newProject('Untitled', false); this.close(); } } }),
     );
     this.show('New map', body, foot);
@@ -149,8 +163,15 @@ export class Menu {
                     this.ui.toast('That slot could not be read.', 'error');
                     return;
                   }
-                  actions.loadRecord(record);
                   this.close();
+                  void confirmDialog(this.ui.host, {
+                    title: 'Load map?',
+                    message: `Replace the current map with ${entry?.name ?? `slot ${slot}`}? Unsaved changes will be lost, though Undo brings the map back.`,
+                    confirm: 'Replace',
+                    danger: true,
+                  }).then((ok) => {
+                    if (ok) actions.loadRecord(record);
+                  });
                 },
               },
             });

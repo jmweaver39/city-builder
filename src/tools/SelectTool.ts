@@ -1,15 +1,20 @@
 /** Inspect: click a road, junction, endpoint or vehicle to open its inspector. */
 import { isJunctionNode, pickEndpoint, pickNode, pickRoad } from './pick';
 import { Tool } from './Tool';
+import { zoneAt } from './zoneOps';
 import { COLORS, type InspectTarget, type ToolId, type ToolPointer } from './types';
 
 export class SelectTool extends Tool {
   readonly id: ToolId = 'select';
+  /** Set by the rail wiring: the train under the cursor. */
+  pickTrain: ((clientX: number, clientY: number) => number | null) | null = null;
 
   /** What a click here would open. */
   targetAt(e: ToolPointer, withVehicles: boolean): InspectTarget | null {
     const { net, view } = this.ctx;
     if (withVehicles) {
+      const train = this.pickTrain?.(e.x, e.y) ?? null;
+      if (train !== null) return { kind: 'train', id: train };
       const vehicle = view.pickVehicle(e.x, e.y);
       if (vehicle !== null) return { kind: 'vehicle', id: vehicle };
     }
@@ -22,6 +27,9 @@ export class SelectTool extends Tool {
     if (node !== null) return { kind: 'junction', id: node };
     const road = pickRoad(this.ctx, e);
     if (road) return { kind: 'segment', id: road.segmentId };
+    const ground = view.pickPlane(e.x, e.y, 0);
+    const zone = ground ? zoneAt(net, ground.x, ground.z) : null;
+    if (zone !== null) return { kind: 'zone', id: zone };
     return null;
   }
 

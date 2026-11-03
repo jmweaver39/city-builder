@@ -29,7 +29,9 @@ import {
   type RGB,
 } from './constants';
 import { buildFrames, type Frame } from './frames';
+import { junctionSetback } from './markings';
 import { addSegmentStructures } from './structures';
+import { asphaltFor } from './style';
 
 export interface RoadOutputs {
   surf: SurfBuf;
@@ -114,8 +116,9 @@ export function rankBias(def: RoadTypeDef): number {
   return Math.min(14, Math.max(0, def.rank)) * BIAS_PER_RANK;
 }
 
-export function surfaceColour(seg: Segment | undefined): RGB {
-  return seg?.overrides.surface ? SURFACE_COL[seg.overrides.surface] : COL.asphalt;
+export function surfaceColour(seg: Segment | undefined, def?: RoadTypeDef): RGB {
+  if (seg?.overrides.surface) return SURFACE_COL[seg.overrides.surface];
+  return def ? asphaltFor(def) : COL.asphalt;
 }
 
 /** Above this clearance a deck is a slab on girders, not a solid embankment edge. */
@@ -356,9 +359,10 @@ export function buildSegment(net: RoadNetwork, id: Id, slot: number, out: RoadOu
 
   const atJunction = (nodeId: Id) => net.nodeGeom(nodeId)?.kind === 'junction';
   const hasMedian = def.median.width > 0 && (def.median.kind === 'grass' || def.median.kind === 'barrier');
-  const noseBack = 2.4;
-  const startS = atJunction(seg.a) ? s0 + noseBack : s0 - 1;
-  const endS = atJunction(seg.b) ? s1 - noseBack : s1 + 1;
+  // Noses stand behind the crosswalk and stop line, which sit the same distance back on every arm.
+  const noseBack = (nodeId: Id) => Math.max(2.4, junctionSetback(net, nodeId) + 0.5);
+  const startS = atJunction(seg.a) ? s0 + noseBack(seg.a) : s0 - 1;
+  const endS = atJunction(seg.b) ? s1 - noseBack(seg.b) : s1 + 1;
   const extras: number[] = [];
   if (hasMedian) {
     const hw = Math.max(def.median.width / 2, 0.6);
@@ -371,7 +375,7 @@ export function buildSegment(net: RoadNetwork, id: Id, slot: number, out: RoadOu
   if (frames.length < 2) return;
 
   const bias = rankBias(def);
-  const main = surfaceColour(seg);
+  const main = surfaceColour(seg, def);
   const n = frames.length - 1;
   if (def.category === 'rail') {
     // Track: a gravel formation here, ballast, sleepers and rails come from render/tracks.

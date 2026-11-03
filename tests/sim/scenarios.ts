@@ -40,10 +40,10 @@ export function diamond() {
     net.drawRoad({ start, end, c1, c2, roadType: 'ramp-1' });
   ramp(onSeg(east, 0.3), atNode(south), v(-330, 20), v(-120, 60, Y));
   const eastAfter = net.nearestSegment(v(400, 20))!.segmentId;
-  ramp(atNode(south), onSeg(eastAfter, 0.4), v(120, 60, Y), v(300, 20));
+  ramp(atNode(south), onSeg(eastAfter, 0.75), v(120, 60, Y), v(300, 20));
   ramp(onSeg(west, 0.3), atNode(north), v(330, -20), v(120, -60, Y));
   const westAfter = net.nearestSegment(v(-400, -20))!.segmentId;
-  ramp(atNode(north), onSeg(westAfter, 0.4), v(-120, -60, Y), v(-300, -20));
+  ramp(atNode(north), onSeg(westAfter, 0.75), v(-120, -60, Y), v(-300, -20));
   return net;
 }
 

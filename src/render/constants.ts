@@ -48,40 +48,40 @@ export function hexRGB(hex: number): RGB {
 }
 
 export const COL = {
-  asphalt: hexRGB(0x4a4c50),
-  shoulder: hexRGB(0x56585b),
-  busLane: hexRGB(0x7a4238),
-  bikeLane: hexRGB(0x3f7358),
-  kerb: hexRGB(0xa8a59c),
-  sidewalk: hexRGB(0x9d9a92),
-  grass: hexRGB(0x5c7a3f),
-  gravel: hexRGB(0x8a8470),
-  concrete: hexRGB(0xa5a39c),
-  concreteDark: hexRGB(0x8b8983),
-  barrier: hexRGB(0xc4c2ba),
-  steel: hexRGB(0x7f868c),
-  girder: hexRGB(0x5d6a70),
-  tunnelInner: hexRGB(0x2a2c30),
+  asphalt: hexRGB(0x3a3d42),
+  shoulder: hexRGB(0x3f4247),
+  busLane: hexRGB(0x8a4a40),
+  bikeLane: hexRGB(0x4f7a58),
+  kerb: hexRGB(0xc9c9c4),
+  sidewalk: hexRGB(0x8e8d82),
+  grass: hexRGB(0x8a8858),
+  gravel: hexRGB(0x8c8270),
+  concrete: hexRGB(0xbab6ac),
+  concreteDark: hexRGB(0xa29e95),
+  barrier: hexRGB(0xd0cec8),
+  steel: hexRGB(0xa8adb2),
+  girder: hexRGB(0x6f7c84),
+  tunnelInner: hexRGB(0x2e3238),
   black: hexRGB(0x0b0c0e),
 } as const;
 
 export const SURFACE_COL: Record<NonNullable<SegmentOverrides['surface']>, RGB> = {
   asphalt: COL.asphalt,
-  concrete: hexRGB(0x9d9a92),
+  concrete: hexRGB(0xbab6ac),
   darkAsphalt: hexRGB(0x34363a),
   red: hexRGB(0x8a3b30),
-  gravel: hexRGB(0x93866c),
+  gravel: hexRGB(0x8c8270),
 };
 
 export const PAINT_COL: Record<PaintColor, RGB> = {
-  white: hexRGB(0xf0ede4),
-  yellow: hexRGB(0xe8b92e),
+  white: hexRGB(0xf2f1ec),
+  yellow: hexRGB(0xe2b33c),
   blue: hexRGB(0x3e7fd6),
   red: hexRGB(0xd2402f),
   green: hexRGB(0x46a85a),
 };
 
-export const LINE_WIDTH = 0.16;
+export const LINE_WIDTH = 0.14;
 /** Gap between the centres of the two lines of a double. */
 export const DOUBLE_GAP = 0.32;
 

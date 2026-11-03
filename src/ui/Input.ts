@@ -6,6 +6,7 @@ import type { Toolbar } from './Toolbar';
 import type { TopBar } from './TopBar';
 import type { InfoBar } from './InfoBar';
 import type { Menu } from './Menu';
+import { toggleGridSnap } from './GridControls';
 
 function toPointer(e: MouseEvent): ToolPointer {
   return { x: e.clientX, y: e.clientY, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey };
@@ -18,7 +19,7 @@ function isForm(target: EventTarget | null): boolean {
     : target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement || target.isContentEditable;
 }
 
-const TOOL_KEYS: Record<string, ToolId> = { b: 'bulldoze', m: 'move', v: 'select', p: 'paint', t: 'traffic', j: 'junction', l: 'lanes' };
+const TOOL_KEYS: Record<string, ToolId> = { b: 'bulldoze', m: 'move', v: 'select', p: 'paint', t: 'traffic', j: 'junction', l: 'lanes', o: 'roundabout' };
 
 export function bindInput(ui: UiContext, parts: { toolbar: Toolbar; topbar: TopBar; infobar: InfoBar; menu: Menu }): void {
   const { tools, renderer, history } = ui;
@@ -118,6 +119,11 @@ export function bindInput(ui: UiContext, parts: { toolbar: Toolbar; topbar: TopB
       return;
     }
     if (e.repeat) return;
+    // Shift+G: grid snapping. Before the draw mode keys, where plain G is Upgrade.
+    if (k === 'g' && e.shiftKey) {
+      toggleGridSnap(ui);
+      return;
+    }
     if (e.key === ' ') {
       e.preventDefault();
       topbar.togglePause();
@@ -131,7 +137,7 @@ export function bindInput(ui: UiContext, parts: { toolbar: Toolbar; topbar: TopB
       const id = TOOL_KEYS[k];
       if (id === 'paint') toolbar.openTab('paint');
       else if (id === 'traffic') toolbar.openTab('traffic');
-      else if (id === 'junction' || id === 'lanes') {
+      else if (id === 'junction' || id === 'lanes' || id === 'roundabout') {
         toolbar.openTab('control');
         tools.setTool(id);
       } else toolbar.toggleTool(id);

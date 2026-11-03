@@ -45,8 +45,11 @@ export function installTooltips(): void {
       tip.style.display = 'none';
       return;
     }
-    tip.textContent = target.dataset.tip ?? '';
-    if (target.dataset.key) tip.append(el('kbd', { text: target.dataset.key }));
+    // Name and hotkey on one line, an optional description under them.
+    tip.replaceChildren(
+      el('div', { class: 'tip-head' }, el('span', { class: 'tip-name', text: target.dataset.tip ?? '' }), target.dataset.key ? el('kbd', { text: target.dataset.key }) : null),
+      ...(target.dataset.desc ? [el('div', { class: 'tip-desc', text: target.dataset.desc })] : []),
+    );
     tip.style.display = 'block';
     place(target);
   });

@@ -12,6 +12,7 @@ it('templates', () => {
       const net = new RoadNetwork();
       stampTemplate(net, t.id, {}, { pos: { x: 0, y: 0, z: 0 }, rotation: 0, elevation: 0 });
       net.setTraffic({ multiplier: 0.7 });
+      const t0 = performance.now();
       const sim = new Simulation(net, seed);
       const hist: Record<string, number> = {};
       const locs: string[] = [];
@@ -30,12 +31,13 @@ it('templates', () => {
       let last = 0;
       for (let w = 0; w < 4; w++) {
         for (let i = 0; i < 3000; i++) { sim.step(); if (i % 5 === 0) checkBodies(sim, check); }
+        console.log(`   window ${w} ${t.id} s${seed} ${((performance.now() - t0) / 1000).toFixed(1)}s active ${sim.stats().active} safety ${sim.stats().safetyStops}`);
         arr.push(sim.stats().arrivedTotal - last); last = sim.stats().arrivedTotal;
       }
       safetyDebug.onStop = null;
       const st = sim.stats();
       const top = Object.entries(hist).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([a, b]) => `${a}:${b}`).join(' ');
-      console.log(`TPL ${t.id.padEnd(18)} s${seed} arr ${arr.join('/')} hits ${check.hits} coll ${st.collisions} safety ${st.safetyStops} stuck ${st.despawnedStuck} | ${top}`);
+      console.log(`TPL ${((performance.now() - t0) / 1000).toFixed(1)}s ${t.id.padEnd(18)} s${seed} arr ${arr.join('/')} hits ${check.hits} coll ${st.collisions} safety ${st.safetyStops} stuck ${st.despawnedStuck} | ${top}`);
       for (const l of locs) console.log('     ', l);
     }
   }

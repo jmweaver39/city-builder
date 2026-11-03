@@ -102,9 +102,11 @@ describe('Straight mode', () => {
     r.click(0, 0);
     r.click(100, 0);
     r.rightClick();
-    r.click(3, 3, { ctrl: true });
+    // Within the node's snap reach, but clear of the road's surface: a free end on
+    // top of the road would be refused as an overlap.
+    r.click(-3, 7, { ctrl: true });
     const n = r.net.nodes.length;
-    r.click(3, 90, { ctrl: true });
+    r.click(-3, 90, { ctrl: true });
     expect(r.net.nodes).toHaveLength(n + 2);
   });
 });

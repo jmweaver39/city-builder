@@ -12,6 +12,7 @@ import type {
   LaneKind,
   NodeGeom,
   Project,
+  RampAttach,
   RoadTypeDef,
   SegmentGeom,
 } from './types';
@@ -32,6 +33,7 @@ import {
   type RoadLaneInfo,
 } from './connectors';
 import { lanePolyline, type PolylineData } from './geometry';
+import { roundaboutLaneLinks } from './roundabout';
 
 /** A road lane before it has a dense index. Immutable once built. */
 export interface RoadLaneProto extends RoadLaneInfo {
@@ -90,16 +92,18 @@ export function buildNodeLanes(
   geomOf: (id: Id) => SegmentGeom | undefined,
   defOf: (id: Id) => RoadTypeDef,
   lanesOf: (id: Id) => readonly (RoadLaneProto | null)[],
+  attachOf?: (id: Id, atStart: boolean) => RampAttach | undefined,
 ): NodeLanes {
   const nodeId = layout.nodeId;
-  const arms = buildArmLanes(layout, geom, geomOf, defOf, lanesOf);
+  const arms = buildArmLanes(layout, geom, geomOf, defOf, lanesOf, attachOf);
   if (layout.kind === 'empty') return { arms, connectors: [], direct: [], directKey: '' };
   if (layout.kind === 'plain') {
     // No junction space here, so even user links join the road lanes directly.
     const links = control.laneLinks ? controlLaneLinks(control, arms) : plainJointLinks(arms);
     return { arms, connectors: [], direct: links, directKey: directKeyOf(links) };
   }
-  const links = control.laneLinks ? controlLaneLinks(control, arms) : autoLaneLinks(arms);
+  // Roundabout ring nodes have their own lane use, see core/roundabout.ts.
+  const links = control.laneLinks ? controlLaneLinks(control, arms) : (roundaboutLaneLinks(arms, defOf) ?? autoLaneLinks(arms));
   const connectors: ConnectorProto[] = [];
   for (const link of links) {
     const c = buildConnector(nodeId, link);

@@ -20,11 +20,22 @@ export interface RoadPreview {
 
 /** A dot, ring or line drawn over the world while a tool is active. */
 export type ToolMark =
-  | { kind: 'point'; pos: Vec3; color: string; radius: number }
-  | { kind: 'ring'; pos: Vec3; color: string; radius: number }
+  /**
+   * Point and ring radii are metres at a normal drawing zoom; the renderer keeps
+   * them about that size on screen when zooming (see markScale.ts). Set `px` for
+   * an exact radius in screen pixels instead.
+   */
+  | { kind: 'point'; pos: Vec3; color: string; radius: number; px?: number }
+  | { kind: 'ring'; pos: Vec3; color: string; radius: number; px?: number }
   | { kind: 'line'; points: Vec3[]; color: string; width: number; dashed?: boolean }
   /** Text label anchored at a world position. */
   | { kind: 'label'; pos: Vec3; text: string; color?: string };
+
+/** A region about to be zoned, drawn as a tinted area. */
+export interface ZoneGhost {
+  points: Vec3[];
+  color: string;
+}
 
 export interface HighlightSet {
   segments?: Id[];
@@ -79,6 +90,10 @@ export interface RendererApi {
   setShadows(on: boolean): void;
   /** Show the lane graph lines, for the lane tools and debugging. */
   setLaneDebug(on: boolean): void;
+  /** Tint zoned regions on the ground, while a zoning tool is active. */
+  setZoneOverlay(on: boolean): void;
+  /** Replace the regions being selected. Pass [] to clear. */
+  setZoneGhost(ghosts: ZoneGhost[]): void;
 
   getCamera(): CameraPose;
   setCamera(pose: Partial<CameraPose>, animate?: boolean): void;

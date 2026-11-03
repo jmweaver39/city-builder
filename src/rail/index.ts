@@ -6,3 +6,5 @@ export * from './rng';
 export * from './TrackGraph';
 export * from './TrackPath';
 export * from './TrainSim';
+export * from './lines';
+export * from './demo';

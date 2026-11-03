@@ -535,7 +535,24 @@ function buildCatalogue(): RoadTypeDef[] {
       shoulder: 1.5,
       speedKmh: 60,
     }),
+    ...[1, 2, 3].map((lanes) => roundaboutRing(lanes)),
   ];
+}
+
+/** The one-way ring of a roundabout, `roundabout-1` to `roundabout-3`. See core/roundabout.ts. */
+function roundaboutRing(lanes: number): RoadTypeDef {
+  return preset({
+    id: `roundabout-${lanes}`,
+    name: `Roundabout ring ${lanes}-lane`,
+    category: 'roundabout',
+    rank: 2,
+    forwardLanes: lanes,
+    backwardLanes: 0,
+    laneWidth: lanes === 1 ? 4.5 : 4,
+    shoulder: 0.75,
+    speedKmh: 30,
+    markings: { laneLine: 'dashed', edgeLine: 'solid', stopLines: false, turnArrows: false, crosswalk: 'none' },
+  });
 }
 
 export const BUILTIN_ROAD_TYPES: readonly RoadTypeDef[] = [...buildCatalogue(), ...RAIL_ROAD_TYPES];

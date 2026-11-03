@@ -256,10 +256,16 @@ function junctionColour(net: RoadNetwork, g: NodeGeom) {
   // A junction keeps a special surface only when every arm agrees on it.
   const first = net.getSegment(g.arms[0]?.segmentId ?? -1);
   const surface = first?.overrides.surface;
+  // The junction takes the asphalt of its most important road.
+  let main = g.arms[0] ? net.roadTypeOf(g.arms[0].segmentId) : undefined;
   for (const arm of g.arms) {
-    if (net.getSegment(arm.segmentId)?.overrides.surface !== surface) return surfaceColour(undefined);
+    const def = net.roadTypeOf(arm.segmentId);
+    if (main && def.rank > main.rank) main = def;
   }
-  return surfaceColour(first);
+  for (const arm of g.arms) {
+    if (net.getSegment(arm.segmentId)?.overrides.surface !== surface) return surfaceColour(undefined, main);
+  }
+  return surfaceColour(first, main);
 }
 
 function buildDeadEnd(net: RoadNetwork, g: NodeGeom, slot: number, out: RoadOutputs): void {
@@ -284,7 +290,7 @@ function buildDeadEnd(net: RoadNetwork, g: NodeGeom, slot: number, out: RoadOutp
     return pts;
   };
   const inner = arc(H);
-  fillPolygon(out.surf, inner, ROAD_LIFT, { color: surfaceColour(net.getSegment(arm.segmentId)), kind: KIND_JUNCTION, slot, bias: 0 });
+  fillPolygon(out.surf, inner, ROAD_LIFT, { color: surfaceColour(net.getSegment(arm.segmentId), net.roadTypeOf(arm.segmentId)), kind: KIND_JUNCTION, slot, bias: 0 });
   const clearance = y - terrainHeight(arm.centre.x, arm.centre.z);
   const kerb = W > 0 ? KERB_HEIGHT : 0;
   buildCorner(out.surf, inner, arc(H + W), kerb, kerb, { slot, clearance, ground: y - clearance });

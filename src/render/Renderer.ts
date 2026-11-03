@@ -6,13 +6,14 @@ import * as THREE from 'three';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import type { Vec3 } from '../core/types';
 import type { SimApi } from '../sim/api';
-import type { CameraPose, HighlightSet, OverlayMode, RendererApi, RendererExtras, RendererStats, RoadPreview, ToolMark } from './api';
+import type { CameraPose, HighlightSet, OverlayMode, RendererApi, RendererExtras, RendererStats, RoadPreview, ToolMark, ZoneGhost } from './api';
 import type { GridView } from './api';
 import { CameraRig } from './camera';
 import { RenderContext } from './context';
 import { DecalLayer } from './decals';
 import { NodeMarkingLayer } from './nodeMarkings';
 import { EndpointLayer } from './endpoints';
+import { ZoneLayer } from './zones';
 import { FurnitureLayer } from './furniture';
 import { Shared } from './materials';
 import { GrassLayer } from './grass';
@@ -68,6 +69,7 @@ export class Renderer implements RendererApi, RendererExtras {
   private vehicles: VehicleLayer;
   private furniture: FurnitureLayer;
   private endpoints: EndpointLayer;
+  private zones: ZoneLayer;
   private overlay: OverlayPainter;
   private tools: ToolLayer;
   private laneDebug: LaneDebug;
@@ -170,6 +172,8 @@ export class Renderer implements RendererApi, RendererExtras {
     this.furniture = new FurnitureLayer(net, this.shared, this.roads.surfaceMaterial, this.glow, aniso);
     scene.add(this.furniture.group);
     this.endpoints = new EndpointLayer(net, this.shared);
+    this.zones = new ZoneLayer(net);
+    scene.add(this.zones.group);
     scene.add(this.endpoints.group);
     this.overlay = new OverlayPainter(net, this.shared, this.roads);
     this.tools = new ToolLayer(net, container);
@@ -205,7 +209,10 @@ export class Renderer implements RendererApi, RendererExtras {
     this.nodeMarkings.flush();
     if (!change) return;
     if (change.decals || this.decals.followsRoads) this.decals.rebuild();
-    if (change.endpoints || change.structural) this.endpoints.rebuild();
+    if (change.endpoints || change.structural) {
+      this.endpoints.rebuild();
+      this.zones.markStale();
+    }
     for (const b of change.boxes) this.trees.markRegion(b[0], b[1], b[2], b[3]);
     if (change.endpoints || change.reset) this.trees.markAll();
     if (change.structural) this.furnitureStale = true;
@@ -272,8 +279,8 @@ export class Renderer implements RendererApi, RendererExtras {
       this.terrain.setLighting(this.rig.haze, this.rig.skyTop, this.rig.sun.color, this.rig.sun.intensity, this.rig.lightDir, night);
       this.furniture.updateNight();
       // Day haze is thin. Dusk air glows, and at night lamps should bloom.
-      this.post.bloomStrength = 0.1 + 0.55 * night;
-      this.post.setAtmosphere(this.rig.haze, this.rig.sunVector, this.rig.sun.color, 0.00007 + 0.00005 * (1 - night));
+      this.post.bloomStrength = 0.6 * night;
+      this.post.setAtmosphere(this.rig.haze, this.rig.sunVector, this.rig.sun.color, 0.000012 + 0.00002 * night);
     }
     this.shared.uCloud.value.x = this.time * 7;
     this.shared.uCloud.value.y = this.time * 3;
@@ -282,6 +289,7 @@ export class Renderer implements RendererApi, RendererExtras {
     this.furniture.updateSignals(this.sim);
     this.overlay.update(dt, this.sim);
     this.trees.update(dt, camera.position.x, camera.position.y, camera.position.z);
+    this.terrain.update(this.cam.target.x, this.cam.target.z, camera.position.y - this.cam.target.y);
     this.laneDebug.refresh();
     this.tools.updateLabels((p) => this.project(p), this.canvas.getBoundingClientRect());
 
@@ -319,6 +327,7 @@ export class Renderer implements RendererApi, RendererExtras {
     this.shared.uCloud.value.z = q.cloudShadows ? 0.42 : 0;
     this.trees.setQuality(q);
     this.grass.setQuality(q);
+    this.terrain.setPatch(q.groundPatch, q.groundStep);
     this.vehicles?.setQuality(q);
     for (const layer of this.context.layers) layer.setQuality?.(q, this.context);
     this.governor.reset();
@@ -361,6 +370,7 @@ export class Renderer implements RendererApi, RendererExtras {
     this.vehicles.dispose();
     this.furniture.dispose();
     this.endpoints.dispose();
+    this.zones.dispose();
     this.tools.dispose();
     this.laneDebug.dispose();
     for (const layer of this.context.layers) layer.dispose?.();
@@ -461,6 +471,14 @@ export class Renderer implements RendererApi, RendererExtras {
   /** The optional drawing grid around a point. Null hides it. */
   setGrid(grid: GridView | null): void {
     this.grid.set(grid);
+  }
+
+  setZoneOverlay(on: boolean): void {
+    this.zones.setVisible(on);
+  }
+
+  setZoneGhost(ghosts: ZoneGhost[]): void {
+    this.zones.setGhost(ghosts);
   }
 
   setLaneDebug(on: boolean): void {

@@ -31,6 +31,8 @@ export class Buckets {
   /** Position of the rearmost bumper on each lane, Infinity when empty. */
   tailRear: Float64Array;
   tailV: Float64Array;
+  /** Whose rear that is, or -1. */
+  tailVeh: Int32Array;
   /** Length spoken for on the way into each lane, by vehicles on or cleared for connectors. */
   reserve: Float64Array;
   /** Last lane change into each lane: the step, and where. */
@@ -44,6 +46,7 @@ export class Buckets {
     this.fill = new Int32Array(n);
     this.tailRear = new Float64Array(n);
     this.tailV = new Float64Array(n);
+    this.tailVeh = new Int32Array(n).fill(-1);
     this.reserve = new Float64Array(n);
     this.changeTick = new Int32Array(n).fill(-1);
     this.changeAt = new Float64Array(n);
@@ -75,7 +78,7 @@ export class Buckets {
   }
 
   build(g: CompiledGraph, veh: VehicleStore): void {
-    const { start, count, fill, eV, eS, eT, order, tailRear, tailV, reserve } = this;
+    const { start, count, fill, eV, eS, eT, order, tailRear, tailV, tailVeh, reserve } = this;
     const { len: laneLen, isConn, toLane, n } = g;
     const { alive, lane, s, len, prev1, prev2, lcFrom, reqLane, permit, seen, v: speed } = veh;
     const tick = ++this.buildTick;
@@ -166,6 +169,7 @@ export class Buckets {
       if (a === b) {
         tailRear[l] = Infinity;
         tailV[l] = 0;
+        tailVeh[l] = -1;
         continue;
       }
       for (let i = a + 1; i < b; i++) {
@@ -185,6 +189,7 @@ export class Buckets {
       }
       let rear = Infinity;
       let rearV = 0;
+      let rearVeh = -1;
       for (let i = a; i < b; i++) {
         if (eT[i] === ENTRY_REAL) order[o++] = eV[i];
         if (eT[i] === ENTRY_REQUEST) continue;
@@ -192,10 +197,12 @@ export class Buckets {
         if (r < rear) {
           rear = r;
           rearV = speed[eV[i]];
+          rearVeh = eV[i];
         }
       }
       tailRear[l] = rear;
       tailV[l] = rearV;
+      tailVeh[l] = rearVeh;
     }
     this.orderCount = o;
   }

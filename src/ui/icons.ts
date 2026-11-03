@@ -50,6 +50,19 @@ export const ICONS = {
   shop: svg('<path d="M4 9 5.500 4h13L20 9M4 9v11h16V9M4 9h16M10 20v-6h4v6"/>'),
   factory: svg('<path d="M3 20V10l6 4v-4l6 4V5h4l2 15z"/>'),
   office: svg('<rect x="6" y="3" width="12" height="18" rx="1"/><path d="M10 7h.01M14 7h.01M10 11h.01M14 11h.01M10 15h.01M14 15h.01"/>'),
+  train: svg('<rect x="6" y="3" width="12" height="13" rx="3"/><path d="M6 10h12M9 20l-2 2M15 20l2 2M9 13h.01M15 13h.01M8 16l-1 4h10l-1-4"/>'),
+  station: svg('<path d="M3 9 12 4l9 5"/><path d="M5 9v7M19 9v7M3 16h18M3 20h18"/>'),
+  trainLine: svg('<circle cx="5" cy="17" r="2"/><circle cx="12" cy="7" r="2"/><circle cx="19" cy="15" r="2"/><path d="M6.4 15.6 10.7 8.6M13.6 8.2l4.2 5.4"/>'),
+  // Traffic Control cards.
+  signalLight: svg('<rect x="8" y="2.5" width="8" height="15" rx="2.5"/><circle cx="12" cy="6.5" r="1.3"/><circle cx="12" cy="10" r="1.3"/><circle cx="12" cy="13.5" r="1.3"/><path d="M12 17.5V22"/>'),
+  stopSign: svg('<path d="M8.3 3h7.4L21 8.3v7.4L15.7 21H8.3L3 15.7V8.3z"/><path d="M8 12h8"/>'),
+  allStop: svg('<path d="M9.5 5h5L18 8.5v5L14.5 17h-5L6 13.5v-5z"/><path d="M12 1.5v1.5M12 19v1.5M1.5 11h1.5M21 11h1.5"/>'),
+  yieldSign: svg('<path d="M3 4h18L12 20z"/><path d="M7.5 7h9L12 15z"/>'),
+  priorityRoad: svg('<path d="M12 2.5 21.5 12 12 21.5 2.5 12z"/><path d="M12 7.5 16.5 12 12 16.5 7.5 12z"/>'),
+  autoControl: svg('<path d="M5 19 10.5 5h3L19 19"/><path d="M7.5 13h9"/><path d="M19 3v4M17 5h4"/>'),
+  roundabout: svg('<circle cx="12" cy="12" r="5.5"/><path d="M12 2v4.5M12 17.5V22M2 12h4.5M17.5 12H22"/><path d="m15.5 7.2 1.4 1.8-2.2.4"/>'),
+  advanced: svg('<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>'),
+  more: svg('<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>'),
 } as const;
 
 export type IconName = keyof typeof ICONS;

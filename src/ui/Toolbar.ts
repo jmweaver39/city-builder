@@ -1,17 +1,23 @@
 /** The bottom toolbar: category tabs, thumbnail cards and the left options strip. */
 import { BUILTIN_ROAD_TYPES, driveLaneCount, isOneWay } from '../core/roadTypes';
-import type { DecalKind, EndpointKind, PaintColor, RoadCategory, RoadTypeDef } from '../core/types';
+import type { DecalKind, EndpointKind, PaintColor, RoadCategory, RoadTypeDef, ZoneKind } from '../core/types';
 import { MAX_ELEVATION, MIN_ELEVATION } from '../core/terrain';
 import { defaultDecalWidth, LINE_DECALS, LINE_STYLES, AREA_DECALS } from '../tools/PaintTool';
 import { formatElevation } from '../tools/RoadTool';
 import { ENDPOINT_NAMES } from '../tools/TrafficTool';
+import { ZONE_COLORS } from '../tools/ZoneTool';
+import { ZONE_NAMES } from '../tools/zoneOps';
 import type { DrawMode, ToolId } from '../tools/types';
 import type { UiContext } from './context';
+import { renderRailTray } from './RailPanels';
+import { ControlTray } from './ControlTray';
 import { checkbox, clear, el, hiDpiCanvas, iconButton, row, selectInput, sliderInput, textInput } from './dom';
 import { ICONS, type IconName } from './icons';
 import { drawDecalThumb, drawLineThumb, drawRoadThumb, PAINT_CSS } from './thumbnails';
+import { gridBlockButton, gridSnapButtons, initGridPrefs, syncGridControls } from './GridControls';
 
 export type TabId = RoadCategory | 'intersections' | 'control' | 'paint' | 'traffic';
+
 
 const ROAD_TABS: readonly RoadCategory[] = ['street', 'avenue', 'oneway', 'highway', 'ramp', 'custom'];
 
@@ -25,6 +31,7 @@ const TABS: { id: TabId; label: string; icon: IconName; key?: string }[] = [
   { id: 'control', label: 'Traffic Control', icon: 'control', key: 'J' },
   { id: 'paint', label: 'Paint', icon: 'paint', key: 'P' },
   { id: 'traffic', label: 'Traffic', icon: 'traffic', key: 'T' },
+  { id: 'rail', label: 'Trains', icon: 'train' },
 ];
 
 const DRAW_MODES: { mode: DrawMode; icon: IconName; tip: string; key: string }[] = [
@@ -66,6 +73,7 @@ export class Toolbar {
   private readonly options = el('div', { class: 'options' });
   private readonly cards = el('div', { class: 'cards' });
   private tab: TabId | null = null;
+  private controlTray: ControlTray | null = null;
 
   constructor(private readonly ui: UiContext) {
     const tabRow = el('div', { class: 'tabs', attrs: { role: 'tablist' } });
@@ -96,6 +104,7 @@ export class Toolbar {
     this.root = el('div', { class: 'panel toolbar' }, this.tray, tabRow);
     ui.dock.append(this.root);
     ui.tools.onChange(() => this.syncState());
+    initGridPrefs(ui);
     ui.net.onChange((c) => {
       if (c.settingsChanged || c.reset) {
         if (this.tab === 'custom') this.render();
@@ -123,9 +132,9 @@ export class Toolbar {
   openTab(id: TabId | null): void {
     this.tab = id;
     this.render();
-    if (id === 'control' && this.tools.active.id !== 'lanes') this.tools.setTool('junction');
+    if (id === 'control' && !['lanes', 'roundabout', 'junction'].includes(this.tools.active.id)) this.tools.setTool('junction');
     if (id === 'paint') this.tools.setTool('paint');
-    if (id === 'traffic') this.tools.setTool('traffic');
+    if (id === 'traffic' && this.tools.active.id !== 'zone') this.tools.setTool('traffic');
     if (id === 'intersections' && this.tools.settings.template.id) this.tools.setTool('template');
     this.syncState();
   }
@@ -141,12 +150,24 @@ export class Toolbar {
     else if (id === 'control') this.renderControl();
     else if (id === 'paint') this.renderPaint();
     else if (id === 'traffic') this.renderTraffic();
+    else if (id === 'rail') {
+      this.renderRoads('rail');
+      renderRailTray(this.ui, this.options, this.cards);
+      this.syncState();
+    }
   }
 
   private roadCard(def: RoadTypeDef): HTMLElement {
     const canvas = hiDpiCanvas(102, 52);
     drawRoadThumb(canvas, def, 102, 52);
-    const lanes = isOneWay(def) ? `${driveLaneCount(def)} one-way` : `${driveLaneCount(def, 1)}+${driveLaneCount(def, -1)} lanes`;
+    const lanes =
+      def.category === 'rail'
+        ? def.lanes.length === 2 && Math.abs(def.lanes[0].offset) > 0.5
+          ? 'Two tracks'
+          : 'One track, both ways'
+        : isOneWay(def)
+          ? `${driveLaneCount(def)} one-way`
+          : `${driveLaneCount(def, 1)}+${driveLaneCount(def, -1)} lanes`;
     const card = el(
       'button',
       {
@@ -158,7 +179,9 @@ export class Toolbar {
           click: () => {
             this.tools.settings.roadType = def.id;
             if (this.tools.settings.drawMode === 'upgrade' && this.tools.active.id !== 'road') this.tools.settings.drawMode = 'straight';
-            this.tools.setTool('road');
+            // The Grid Block tool builds with the selected road, so picking one keeps it.
+            if (this.tools.active.id === 'gridBlock') this.tools.settingsChanged();
+            else this.tools.setTool('road');
           },
         },
       },
@@ -237,6 +260,7 @@ export class Toolbar {
           this.tools.settingsChanged();
         },
       }),
+      gridBlockButton(this.ui),
     );
 
     const snaps = el('div', { class: 'opt-row' });
@@ -256,6 +280,7 @@ export class Toolbar {
     toggle('snapSegments', 'snapRoad', 'Snap along roads, splitting them');
     toggle('snapAngle', 'angle', 'Snap to 15 degree guides');
     toggle('snapLength', 'ruler', 'Snap length to 8 m steps');
+    snaps.append(...gridSnapButtons(this.ui));
 
     const elevation = el(
       'div',
@@ -328,7 +353,7 @@ export class Toolbar {
         ),
       );
     }
-    const roadOptions = [{ value: '', label: 'Template default' }, ...BUILTIN_ROAD_TYPES.map((r) => ({ value: r.id, label: r.name }))];
+    const roadOptions = [{ value: '', label: 'Template default' }, ...BUILTIN_ROAD_TYPES.filter((r) => r.category !== 'rail').map((r) => ({ value: r.id, label: r.name }))];
     this.options.append(
       el('div', { class: 'opt-title', text: 'Road type' }),
       selectInput(roadOptions, s.roadType ?? '', (v) => {
@@ -350,30 +375,8 @@ export class Toolbar {
   }
 
   private renderControl(): void {
-    const card = (tool: ToolId, icon: IconName, name: string, meta: string, key: string) =>
-      el(
-        'button',
-        {
-          class: 'card',
-          dataset: { tool },
-          tip: name,
-          keyHint: key,
-          attrs: { type: 'button', 'aria-label': name },
-          on: { click: () => this.tools.setTool(tool) },
-        },
-        el('div', { class: 'art', html: ICONS[icon] }),
-        el('div', { class: 'card-name', text: name }),
-        el('div', { class: 'card-meta', text: meta }),
-      );
-    this.cards.append(
-      card('junction', 'control', 'Junction control', 'Signs and signals', 'J'),
-      card('lanes', 'lanes', 'Lane connector', 'Link lanes by hand', 'L'),
-    );
-    this.options.append(
-      el('div', { class: 'opt-title', text: 'Lane connector' }),
-      el('button', { class: 'btn reset-lanes', text: 'Reset to Auto', tip: 'Back to automatic connectors at this junction', attrs: { type: 'button' }, on: { click: () => this.tools.lanes.resetToAuto() } }),
-      el('div', { class: 'small muted', text: 'Click a junction, an amber arriving lane, then a cyan leaving lane.' }),
-    );
+    this.controlTray = new ControlTray(this.ui, this.cards, this.options);
+    this.controlTray.render();
     this.syncState();
   }
 
@@ -504,39 +507,135 @@ export class Toolbar {
 
   private renderTraffic(): void {
     const s = this.tools.settings;
-    for (const c of ENDPOINT_CARDS) {
+    const gateway = ENDPOINT_CARDS[0];
+    this.cards.append(
+      el(
+        'button',
+        {
+          class: 'card',
+          dataset: { endpoint: 'gateway' },
+          tip: 'Gateway: traffic enters and leaves the map at a dead end',
+          attrs: { type: 'button', 'aria-label': 'Gateway' },
+          on: {
+            click: () => {
+              s.trafficKind = 'gateway';
+              this.tools.setTool('traffic');
+              this.tools.settingsChanged();
+              this.renderTrafficOptions();
+              this.syncState();
+            },
+          },
+        },
+        el('div', { class: 'art', html: ICONS[gateway.icon] }),
+        el('div', { class: 'card-name', text: 'Gateway' }),
+        el('div', { class: 'card-meta', text: gateway.meta }),
+      ),
+    );
+    const zones: { kind: ZoneKind | 'none'; icon: IconName; meta: string }[] = [
+      { kind: 'residential', icon: 'home', meta: 'Homes' },
+      { kind: 'commercial', icon: 'shop', meta: 'Shops' },
+      { kind: 'industrial', icon: 'factory', meta: 'Industry' },
+      { kind: 'office', icon: 'office', meta: 'Offices' },
+      { kind: 'none', icon: 'bulldoze', meta: 'Remove zoning' },
+    ];
+    for (const z of zones) {
       this.cards.append(
         el(
           'button',
           {
             class: 'card',
-            dataset: { endpoint: c.kind },
-            tip: ENDPOINT_NAMES[c.kind],
-            attrs: { type: 'button', 'aria-label': ENDPOINT_NAMES[c.kind] },
+            dataset: { zone: z.kind },
+            tip: `${ZONE_NAMES[z.kind]}: fill a block, drag along roads, or draw a shape`,
+            attrs: { type: 'button', 'aria-label': ZONE_NAMES[z.kind] },
             on: {
               click: () => {
-                s.trafficKind = c.kind;
-                this.tools.setTool('traffic');
+                s.zone.kind = z.kind;
+                this.tools.setTool('zone');
                 this.tools.settingsChanged();
+                this.renderTrafficOptions();
                 this.syncState();
               },
             },
           },
-          el('div', { class: 'art', html: ICONS[c.icon] }),
-          el('div', { class: 'card-name', text: ENDPOINT_NAMES[c.kind] }),
-          el('div', { class: 'card-meta', text: c.meta }),
+          el('div', { class: 'art', html: ICONS[z.icon], style: { color: ZONE_COLORS[z.kind] } }),
+          el('div', { class: 'card-name', text: ZONE_NAMES[z.kind] }),
+          el('div', { class: 'card-meta', text: z.meta }),
         ),
       );
     }
-    this.options.append(
-      el('div', { class: 'opt-title', text: 'Auto gateways' }),
-      row('Dead ends', checkbox(this.ui.net.traffic.autoGateways, (v) => {
-        this.ui.history.hint('Auto gateways');
-        this.ui.net.setTraffic({ autoGateways: v });
-      }), 'Treat every dead end with no endpoint as a gateway'),
-      el('div', { class: 'small muted', text: 'Click an endpoint to edit its rate, attraction and mix.' }),
-    );
+    this.renderTrafficOptions();
     this.syncState();
+  }
+
+  /** Zoning options when a zone tool is active, gateway options otherwise. */
+  private renderTrafficOptions(): void {
+    clear(this.options);
+    const z = this.tools.settings.zone;
+    if (this.tools.active.id !== 'zone') {
+      this.options.append(
+        el('div', { class: 'opt-title', text: 'Auto gateways' }),
+        row('Dead ends', checkbox(this.ui.net.traffic.autoGateways, (v) => {
+          this.ui.history.hint('Auto gateways');
+          this.ui.net.setTraffic({ autoGateways: v });
+        }), 'Treat every dead end with no endpoint as a gateway'),
+        el('div', { class: 'small muted', text: 'Pick a zone to zone land. Click an endpoint or region to edit it.' }),
+      );
+      return;
+    }
+    const changed = () => this.tools.settingsChanged();
+    const modes = el('div', { class: 'opt-row' });
+    const mode = (m: typeof z.mode, label: string, tip: string) =>
+      modes.append(
+        el('button', {
+          class: `btn zone-mode ${z.mode === m ? 'primary' : ''}`,
+          text: label,
+          tip,
+          attrs: { type: 'button' },
+          dataset: { mode: m },
+          on: {
+            click: () => {
+              z.mode = m;
+              changed();
+              this.renderTrafficOptions();
+            },
+          },
+        }),
+      );
+    mode('block', 'Block', 'Click inside land enclosed by roads');
+    mode('frontage', 'Frontage', 'Drag along roads, on the side to zone');
+    mode('rect', 'Rectangle', 'Drag a rectangle. Corners snap to road edges');
+    mode('polygon', 'Polygon', 'Click corners. Enter or the first corner finishes');
+    const metres = (v: number) => `${v} m`;
+    this.options.append(
+      el('div', { class: 'opt-title', text: 'Mode' }),
+      modes,
+      z.kind === 'none'
+        ? el('div', { class: 'small muted', text: 'Dezone removes zoning wherever it covers.' })
+        : row('Density', selectInput([{ value: 'low', label: 'Low' }, { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' }], z.density, (v) => {
+            z.density = v;
+            changed();
+          })),
+      row('Depth', sliderInput(z.depth, { min: 8, max: 120, step: 4, format: metres }, (v) => {
+        z.depth = v;
+        changed();
+      }), 'How deep a frontage strip reaches back from the road'),
+      row('Setback', sliderInput(z.setback, { min: 0, max: 20, step: 1, format: metres }, (v) => {
+        z.setback = v;
+        changed();
+      }), 'Gap kept from the road edge'),
+      row('Snap to roads', checkbox(z.snap, (v) => {
+        z.snap = v;
+        changed();
+      })),
+      row('Snap distance', sliderInput(z.snapDistance, { min: 2, max: 30, step: 1, format: metres }, (v) => {
+        z.snapDistance = v;
+        changed();
+      })),
+      row('Skip highways', checkbox(z.excludeFast, (v) => {
+        z.excludeFast = v;
+        changed();
+      }), 'Highways, ramps and rail cannot front a zone'),
+    );
   }
 
   /** Reflect tool state in the buttons without rebuilding the tray. */
@@ -562,6 +661,7 @@ export class Toolbar {
     for (const key of ['snapNodes', 'snapSegments', 'snapAngle', 'snapLength'] as const) {
       this.root.querySelector(`.snap-${key}`)?.classList.toggle('active', s[key]);
     }
+    syncGridControls(this.root, this.ui);
     const elevation = this.root.querySelector<HTMLElement>('.elevation-value');
     if (elevation) {
       elevation.textContent = formatElevation(s.elevation);
@@ -577,14 +677,17 @@ export class Toolbar {
     this.cards.querySelectorAll<HTMLElement>('.card').forEach((card) => {
       const d = card.dataset;
       let on = false;
-      if (d.road) on = active === 'road' && s.roadType === d.road;
+      if (d.road) on = (active === 'road' || active === 'gridBlock') && s.roadType === d.road;
       if (d.template) on = active === 'template' && s.template.id === d.template;
       if (d.decal) on = active === 'paint' && s.paint.kind === d.decal;
       if (d.line) on = active === 'paint' && s.paint.kind === 'line' && s.paint.lineStyle === d.line;
       if (d.endpoint) on = active === 'traffic' && s.trafficKind === d.endpoint;
+      if (d.zone) on = active === 'zone' && s.zone.kind === d.zone;
       if (d.tool) on = active === d.tool;
+      if (d.control) return;
       card.classList.toggle('active', on);
     });
     this.root.querySelector<HTMLButtonElement>('.reset-lanes')?.toggleAttribute('disabled', tools.lanes.node === null);
+    if (this.tab === 'control') this.controlTray?.sync();
   }
 }

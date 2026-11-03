@@ -18,3 +18,5 @@ export * from './serialize';
 export * from './spatial';
 export * from './invariants';
 export * from './RoadNetwork';
+export * from './ramps';
+export * from './overlap';

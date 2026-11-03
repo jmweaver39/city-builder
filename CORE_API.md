@@ -62,15 +62,32 @@ Built-in road ids: `street-2`, `street-2-bike`, `street-2-oneway`, `street-4`, `
   errors when the gap is over 1.5 m and under 6 m.
 - Ramps are rank 2. `auto` junction mode never picks all-stop.
 
+## Ramps and controlled access (`ramps.ts`)
+
+- `SegmentOverrides.attachA` / `attachB`: `{ lane, hostSide }`. That end of the road sits on the outer
+  edge of the host road's carriageway at its node instead of on the node, and the host's outermost
+  `lane + 1` lanes feed or take it. `cubicOf` returns the moved curve; `nodeCubicOf` the raw one. Pass
+  `startAttach` / `endAttach` to `drawRoad` and `validateDraft`; `makeAttach` builds one. Attaches survive
+  save, split, reverse and moving the host.
+- At a junction with three or more arms and a `highway` arm, connectors follow `linkControlledAccess`:
+  each carriageway keeps to itself, side roads branch off or join on their own side only (merge-only,
+  right in and right out), never across a median, with no left or U-turns across a two-way highway.
+  `effectiveControl` gives `none` there in auto mode. Hand-set `laneLinks` still win.
+- `validateDraft` adds `wrongWay` (error: a one-way road joining against the highway traffic) and
+  `atGradeHighway` (warning: a two-way road joining a highway at grade).
+
 ## Known limitations
 
 1. About 4.9% of junctions under random fuzz use a hull outline fallback (`outlineSimplified`),
    nearly all from tiny stubs. Valid polygon, loses rounded corners.
 2. At the 80 m trim cap, a ramp hugging the highway still overlaps it past the cut, so the two road
-   surfaces overlap with no gore. The renderer must draw this cleanly. Ramps should leave at more than a
-   few degrees.
+   surfaces overlap with no gore. The renderer clips each road's lines off the other's surface there
+   (`render/gore.ts`). A ramp attached to a lane (below) leaves from the carriageway edge, which roughly
+   halves the trim, and `validateDraft` allows such an overlap only for `DIVERGE_ALLOWANCE` (150 m).
 3. Only `drawRoad` creates junctions at crossings. `moveNode`, `setSegmentControls` and `addSegment` do
    not. A road crossing itself is reported by `validateDraft`, not resolved.
-4. Two nearly collinear overlapping roads give no crossing hits. Only `validateDraft` catches them.
+4. Two nearly collinear overlapping roads give no crossing hits. `validateDraft` refuses them with a
+   `tooClose` error ("Overlaps an existing road.", with the stretch in `issue.stretch`), as do the Move
+   tool and templates through `segmentOverlapIssues` in `overlap.ts`. `addSegment` does not check.
 5. A bike lane meeting a junction with no bike lanes gets a turnaround or stops. The no-orphan guarantee
    covers drive lanes.

@@ -2,16 +2,23 @@
  * The optional drawing grid, shown on the ground while the grid is on and a road
  * tool is active.
  *
+ * Adaptive like a CAD grid: finer subdivisions fade in as the camera closes in
+ * and coarser levels take over zoomed out (levels from gridLevels.ts). Each level
+ * fades by its cell size in screen pixels, so zooming crossfades with no popping
+ * and lines are dropped before they get dense enough to shimmer. Lines further
+ * apart on screen draw brighter, and major lines stay brightest.
+ *
  * One quad around the cursor in the overlay scene. Lines are found per pixel from
- * world position, so they stay a crisp pixel or two wide at any zoom, and minor
- * lines fade out before they get dense enough to shimmer. Depth testing is off,
- * like the other tool marks, so the grid never z-fights terrain or road surfaces
- * and reads on asphalt too. A dark halo under each light line keeps it legible on
- * bright grass by day; it is dimmed a little at night.
+ * world position, so they stay a crisp pixel or two wide at any zoom. Depth
+ * testing is off, like the other tool marks, so the grid never z-fights terrain
+ * or road surfaces and reads on asphalt too. A dark halo under each light line
+ * keeps it legible on bright grass by day; it is dimmed a little at night. The
+ * fade radius grows with camera distance so the grid still reads map-wide.
  */
 import * as THREE from 'three';
 import type { GridView } from './api';
 import type { RenderContext, RenderLayer } from './context';
+import { GRID_FADE_PX, GRID_MAX_LEVELS, gridLevels } from './gridLevels';
 
 const VERT = /* glsl */ `
 varying vec2 vWorld;
@@ -23,42 +30,47 @@ void main() {
 `;
 
 const FRAG = /* glsl */ `
+#define MAX_LEVELS ${GRID_MAX_LEVELS}
 uniform vec2 uOrigin;
 uniform vec2 uRot;
-uniform float uSpacing;
-uniform float uMajor;
+uniform float uLevels[MAX_LEVELS];
+uniform float uWeights[MAX_LEVELS];
+uniform int uCount;
+uniform vec2 uFade;
+uniform float uPixelRatio;
 uniform vec2 uCenter;
 uniform float uRadius;
 uniform float uNight;
 varying vec2 vWorld;
 
-// Distance to the nearest line of each family, in pixels.
-vec2 linePx(vec2 c) {
-  vec2 w = max(fwidth(c), vec2(1e-6));
-  return abs(fract(c - 0.5) - 0.5) / w;
-}
-
 void main() {
   vec2 d = vWorld - uOrigin;
   vec2 l = vec2(dot(d, uRot), dot(d, vec2(-uRot.y, uRot.x)));
-  vec2 c = l / uSpacing;
-  vec2 cm = c / uMajor;
-  vec2 pm = linePx(c);
-  vec2 pM = linePx(cm);
-  float dMinor = min(pm.x, pm.y);
-  float dMajor = min(pM.x, pM.y);
-  // Cells smaller than a few pixels would only shimmer.
-  float cellPx = 1.0 / max(max(fwidth(c).x, fwidth(c).y), 1e-6);
-  float minorOn = smoothstep(6.0, 14.0, cellPx);
-  float majorOn = smoothstep(6.0, 14.0, cellPx * uMajor);
-  float minorCore = (1.0 - smoothstep(0.35, 1.1, dMinor)) * minorOn;
-  float majorCore = (1.0 - smoothstep(0.6, 1.6, dMajor)) * majorOn;
-  float core = max(minorCore * 0.42, majorCore * 0.78);
-  float halo = max((1.0 - smoothstep(0.8, 2.6, dMinor)) * minorOn * 0.22, (1.0 - smoothstep(1.2, 3.4, dMajor)) * majorOn * 0.32);
+  // Metres per drawing-buffer pixel along each grid axis.
+  vec2 w = max(fwidth(l), vec2(1e-6));
+  // Density is judged on the more squashed axis, in CSS pixels, so lines going
+  // edge-on towards the horizon drop out before they alias.
+  float mpp = max(w.x, w.y) * uPixelRatio;
+  float core = 0.0;
+  float halo = 0.0;
+  for (int i = 0; i < MAX_LEVELS; i++) {
+    if (i >= uCount) break;
+    float s = uLevels[i];
+    float cellPx = s / mpp;
+    float on = smoothstep(uFade.x, uFade.y, cellPx);
+    if (on <= 0.0) continue;
+    vec2 c = l / s;
+    vec2 dpx = abs(fract(c - 0.5) - 0.5) * s / w;
+    float dl = min(dpx.x, dpx.y);
+    // Lines that are far apart on screen read as the structure, so draw them brighter.
+    float wt = uWeights[i] * mix(0.6, 1.0, smoothstep(16.0, 160.0, cellPx)) * on;
+    float width = mix(0.9, 1.5, uWeights[i]) * uPixelRatio;
+    core = max(core, (1.0 - smoothstep(width * 0.4, width * 1.1, dl)) * wt);
+    halo = max(halo, (1.0 - smoothstep(width, width * 2.8, dl)) * wt * 0.4);
+  }
   float dist = length(vWorld - uCenter);
-  float fade = 1.0 - smoothstep(uRadius * 0.3, uRadius, dist);
-  float dim = mix(1.0, 0.8, uNight);
-  core *= fade * dim;
+  float fade = 1.0 - smoothstep(uRadius * 0.2, uRadius, dist);
+  core *= fade * mix(1.0, 0.8, uNight);
   halo *= fade * mix(1.0, 0.5, uNight);
   float a = core + halo * (1.0 - core);
   if (a < 0.003) discard;
@@ -73,6 +85,7 @@ export class GridLayer implements RenderLayer {
   readonly mesh: THREE.Mesh;
   private readonly material: THREE.ShaderMaterial;
   private view: GridView | null = null;
+  private readonly eye = new THREE.Vector3();
 
   constructor(private readonly ctx: RenderContext) {
     this.material = new THREE.ShaderMaterial({
@@ -81,8 +94,11 @@ export class GridLayer implements RenderLayer {
       uniforms: {
         uOrigin: { value: new THREE.Vector2() },
         uRot: { value: new THREE.Vector2(1, 0) },
-        uSpacing: { value: 32 },
-        uMajor: { value: 4 },
+        uLevels: { value: new Array<number>(GRID_MAX_LEVELS).fill(1) },
+        uWeights: { value: new Array<number>(GRID_MAX_LEVELS).fill(0) },
+        uCount: { value: 0 },
+        uFade: { value: new THREE.Vector2(GRID_FADE_PX[0], GRID_FADE_PX[1]) },
+        uPixelRatio: { value: 1 },
         uCenter: { value: new THREE.Vector2() },
         uRadius: { value: 300 },
         uNight: { value: 0 },
@@ -104,9 +120,9 @@ export class GridLayer implements RenderLayer {
     ctx.overlayScene.add(this.mesh);
   }
 
-  /** Fade radius for a spacing: a dozen or so cells, never tiny or huge. */
-  static radiusFor(spacing: number): number {
-    return Math.min(700, Math.max(140, spacing * 9));
+  /** Fade radius for a spacing and camera distance: enough to work in, never the whole map close up. */
+  static radiusFor(spacing: number, cameraDistance = 0): number {
+    return Math.min(4000, Math.max(120, spacing * 6, cameraDistance * 0.9));
   }
 
   set(view: GridView | null): void {
@@ -116,13 +132,27 @@ export class GridLayer implements RenderLayer {
     const u = this.material.uniforms;
     u.uOrigin.value.set(view.originX, view.originZ);
     u.uRot.value.set(Math.cos(view.rotation), Math.sin(view.rotation));
-    u.uSpacing.value = Math.max(0.5, view.spacing);
-    u.uMajor.value = Math.max(1, view.majorEvery);
+    const levels = gridLevels(Math.max(0.5, view.spacing), Math.max(2, view.majorEvery));
+    const sp = u.uLevels.value as number[];
+    const wt = u.uWeights.value as number[];
+    for (let i = 0; i < GRID_MAX_LEVELS; i++) {
+      sp[i] = levels[i]?.spacing ?? 1;
+      wt[i] = levels[i]?.weight ?? 0;
+    }
+    u.uCount.value = levels.length;
     u.uCenter.value.set(view.center.x, view.center.z);
-    const r = GridLayer.radiusFor(view.spacing);
-    u.uRadius.value = r;
-    this.mesh.scale.set(r, 1, r);
     this.mesh.position.set(view.center.x, view.elevation + 0.05, view.center.z);
+    this.place();
+  }
+
+  /** Size the quad and fade radius for the camera distance. */
+  private place(): void {
+    const view = this.view;
+    if (!view) return;
+    this.eye.set(view.center.x, view.elevation, view.center.z);
+    const r = GridLayer.radiusFor(view.spacing, this.ctx.camera.position.distanceTo(this.eye));
+    this.material.uniforms.uRadius.value = r;
+    this.mesh.scale.set(r, 1, r);
   }
 
   get current(): GridView | null {
@@ -130,7 +160,11 @@ export class GridLayer implements RenderLayer {
   }
 
   update(): void {
-    if (this.view) this.material.uniforms.uNight.value = this.ctx.night;
+    if (!this.view) return;
+    const u = this.material.uniforms;
+    u.uNight.value = this.ctx.night;
+    u.uPixelRatio.value = this.ctx.gl.getPixelRatio();
+    this.place();
   }
 
   dispose(): void {

@@ -19,6 +19,7 @@ import type {
   NodeLineMarking,
   NodeMarking,
   Project,
+  RampAttach,
   RoadNode,
   RoadTypeDef,
   Segment,
@@ -56,7 +57,7 @@ import {
   type NodeLanes,
   type RoadLaneProto,
 } from './laneGraph';
-import { add, clamp, copy, dist, distXZ, dotXZ, isFiniteVec, lerp, rightOf, sub } from './math';
+import { add, clamp, copy, dist, distXZ, dotXZ, isFiniteVec, lerp, normalizeXZ, rightOf, sub } from './math';
 import {
   builtinRoadType,
   effectiveLanes,
@@ -87,6 +88,8 @@ import {
   type ReverseReport,
 } from './reverse';
 import { SpatialHash } from './spatial';
+import { attachAt, attachedCubic, attachPointFrom, hostDirection, pickHost, rampEndIssues, type AttachAccess } from './ramps';
+import { draftOverlapIssues } from './overlap';
 import { GRADE_CLEARANCE, MAP_HALF_SIZE, MAX_ELEVATION, MIN_ELEVATION } from './terrain';
 
 // ---------------------------------------------------------------------------
@@ -115,6 +118,12 @@ export interface DrawRoadParams {
   c2?: Vec3;
   roadType: string;
   overrides?: SegmentOverrides;
+  /**
+   * Leave from, or join, a lane of the road at a segment or node anchor, as a ramp
+   * does. The end sits on that road's carriageway edge. See core/ramps.ts.
+   */
+  startAttach?: RampAttach;
+  endAttach?: RampAttach;
 }
 
 export interface DrawRoadResult {
@@ -151,7 +160,11 @@ export type DraftIssueCode =
   | 'elevationRange'
   | 'selfCrossing'
   /** Track meeting a road other than by crossing it, or metro crossing at grade. */
-  | 'railCrossing';
+  | 'railCrossing'
+  /** A one-way road joining a highway against its traffic. */
+  | 'wrongWay'
+  /** A two-way road joining a highway at grade: right in, right out only. */
+  | 'atGradeHighway';
 
 export interface DraftIssue {
   code: DraftIssueCode;
@@ -159,6 +172,8 @@ export interface DraftIssue {
   severity: 'error' | 'warning';
   message: string;
   at?: Vec3;
+  /** The stretch of the draft the issue covers, for drawing it, as for an overlap. */
+  stretch?: Vec3[];
 }
 
 export interface NearestSegment {
@@ -349,6 +364,25 @@ export class RoadNetwork {
     this.curves.delete(id);
     this.pendingEdit = true;
     this.graph = null;
+    const seg = this.segIndex.get(id);
+    if (seg) {
+      this.touchAttachedAt(seg.a, id);
+      this.touchAttachedAt(seg.b, id);
+    }
+  }
+
+  /** A ramp end attached at a node follows its host road, so its curve changes with it. */
+  private touchAttachedAt(nodeId: Id, except?: Id): void {
+    const node = this.nodeIndex.get(nodeId);
+    if (!node) return;
+    for (const other of node.segments) {
+      if (other === except) continue;
+      const s = this.segIndex.get(other);
+      if (!s || !attachAt(s, nodeId)) continue;
+      this.dirtySegs.add(other);
+      this.hashDirtySegs.add(other);
+      this.curves.delete(other);
+    }
   }
 
   private touchNode(id: Id): void {
@@ -467,8 +501,23 @@ export class RoadNetwork {
   /** The Bezier of a segment, end points included. */
   cubicOf(segmentId: Id): Cubic {
     const s = this.requireSegment(segmentId);
+    const raw = { p0: this.requireNode(s.a).pos, p1: s.c1, p2: s.c2, p3: this.requireNode(s.b).pos };
+    // A ramp end attached to a lane starts at that lane's edge, not at the node.
+    return s.overrides.attachA || s.overrides.attachB ? attachedCubic(this.attachAccess, s, raw) : raw;
+  }
+
+  /** The cubic between the node positions, ignoring any lane attach. */
+  nodeCubicOf(segmentId: Id): Cubic {
+    const s = this.requireSegment(segmentId);
     return { p0: this.requireNode(s.a).pos, p1: s.c1, p2: s.c2, p3: this.requireNode(s.b).pos };
   }
+
+  /** What core/ramps.ts needs to place attached ramp ends. */
+  readonly attachAccess: AttachAccess = {
+    node: (id) => this.nodeIndex.get(id),
+    segment: (id) => this.segIndex.get(id),
+    def: (seg) => this.requireRoadType(seg.roadType),
+  };
 
   // -------------------------------------------------------------------------
   // Reads of derived data
@@ -600,6 +649,10 @@ export class RoadNetwork {
           (s) => this.geoms.get(s),
           (s) => this.roadTypeOf(s),
           (s) => this.roadLanes.get(s) ?? [],
+          (s, atStart) => {
+            const seg = this.segIndex.get(s);
+            return atStart ? seg?.overrides.attachA : seg?.overrides.attachB;
+          },
         ),
       );
       this.evtNodes.add(id);
@@ -835,7 +888,11 @@ export class RoadNetwork {
     const farNode = this.requireNode(seg.b);
 
     farNode.segments = farNode.segments.filter((x) => x !== id);
-    const rightId = this.createSegment(nodeId, seg.b, right.p1, right.p2, seg.roadType, structuredClone(seg.overrides));
+    // A lane attach stays with the end it belongs to.
+    const rightOverrides = structuredClone(seg.overrides);
+    delete rightOverrides.attachA;
+    delete seg.overrides.attachB;
+    const rightId = this.createSegment(nodeId, seg.b, right.p1, right.p2, seg.roadType, rightOverrides);
     this.renameInControl(farNode, id, rightId);
 
     seg.b = nodeId;
@@ -967,6 +1024,7 @@ export class RoadNetwork {
     for (const nodeId of [seg.a, seg.b]) {
       const node = this.requireNode(nodeId);
       node.segments = node.segments.filter((x) => x !== id);
+      this.touchAttachedAt(nodeId);
       this.stripFromControl(node, id);
       if (node.segments.length === 0) this.removeNodeInternal(nodeId);
       else this.touchNode(nodeId);
@@ -1075,6 +1133,14 @@ export class RoadNetwork {
 
       [seg.a, seg.b] = [seg.b, seg.a];
       [seg.c1, seg.c2] = [seg.c2, seg.c1];
+      // A lane attach belongs to the node, and the host flips sides as the road turns round.
+      const { attachA, attachB } = seg.overrides;
+      if (attachA || attachB) {
+        delete seg.overrides.attachA;
+        delete seg.overrides.attachB;
+        if (attachB) seg.overrides.attachA = { ...attachB, hostSide: attachB.hostSide === 1 ? -1 : 1 };
+        if (attachA) seg.overrides.attachB = { ...attachA, hostSide: attachA.hostSide === 1 ? -1 : 1 };
+      }
       this.touchSeg(id);
       for (const nodeId of ends) this.touchNode(nodeId);
       this.graphTopologyChanged = true;
@@ -1093,6 +1159,14 @@ export class RoadNetwork {
       }
       for (const d of this.p.decals) {
         if (d.road && flipPaintOn(d.road, id)) this.evtDecals = true;
+      }
+      for (const z of this.p.zones ?? []) {
+        for (const a of z.anchors ?? []) {
+          if (!a || a.segmentId !== id) continue;
+          a.t = flipT(a.t);
+          a.offset = -a.offset;
+          this.evtEndpoints = true;
+        }
       }
 
       ends.forEach((nodeId, i) => {
@@ -1324,11 +1398,44 @@ export class RoadNetwork {
     }
   }
 
-  private draftCubic(start: RoadAnchor, end: RoadAnchor, c1?: Vec3, c2?: Vec3): Cubic {
-    const p0 = this.anchorPosition(start);
-    const p3 = this.anchorPosition(end);
+  private draftCubic(start: RoadAnchor, end: RoadAnchor, c1?: Vec3, c2?: Vec3, startAttach?: RampAttach, endAttach?: RampAttach): Cubic {
+    let p0 = this.anchorPosition(start);
+    let p3 = this.anchorPosition(end);
+    if (startAttach) {
+      const dir = normalizeXZ(sub(c1 && distXZ(c1, p0) > 1e-3 ? c1 : p3, p0));
+      p0 = this.anchorAttachPoint(start, startAttach, dir) ?? p0;
+    }
+    if (endAttach) {
+      const dir = normalizeXZ(sub(p3, c2 && distXZ(c2, p3) > 1e-3 ? c2 : p0));
+      p3 = this.anchorAttachPoint(end, endAttach, dir) ?? p3;
+    }
     const fallback = straightCubic(p0, p3);
     return { p0, p1: c1 ?? fallback.p1, p2: c2 ?? fallback.p2, p3 };
+  }
+
+  /** Where a road end attached to a lane at an anchor lands, or null when there is no host. */
+  anchorAttachPoint(anchor: RoadAnchor, attach: RampAttach, rampDir: Vec3): Vec3 | null {
+    let host: Segment | null = null;
+    let hostDir: Vec3 | null = null;
+    let pos: Vec3;
+    if (anchor.kind === 'segment') {
+      host = this.getSegment(anchor.id) ?? null;
+      if (!host) return null;
+      const c = this.cubicOf(anchor.id);
+      const t = clamp(anchor.t, 0, 1);
+      pos = cubicPoint(c, t);
+      hostDir = cubicTangentXZ(c, t);
+    } else if (anchor.kind === 'node') {
+      const node = this.getNode(anchor.id);
+      host = pickHost(this.attachAccess, anchor.id, -1);
+      if (!node || !host) return null;
+      pos = node.pos;
+      hostDir = hostDirection(this.attachAccess, host, anchor.id);
+      if (!hostDir) return null;
+    } else {
+      return null;
+    }
+    return attachPointFrom(pos, hostDir, effectiveLanes(this.requireRoadType(host.roadType), host.overrides), attach, rampDir);
   }
 
   /**
@@ -1385,16 +1492,23 @@ export class RoadNetwork {
     this.requireRoadType(roadType);
     if (params.c1) assertVec(params.c1, 'Control c1');
     if (params.c2) assertVec(params.c2, 'Control c2');
-    const draft = this.draftCubic(start, end, params.c1, params.c2);
+    const startAttach = start.kind === 'free' ? undefined : params.startAttach;
+    const endAttach = end.kind === 'free' ? undefined : params.endAttach;
+    const draft = this.draftCubic(start, end, params.c1, params.c2, startAttach, endAttach);
     const polygon = dist(draft.p0, draft.p1) + dist(draft.p1, draft.p2) + dist(draft.p2, draft.p3);
     if (polygon < MIN_SEGMENT_LENGTH) throw new NetworkError('A road needs some length');
 
     return this.batch(() => {
       const freeNodes = new Set<Id>();
       const { startNode, endNode } = this.resolveAnchors(start, end, freeNodes);
-      const p0 = this.requireNode(startNode).pos;
-      const p3 = this.requireNode(endNode).pos;
+      // An attached end starts on its lane's edge, which is where the drawn curve starts.
+      const p0 = startAttach ? draft.p0 : this.requireNode(startNode).pos;
+      const p3 = endAttach ? draft.p3 : this.requireNode(endNode).pos;
       const cubic: Cubic = { p0, p1: draft.p1, p2: draft.p2, p3 };
+      const attachFor = (from: { node: Id; t: number }, to: { node: Id; t: number }) => ({
+        a: from.t === 0 && from.node === startNode ? startAttach : undefined,
+        b: to.t === 1 && to.node === endNode ? endAttach : undefined,
+      });
 
       const hits = this.findCrossings(cubic, [startNode, endNode]).filter((h) => h.atGrade);
       const stops = this.cutCrossedSegments(hits);
@@ -1435,10 +1549,11 @@ export class RoadNetwork {
           if (to.t - from.t < 1e-3) continue;
           const mt = (from.t + to.t) / 2;
           const mid = this.createNode(cubicPoint(cubic, mt));
-          this.addPiece(cubic, from.t, mt, from.node, mid, roadType, pieceOverrides, result);
-          this.addPiece(cubic, mt, to.t, mid, to.node, roadType, pieceOverrides, result);
+          const ends = attachFor(from, to);
+          this.addPiece(cubic, from.t, mt, from.node, mid, roadType, pieceOverrides, result, { a: ends.a });
+          this.addPiece(cubic, mt, to.t, mid, to.node, roadType, pieceOverrides, result, { b: ends.b });
         } else {
-          this.addPiece(cubic, from.t, to.t, from.node, to.node, roadType, pieceOverrides, result);
+          this.addPiece(cubic, from.t, to.t, from.node, to.node, roadType, pieceOverrides, result, attachFor(from, to));
         }
       }
 
@@ -1530,6 +1645,7 @@ export class RoadNetwork {
     roadType: string,
     overrides: SegmentOverrides,
     result: DrawRoadResult,
+    attach: { a?: RampAttach; b?: RampAttach } = {},
   ): void {
     if (t1 - t0 < 1e-6) return;
     const piece = subCubic(cubic, t0, t1);
@@ -1538,9 +1654,24 @@ export class RoadNetwork {
     if (dist(pa, pb) < MIN_SEGMENT_LENGTH && dist(piece.p1, piece.p0) + dist(piece.p2, piece.p3) < MIN_SEGMENT_LENGTH) {
       return;
     }
-    const c1 = add(piece.p1, sub(pa, piece.p0));
-    const c2 = add(piece.p2, sub(pb, piece.p3));
-    result.segments.push(this.createSegment(a, b, c1, c2, roadType, structuredClone(overrides)));
+    const own = structuredClone(overrides);
+    delete own.attachA;
+    delete own.attachB;
+    if (attach.a) own.attachA = { ...attach.a };
+    if (attach.b) own.attachB = { ...attach.b };
+    // An attached end is already where the curve starts, so its handle stays put.
+    const c1 = attach.a ? { ...piece.p1 } : add(piece.p1, sub(pa, piece.p0));
+    const c2 = attach.b ? { ...piece.p2 } : add(piece.p2, sub(pb, piece.p3));
+    const id = this.createSegment(a, b, c1, c2, roadType, own);
+    if (attach.a || attach.b) {
+      // Close any rounding between the drawn end and where the attach puts it.
+      const real = this.cubicOf(id);
+      const seg = this.requireSegment(id);
+      if (attach.a) seg.c1 = add(c1, sub(real.p0, piece.p0));
+      if (attach.b) seg.c2 = add(c2, sub(real.p3, piece.p3));
+      this.touchSeg(id);
+    }
+    result.segments.push(id);
   }
 
   // -------------------------------------------------------------------------
@@ -1554,7 +1685,9 @@ export class RoadNetwork {
   validateDraft(draft: Omit<DrawRoadParams, 'overrides'>): DraftIssue[] {
     const issues: DraftIssue[] = [];
     const def = this.requireRoadType(draft.roadType);
-    const cubic = this.draftCubic(draft.start, draft.end, draft.c1, draft.c2);
+    const startAttach = draft.start.kind === 'free' ? undefined : draft.startAttach;
+    const endAttach = draft.end.kind === 'free' ? undefined : draft.endAttach;
+    const cubic = this.draftCubic(draft.start, draft.end, draft.c1, draft.c2, startAttach, endAttach);
     const curve = buildSegmentCurve(cubic);
     const L = curve.length;
 
@@ -1661,9 +1794,36 @@ export class RoadNetwork {
       }
     }
 
-    this.checkParallel(def, cubic, samples, draft.start, draft.end, issues);
+    // Surfaces lying on top of each other, which crossings alone miss.
+    const overlaps = draftOverlapIssues(this, def, cubic, draft.start, draft.end);
+    issues.push(...overlaps);
+    if (!overlaps.length) this.checkParallel(def, cubic, samples, draft.start, draft.end, issues);
+    issues.push(...this.rampIssues(def, cubic, draft.start, draft.end));
     issues.push(...railDraftIssues(this, def, cubic, curve.length, draft.start, draft.end, radius));
     return issues;
+  }
+
+  /** How each end of a draft meets a highway: against its traffic, or at grade. */
+  private rampIssues(def: RoadTypeDef, cubic: Cubic, start: RoadAnchor, end: RoadAnchor): DraftIssue[] {
+    const out: DraftIssue[] = [];
+    for (const [anchor, leaving] of [[start, true], [end, false]] as const) {
+      let host: Segment | null = null;
+      let hostDir: Vec3 | null = null;
+      if (anchor.kind === 'segment') {
+        host = this.getSegment(anchor.id) ?? null;
+        if (host) hostDir = cubicTangentXZ(this.nodeCubicOf(host.id), clamp(anchor.t, 0, 1));
+      } else if (anchor.kind === 'node') {
+        const node = this.getNode(anchor.id);
+        // Carrying on from a road's dead end is not joining it.
+        if (!node || node.segments.length < 2) continue;
+        host = pickHost(this.attachAccess, anchor.id, -1);
+        if (host) hostDir = hostDirection(this.attachAccess, host, anchor.id);
+      }
+      if (!host || !hostDir) continue;
+      const pos = leaving ? cubic.p0 : cubic.p3;
+      out.push(...rampEndIssues(def, cubic, { hostDef: this.requireRoadType(host.roadType), hostDir, pos, leaving }));
+    }
+    return out;
   }
 
   private checkParallel(
@@ -1713,13 +1873,12 @@ export class RoadNetwork {
         const sharesNode = [seg.a, seg.b].find((n) => ownNodes.has(n));
         if (sharesNode !== undefined && distXZ(this.requireNode(sharesNode).pos, p) < PARALLEL_GRACE) continue;
         seen.add(id);
-        const overlap = hit.distance < sum;
+        // Real overlaps are draftOverlapIssues' to report.
+        if (hit.distance < sum) continue;
         issues.push({
           code: 'tooClose',
-          severity: overlap ? 'error' : 'warning',
-          message: overlap
-            ? 'Overlaps a nearly parallel road.'
-            : `Only ${(hit.distance - sum).toFixed(1)} m from a nearly parallel road.`,
+          severity: 'warning',
+          message: `Only ${(hit.distance - sum).toFixed(1)} m from a nearly parallel road.`,
           at: p,
         });
       }
@@ -1849,6 +2008,7 @@ export class RoadNetwork {
         ratePerHour: init.ratePerHour ?? 300,
         attraction: init.attraction ?? 1,
         mix: init.mix ?? defaultVehicleMix(),
+        ...(init.regionId !== undefined ? { regionId: init.regionId } : {}),
       };
       this.assertEndpointRefs(ep);
       this.p.endpoints.push(ep);

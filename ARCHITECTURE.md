@@ -46,6 +46,7 @@ Modules may depend only on the ones listed before them.
 | `src/core` | Data model, curves, network edits, junction geometry, lane graph, save format. Pure TS with no DOM or Three.js. | nothing |
 | `src/sim` | Vehicles, routing, junction control, signals, spawning, statistics. Pure TS, runs headless under Vitest. | core |
 | `src/templates` | Parametric interchange stamps: roundabout, diamond, cloverleaf, trumpet, stack, turbine, and so on. | core |
+| `src/rail` | Trains: track graph from rail lanes, consists, physics, block signalling, stations, lines, demo. Pure TS, headless. | core |
 | `src/render` | Three.js scene: terrain, roads, markings, vehicles, overlays, previews. | core, read-only access to sim |
 | `src/tools` | Input-driven editor tools. No direct DOM outside the canvas input they are given. | core, sim, templates, render |
 | `src/ui` | DOM panels. | all of the above |
@@ -82,6 +83,11 @@ Connectors, auto-generated when `control.laneLinks` is null:
 - General junction: rightmost lanes turn right, leftmost turn left, the rest go
   straight, and single-lane approaches share all moves. No U-turns, except at a
   dead end with two-way road, which gets a turnaround.
+- Controlled access (any junction with a 'highway' arm): traffic keeps to its own
+  carriageway. Ramps and streets branch off or join on their own side only, from
+  or into the lanes next to them (merge-only, right in and right out), with no
+  turns across a median or opposing traffic. A ramp attached to a lane is fed by
+  that lane and every lane outside it. See core/ramps.ts.
 - Every driving lane must have a way out unless the node is a true dead end.
 - Bus lanes join only drive or bus lanes. Bike lanes join bike lanes only.
 
@@ -108,6 +114,23 @@ Connectors, auto-generated when `control.laneLinks` is null:
   weighted by attraction. A vehicle never targets its own endpoint.
 - After a network edit, vehicles remap by `GLane.key`, keeping their fraction along
   the lane. Vehicles on lanes that no longer exist are removed.
+
+## Rail design
+
+- Track is a road category `rail` with lanes of kind `rail` (catalogue in `core/railTypes.ts`), so
+  drawing, snapping, elevation, bridges, tunnels, junctions, undo and save are the road system's.
+  Single track is two coincident lanes, one per direction. Rail links only to rail, only where a
+  train can run through (40 degrees at most), with turnouts limited to 40 km/h and no U-turns at
+  dead ends. A track crossing a road at grade is a level crossing; metro never crosses at grade.
+- Stations and lines persist in the optional `Project.rail`, edited through `RoadNetwork`.
+- `rail/TrackGraph` folds lanes back into physical pieces of track, used either way, and groups
+  any pieces that could foul each other into blocks. `rail/TrainSim` runs trains on it at a fixed
+  0.1 s step: power and mass limited traction, grade, braking curves, curve and switch limits, two
+  bogies per car on the track path. A train holds every block it occupies or will enter; blocks
+  planned in both directions are taken whole through to a place it can stand aside, and a ring
+  of trains waiting on each other is broken by withdrawing the youngest.
+- `render/rail.ts` is a RenderLayer added through RenderContext; `app/rail.ts` wires the sim,
+  layer, tools and panels together.
 
 ## Rendering design
 

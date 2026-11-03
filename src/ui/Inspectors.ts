@@ -1,8 +1,9 @@
 /** Floating inspectors for segments, junctions, endpoints and vehicles. */
-import type { Id, LaneKind, LineStyle, MarkingStyle, PaintColor, SegmentOverrides, TrafficEndpoint } from '../core/types';
+import type { Id, LaneKind, LineStyle, MarkingStyle, PaintColor, SegmentOverrides, TrafficEndpoint, ZoneRegion } from '../core/types';
 import { BUILTIN_ROAD_TYPES, effectiveLanes, effectiveMarkings, effectiveSpeedKmh, laneSpeedKmh } from '../core/roadTypes';
 import { connectedRoad, connectedRoadOriented, mirroredLane } from '../tools/roadOps';
 import { reverseMessages, reverseRoads, strandedMarks } from '../tools/ReverseTool';
+import { syncZoneAccess, ZONE_NAMES, zoneStats } from '../tools/zoneOps';
 import { ENDPOINT_NAMES } from '../tools/TrafficTool';
 import type { InspectTarget } from '../tools/types';
 import type { UiContext } from './context';
@@ -10,6 +11,7 @@ import { checkbox, clear, el, numberInput, row, selectInput, sliderInput, textIn
 import { JunctionEditor } from './JunctionEditor';
 import { NodeMarkingPanel } from './NodeMarkingPanel';
 import { Panel } from './Panel';
+import { StationInspector, TrainInspector } from './RailPanels';
 import { colorArt, crosswalkArt, lineStyleArt, surfaceArt } from './thumbnails';
 
 const LINE_LABELS: Record<LineStyle, string> = {
@@ -146,7 +148,10 @@ class SegmentInspector extends Inspector {
     this.panel.setTitle(seg.overrides.name || def.name);
     const whole = connectedRoad(net, this.id).length;
 
-    const types = [...BUILTIN_ROAD_TYPES, ...net.project.customRoadTypes].map((t) => ({ value: t.id, label: t.name }));
+    // Track only turns into other track, and road into road.
+    const types = [...BUILTIN_ROAD_TYPES, ...net.project.customRoadTypes]
+      .filter((t) => (t.category === 'rail') === (def.category === 'rail'))
+      .map((t) => ({ value: t.id, label: t.name }));
     body.append(
       row('Name', textInput(seg.overrides.name ?? '', def.name, (v) => {
         this.patch('Rename road', 'name', () => ({ name: v || undefined }));
@@ -458,6 +463,94 @@ class VehicleInspector extends Inspector {
   }
 }
 
+class ZoneInspector extends Inspector {
+  private readonly live = el('dl', { class: 'kv small' });
+
+  constructor(ui: UiContext, private readonly id: Id) {
+    super(ui, 'Zone');
+    this.render();
+  }
+
+  private get region(): ZoneRegion | undefined {
+    return this.ui.net.project.zones?.find((z) => z.id === this.id);
+  }
+
+  /** Edit and refit access, as one undo step. */
+  private edit(label: string, patch: Partial<ZoneRegion>, key: string): void {
+    const { net, history } = this.ui;
+    history.hint(label, `zone-${key}-${this.id}`);
+    net.batch(() => {
+      net.updateZone(this.id, patch);
+      syncZoneAccess(net, this.id);
+    });
+  }
+
+  private render(): void {
+    const region = this.region;
+    if (!region || region.kind === 'none') return;
+    const body = this.panel.body;
+    clear(body);
+    this.panel.setTitle(region.name || `${ZONE_NAMES[region.kind]} zone`);
+    const kinds = (['residential', 'commercial', 'industrial', 'office'] as const).map((k) => ({ value: k, label: ZONE_NAMES[k] }));
+    body.append(
+      row('Name', textInput(region.name, `${ZONE_NAMES[region.kind]} zone`, (v) => this.edit('Rename zone', { name: v }, 'name'))),
+      row('Kind', selectInput(kinds, region.kind, (v) => {
+        this.edit('Change zone', { kind: v }, 'kind');
+        this.render();
+      })),
+      row('Density', selectInput([{ value: 'low', label: 'Low' }, { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' }], region.density, (v) => {
+        this.edit('Change density', { density: v }, 'density');
+        this.render();
+      })),
+      row('Enabled', checkbox(region.enabled, (v) => this.edit('Toggle zone', { enabled: v }, 'enabled'))),
+      el('div', { class: 'section-title', text: 'Traffic' }),
+      this.live,
+      el('div', { class: 'btn-row', style: { marginTop: '8px' } }, el('button', {
+        class: 'btn danger',
+        text: 'Remove zone',
+        attrs: { type: 'button' },
+        on: {
+          click: () => {
+            this.ui.history.hint('Remove zone');
+            this.ui.net.removeZone(this.id);
+          },
+        },
+      })),
+    );
+    this.tick();
+  }
+
+  tick(): void {
+    const region = this.region;
+    if (!region) return;
+    const { net, sim } = this.ui;
+    const stats = zoneStats(net, this.id);
+    let spawned = 0;
+    let arrived = 0;
+    for (const e of net.endpoints) {
+      if (e.regionId !== this.id) continue;
+      const s = sim.endpointStats?.(e.id);
+      if (s) {
+        spawned += s.spawned;
+        arrived += s.arrived;
+      }
+    }
+    clear(this.live);
+    const add = (k: string, v: string) => this.live.append(el('dt', { text: k }), el('dd', { text: v }));
+    add('Zoned area', `${Math.round(stats.area).toLocaleString()} m\u00b2`);
+    add('Generates', `${stats.ratePerHour} vehicles/h`);
+    add('Attraction', stats.attraction.toFixed(1));
+    add('Access points', stats.access ? String(stats.access) : 'None: no road to reach it');
+    add('Sent, received', `${spawned}, ${arrived}`);
+  }
+
+  refresh(): boolean {
+    if (!this.region) return false;
+    if (!this.editing) this.render();
+    return true;
+  }
+}
+
 class NodeMarkingInspector extends Inspector {
   private readonly content: NodeMarkingPanel;
   private readonly off: () => void;
@@ -533,8 +626,17 @@ export class Inspectors {
       case 'vehicle':
         this.current = new VehicleInspector(this.ui, target.id);
         break;
+      case 'train':
+        this.current = new TrainInspector(this.ui, target.id) as unknown as Inspector;
+        break;
+      case 'station':
+        this.current = new StationInspector(this.ui, target.id) as unknown as Inspector;
+        break;
       case 'nodeMarkings':
         this.current = new NodeMarkingInspector(this.ui, target.id);
+        break;
+      case 'zone':
+        this.current = new ZoneInspector(this.ui, target.id);
         break;
     }
   }

@@ -1,5 +1,6 @@
 /**
- * Procedural rolling stock. Every vehicle is built from swept profiles, boxes and
+ * Procedural rolling stock in low-poly style: chunky faceted shapes, flat colour
+ * per part, simple window bands. Every vehicle is built from swept profiles, boxes and
  * cylinders, with a part code per vertex so one shader can paint the livery, light
  * the lamps and windows, and show open doors. Local frame: forward is -Z, x right,
  * y up from the top of the rail, origin halfway along the body.
@@ -129,19 +130,17 @@ export class ModelBuilder {
   }
 
   /** Cylinder along Z. */
-  cylZ(cx: number, cy: number, r: number, z0: number, z1: number, color: Col, part: number, sides = 12, caps = true): void {
+  cylZ(cx: number, cy: number, r: number, z0: number, z1: number, color: Col, part: number, sides = 8, caps = true): void {
     const prof: [number, number][] = [];
     for (let i = 0; i < sides; i++) {
       const a = (i / sides) * Math.PI * 2;
       prof.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]);
     }
-    // Counter-clockwise from -Z means clockwise in x/y seen from +Z.
-    prof.reverse();
     this.sweep(prof, z0, z1, color, part, { capFront: caps, capBack: caps });
   }
 
   /** Cylinder along X, for wheels and axles. */
-  cylX(x0: number, x1: number, cy: number, cz: number, r: number, color: Col, part: number, sides = 10): void {
+  cylX(x0: number, x1: number, cy: number, cz: number, r: number, color: Col, part: number, sides = 6): void {
     for (let i = 0; i < sides; i++) {
       const a0 = (i / sides) * Math.PI * 2;
       const a1 = ((i + 1) / sides) * Math.PI * 2;
@@ -184,8 +183,8 @@ function carProfile(hw: number, floor: number, top: number): [number, number][] 
     [hw, floor + 0.5],
     [hw, eave],
   ];
-  for (let i = 1; i <= 5; i++) {
-    const a = (i / 6) * Math.PI;
+  for (let i = 1; i <= 2; i++) {
+    const a = (i / 3) * Math.PI;
     pts.push([Math.cos(a) * hw * 0.98, eave + Math.sin(a) * (top - eave)]);
   }
   pts.push([-hw, eave], [-hw, floor + 0.5]);
@@ -341,7 +340,7 @@ function electricLoco(): THREE.BufferGeometry {
     }
   }
   // Grilles, cab side windows, roof equipment.
-  for (let z = -L / 2 + 3.5; z < L / 2 - 3.5; z += 1.6) m.sides(hw, z, z + 1.2, floor + 1.3, top - 0.6, DARK, P_DARK);
+  m.sides(hw, -L / 2 + 3.5, L / 2 - 3.5, floor + 1.3, top - 0.6, DARK, P_DARK);
   m.sides(hw, -L / 2 + 1.0, -L / 2 + 2.0, floor + 1.4, top - 0.55, GLASS, P_GLASS);
   m.sides(hw, L / 2 - 2.0, L / 2 - 1.0, floor + 1.4, top - 0.55, GLASS, P_GLASS);
   m.box(-0.6, 0.6, top, top + 0.35, -2, 2, ROOF, P_FIXED);
@@ -374,12 +373,12 @@ function dieselLoco(): THREE.BufferGeometry {
   const hoodTop = k.height - 0.55;
   const hw2 = hw - 0.45;
   m.box(-hw2, hw2, deck, hoodTop, cabZ1, L / 2 - 0.4, WHITE, P_BODY);
-  for (let z = cabZ1 + 0.6; z < L / 2 - 4; z += 1.4) m.sides(hw2, z, z + 1.0, deck + 0.5, hoodTop - 0.3, DARK, P_DARK);
-  for (let z = L / 2 - 4; z < L / 2 - 0.8; z += 1.15) m.sides(hw2, z, z + 0.9, deck + 0.3, hoodTop - 0.15, lin(0x2d2f33), P_DARK);
-  for (const z of [L / 2 - 1.6, L / 2 - 3.0]) m.cylZ(0, hoodTop + 0.02, 0.6, z - 0.1, z + 0.1, DARK, P_DARK, 10);
+  m.sides(hw2, cabZ1 + 0.6, L / 2 - 4.4, deck + 0.5, hoodTop - 0.3, DARK, P_DARK);
+  m.sides(hw2, L / 2 - 4, L / 2 - 0.8, deck + 0.3, hoodTop - 0.15, lin(0x2d2f33), P_DARK);
+  for (const z of [L / 2 - 1.6, L / 2 - 3.0]) m.cylZ(0, hoodTop + 0.02, 0.6, z - 0.1, z + 0.1, DARK, P_DARK, 6);
   m.cylZ(0, hoodTop + 0.25, 0.12, cabZ1 + 2.4, cabZ1 + 2.7, BLACK, P_DARK, 6);
   // Fuel tank between the trucks.
-  m.cylZ(0, deck - 0.9, 0.62, -3.5, 3.5, DARK, P_DARK, 10);
+  m.cylZ(0, deck - 0.9, 0.62, -3.5, 3.5, DARK, P_DARK, 6);
   // Handrails along the walkway.
   for (const s of [-1, 1]) m.box(s * (hw - 0.05) - 0.02, s * (hw - 0.05) + 0.02, deck + 0.95, deck + 1.0, cabZ1, L / 2 - 0.3, lin(0xe0c020), P_FIXED);
   m.box(-0.2, 0.2, 0.85, 1.05, -L / 2 - 0.4, -L / 2, DARK, P_DARK);
@@ -403,7 +402,7 @@ function boxcar(): THREE.BufferGeometry {
   m.box(-hw, hw, deck, k.height - 0.12, -L / 2 + 0.25, L / 2 - 0.25, WHITE, P_BODY);
   m.box(-hw + 0.08, hw - 0.08, k.height - 0.12, k.height, -L / 2 + 0.3, L / 2 - 0.3, WHITE, P_BODY);
   // Ribs, sliding door with its track, end ladders.
-  for (let z = -L / 2 + 0.9; z < L / 2 - 0.5; z += 1.1) m.sides(hw, z, z + 0.1, deck + 0.05, k.height - 0.2, RUST, P_STRIPE, 0.03);
+  m.sides(hw, -L / 2 + 0.25, L / 2 - 0.25, k.height - 0.55, k.height - 0.35, RUST, P_STRIPE, 0.03);
   m.sides(hw, -1.6, 1.6, deck + 0.1, k.height - 0.35, WHITE, P_DOOR, 0.05);
   m.sides(hw, -1.8, 1.8, k.height - 0.35, k.height - 0.28, DARK, P_DARK, 0.06);
   for (const z of [-L / 2 + 0.24, L / 2 - 0.24]) m.box(-0.5, 0.5, deck + 0.2, k.height - 0.4, z - 0.02, z + 0.02, DARK, P_DARK);
@@ -419,14 +418,14 @@ function tanker(): THREE.BufferGeometry {
   wagonFrame(m, hw, L, deck);
   const r = 1.45;
   const cy = deck + r + 0.05;
-  m.cylZ(0, cy, r, -L / 2 + 1.0, L / 2 - 1.0, WHITE, P_BODY, 16, false);
+  m.cylZ(0, cy, r, -L / 2 + 1.0, L / 2 - 1.0, WHITE, P_BODY, 8, false);
   // Dished heads.
-  m.cylZ(0, cy, r * 0.82, -L / 2 + 0.6, -L / 2 + 1.0, WHITE, P_BODY, 16);
-  m.cylZ(0, cy, r * 0.82, L / 2 - 1.0, L / 2 - 0.6, WHITE, P_BODY, 16);
-  m.cylZ(0, cy + r, 0.45, -0.4, 0.4, WHITE, P_BODY, 10);
+  m.cylZ(0, cy, r * 0.82, -L / 2 + 0.6, -L / 2 + 1.0, WHITE, P_BODY, 8);
+  m.cylZ(0, cy, r * 0.82, L / 2 - 1.0, L / 2 - 0.6, WHITE, P_BODY, 8);
+  m.cylZ(0, cy + r, 0.45, -0.4, 0.4, WHITE, P_BODY, 6);
   m.box(-0.7, 0.7, cy + r - 0.05, cy + r + 0.02, -2.5, 2.5, DARK, P_DARK);
   // Hazard band around the barrel.
-  m.cylZ(0, cy, r + 0.01, -0.8, 0.8, lin(0xd04020), P_STRIPE, 16, false);
+  m.cylZ(0, cy, r + 0.01, -0.8, 0.8, lin(0xd04020), P_STRIPE, 8, false);
   return m.build();
 }
 
@@ -438,7 +437,7 @@ function hopper(): THREE.BufferGeometry {
   const top = k.height;
   // Open top with sloping ends and bays below.
   m.box(-hw, hw, 1.9, top, -L / 2 + 0.6, L / 2 - 0.6, WHITE, P_BODY);
-  for (let z = -L / 2 + 1.1; z < L / 2 - 0.8; z += 0.9) m.sides(hw, z, z + 0.08, 2.0, top - 0.05, RUST, P_STRIPE, 0.03);
+  m.sides(hw, -L / 2 + 0.6, L / 2 - 0.6, top - 0.35, top - 0.1, RUST, P_STRIPE, 0.03);
   for (const z of [-L / 4, 0, L / 4]) {
     m.quad([hw - 0.3, 1.9, z + 1.3], [-hw + 0.3, 1.9, z + 1.3], [-0.4, 0.9, z + 0.3], [0.4, 0.9, z + 0.3], WHITE, P_BODY);
     m.quad([-hw + 0.3, 1.9, z - 1.3], [hw - 0.3, 1.9, z - 1.3], [0.4, 0.9, z - 0.3], [-0.4, 0.9, z - 0.3], WHITE, P_BODY);
@@ -455,7 +454,6 @@ function hopper(): THREE.BufferGeometry {
 
 function container(m: ModelBuilder, hw: number, y0: number, h: number, z0: number, z1: number, part: number): void {
   m.box(-hw, hw, y0, y0 + h, z0, z1, WHITE, part);
-  for (let z = z0 + 0.35; z < z1 - 0.2; z += 0.3) m.sides(hw, z, z + 0.05, y0 + 0.05, y0 + h - 0.05, lin(0x000000), P_DARK, 0.005);
   m.end(z1 + 0.01, -hw + 0.1, hw - 0.1, y0 + 0.1, y0 + h - 0.1, DARK, P_DARK, true);
 }
 
@@ -500,9 +498,7 @@ function autorack(): THREE.BufferGeometry {
   m.box(-hw, hw, deck, k.height - 0.1, -L / 2 + 0.2, L / 2 - 0.2, WHITE, P_BODY);
   m.box(-hw + 0.1, hw - 0.1, k.height - 0.1, k.height, -L / 2 + 0.3, L / 2 - 0.3, lin(0xa8acb0), P_FIXED);
   // Perforated side panels: rows of dark slots.
-  for (let y = deck + 0.5; y < k.height - 0.5; y += 0.55) {
-    for (let z = -L / 2 + 0.8; z < L / 2 - 0.8; z += 1.3) m.sides(hw, z, z + 1.0, y, y + 0.2, DARK, P_DARK, 0.02);
-  }
+  for (const y of [deck + 1.2, deck + 2.7]) m.sides(hw, -L / 2 + 0.8, L / 2 - 0.8, y, y + 0.5, DARK, P_DARK, 0.02);
   m.end(-L / 2 + 0.19, -hw + 0.15, hw - 0.15, deck + 0.2, k.height - 0.3, lin(0x8d9297), P_FIXED);
   return m.build();
 }

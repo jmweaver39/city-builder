@@ -29,6 +29,14 @@ export class FakeView implements ToolView {
     this.highlight = h;
   }
   setLaneDebug() {}
+  zoneOverlay = false;
+  ghosts: { points: { x: number; z: number }[]; color: string }[] = [];
+  setZoneOverlay(on: boolean) {
+    this.zoneOverlay = on;
+  }
+  setZoneGhost(g: { points: { x: number; y: number; z: number }[]; color: string }[]) {
+    this.ghosts = g;
+  }
 }
 
 export interface Rig {

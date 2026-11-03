@@ -3,7 +3,7 @@
  * onBeforeCompile, so lights, shadows, fog and log depth keep working.
  */
 import * as THREE from 'three';
-import { makeNoiseTexture } from './textures';
+import { makeDetailTexture, makeNoiseTexture } from './textures';
 
 export const SLOT_COLS = 1024;
 const SLOT_ROWS = 128;
@@ -27,12 +27,15 @@ export class Shared {
    * colour, odd rows the highlight. Alpha is strength. Slot n sits at column
    * n % 1024 of row pair n / 1024.
    */
+  /** High-resolution detail for ground and roads. See makeDetailTexture. */
+  readonly uDetail: { value: THREE.DataTexture };
   readonly slotData = new Uint8Array(SLOT_COLS * SLOT_ROWS * 4);
   readonly slotTex: THREE.DataTexture;
   readonly uSlots: { value: THREE.DataTexture };
 
   constructor(anisotropy: number) {
     this.uNoise = { value: makeNoiseTexture(256, anisotropy) };
+    this.uDetail = { value: makeDetailTexture(2048, anisotropy) };
     this.slotTex = new THREE.DataTexture(this.slotData, SLOT_COLS, SLOT_ROWS, THREE.RGBAFormat, THREE.UnsignedByteType);
     this.slotTex.magFilter = THREE.NearestFilter;
     this.slotTex.minFilter = THREE.NearestFilter;
@@ -42,6 +45,7 @@ export class Shared {
 
   dispose(): void {
     this.uNoise.value.dispose();
+    this.uDetail.value.dispose();
     this.slotTex.dispose();
   }
 }
@@ -82,6 +86,7 @@ export function makeSurfaceMaterial(shared: Shared): THREE.MeshStandardMaterial 
   m.onBeforeCompile = (s) => {
     s.uniforms.uSlots = shared.uSlots;
     s.uniforms.uNoise = shared.uNoise;
+    s.uniforms.uDetail = shared.uDetail;
     s.uniforms.uTime = shared.uTime;
     s.uniforms.uNight = shared.uNight;
     s.uniforms.uCloud = shared.uCloud;
@@ -123,6 +128,7 @@ if (vKind < 4.5 || vKind == 6.0) {
         '#include <common>',
         /* glsl */ `#include <common>
 uniform sampler2D uNoise;
+uniform sampler2D uDetail;
 uniform float uTime;
 uniform float uNight;
 uniform vec3 uCloud;
@@ -145,109 +151,37 @@ ${CLOUD_SHADOW}
         '#include <color_fragment>',
         /* glsl */ `#include <color_fragment>
 {
-  vec2 p = vWorld.xz;
-  float dist = length(vViewPosition);
-  float close = 1.0 - smoothstep(35.0, 170.0, dist);
-  float mid = 1.0 - smoothstep(150.0, 700.0, dist);
-  vec4 fine = texture2D(uNoise, p / 5.0);
-  vec4 broad = texture2D(uNoise, p / 41.0);
-  vec4 macro = texture2D(uNoise, p / 233.0);
+  // Clean, even surfaces with fine grain: no patches, wear or stains.
   float k = vKind;
+  vec2 wp = vWorld.xz;
+  float dist = length(vViewPosition);
   if (k < 0.5 || k == 6.0) {
-    // Asphalt: aggregate up close, wear and repairs further out.
-    float grit = texture2D(uNoise, p / 0.71).a;
-    float grit2 = texture2D(uNoise, p / 1.9).r;
-    vec3 c = diffuseColor.rgb;
-    c *= 0.84 + 0.26 * fine.r + 0.16 * (broad.g - 0.5) + 0.14 * (macro.b - 0.5);
-    c *= 1.0 + close * (grit - 0.5) * 0.55;
-    c += close * smoothstep(0.86, 0.97, grit) * 0.03;
-    float rough = 0.86 + 0.08 * fine.g;
-    vec2 bump = (vec2(grit, grit2) - 0.5) * close * 0.32;
-    if (k < 0.5) {
-      float u = vRoad.x;
-      float s = vRoad.y;
-      // Polished, darker wheel paths with a stained strip between them.
-      float wob = (texture2D(uNoise, vec2(s / 37.0, u * 0.01 + 0.3)).g - 0.5) * 0.3;
-      float d = abs(abs(u + wob) - 0.92);
-      float track = exp(-d * d * 7.0) * mid * (0.6 + 0.6 * broad.r);
-      c *= 1.0 - 0.17 * track;
-      rough -= 0.2 * track;
-      float drip = exp(-(u + wob) * (u + wob) * 5.0) * smoothstep(0.42, 0.72, fine.b) * mid;
-      c *= 1.0 - 0.3 * drip;
-      rough -= 0.2 * drip;
-      // Repair patches, rectangular as a crew would cut them.
-      float cell = floor(s / 29.0);
-      float h = hash1(cell + floor(u * 0.02 + 40.0));
-      if (h < 0.24 && abs(u) < 1.75) {
-        float a = 6.0 + hash1(cell + 3.1) * 8.0;
-        float l = 5.0 + hash1(cell + 7.7) * 12.0;
-        float q = s - cell * 29.0;
-        float e = min(min(q - a, a + l - q), 1.75 - abs(u));
-        if (e > 0.0) {
-          c = mix(c, c * (h < 0.12 ? 0.74 : 1.13), mid);
-          rough += 0.04;
-        }
-        float seam = 1.0 - smoothstep(0.0, 0.05, abs(e));
-        c = mix(c, vec3(0.012), seam * close * 0.8);
-        rough = mix(rough, 0.42, seam * close);
-      }
-    } else {
-      // Junctions take the turning traffic: darker, with oil spots.
-      float spot = smoothstep(0.6, 0.75, texture2D(uNoise, p / 13.0).g) * smoothstep(0.4, 0.6, broad.b);
-      c *= 1.0 - 0.22 * spot * mid;
-      rough -= 0.25 * spot * mid;
-      c *= 0.94;
-    }
-    // Sealed cracks: thin shiny tar lines wandering across the surface.
-    float nCrack = texture2D(uNoise, p / 23.0).g + (fine.g - 0.5) * 0.06;
-    float tar = (1.0 - smoothstep(0.0, 0.009, abs(nCrack - 0.5))) * smoothstep(0.42, 0.62, macro.g);
-    c = mix(c, vec3(0.011, 0.011, 0.012), tar * mid * 0.85);
-    rough = mix(rough, 0.4, tar * mid);
-    diffuseColor.rgb = c;
-    gRough = rough;
-    gBump = bump;
+    float g1 = texture2D(uDetail, wp / 3.1).g;
+    float g2 = texture2D(uDetail, wp / 11.3).g;
+    float macro = texture2D(uNoise, wp / 97.0).g;
+    diffuseColor.rgb *= 0.95 + 0.1 * mix(g2, g1, 1.0 - smoothstep(30.0, 140.0, dist)) + 0.03 * (macro - 0.5);
+    gRough = 0.86;
   } else if (k < 1.5) {
-    // Concrete sidewalk: bays along the road, with score lines between.
+    diffuseColor.rgb *= 0.95 + 0.08 * texture2D(uDetail, wp / 2.7).g;
     bool hasRoad = abs(vRoad.y) > 0.001;
-    vec2 q = hasRoad ? vec2(vRoad.x / 1.8, vRoad.y / 2.4) : p / 2.2;
-    vec2 cellId = floor(q);
+    vec2 q = hasRoad ? vec2(vRoad.x / 1.8, vRoad.y / 2.4) : vWorld.xz / 2.2;
     vec2 d = abs(fract(q) - 0.5);
     float w = max(fwidth(q.x), fwidth(q.y));
-    float joint = smoothstep(0.5 - 0.02 - w, 0.5 - 0.02, max(d.x, d.y));
-    joint *= 1.0 - smoothstep(0.1, 0.4, w);
-    float tone = 0.9 + 0.2 * hash2(cellId);
-    float stain = smoothstep(0.5, 0.8, broad.g);
-    diffuseColor.rgb *= tone * (0.92 + 0.16 * fine.g) * (1.0 - 0.15 * stain) * (1.0 - 0.45 * joint);
-    gRough = 0.88;
-    gBump = (texture2D(uNoise, p / 1.1).rg - 0.5) * close * 0.1;
-  } else if (k < 2.5) {
-    float g = texture2D(uNoise, p / 11.0).g * 0.6 + broad.b * 0.4;
-    diffuseColor.rgb *= (0.82 + 0.36 * g) * (0.9 + 0.2 * close * texture2D(uNoise, p / 0.9).r);
-    gRough = 0.96;
-  } else if (k < 3.5) {
-    // Cast concrete. Sampled in 3D so vertical faces do not streak.
-    vec3 q = vWorld;
-    float a = texture2D(uNoise, (q.xz + q.yy * 0.7) / 6.0).g;
-    float b = texture2D(uNoise, (q.xz * 0.6 + q.yy * 1.3) / 31.0).b;
-    float weather = smoothstep(0.35, 0.8, texture2D(uNoise, vec2(q.x * 0.03 + q.z * 0.03, q.y * 0.12)).g);
-    diffuseColor.rgb *= (0.86 + 0.24 * a) * (0.9 + 0.2 * b) * (1.0 - 0.14 * weather);
+    float joint = smoothstep(0.5 - 0.025 - w, 0.5 - 0.025, max(d.x, d.y));
+    joint *= 1.0 - smoothstep(0.08, 0.3, w);
+    diffuseColor.rgb *= 1.0 - 0.18 * joint;
     gRough = 0.9;
-  } else if (k < 4.5) {
-    diffuseColor.rgb *= 0.92 + 0.14 * fine.g;
-    gRough = 0.82;
   } else if (k > 6.5 && k < 7.5) {
-    gRough = 0.46 + 0.2 * fine.g;
-    gMetal = 0.85;
+    gRough = 0.6;
+    gMetal = 0.2;
   } else if (k > 7.5) {
     gGlow = diffuseColor.rgb * 4.0;
-    gRough = 0.5;
   } else {
-    gRough = 0.75;
+    gRough = 0.88;
   }
   if (vOverlay.a > 0.0) {
     if (k < 0.5 || k == 6.0) diffuseColor.rgb = mix(diffuseColor.rgb, vOverlay.rgb, vOverlay.a);
     else diffuseColor.rgb = mix(diffuseColor.rgb, vOverlay.rgb * 0.75 + 0.1, vOverlay.a * 0.6);
-    gRough = max(gRough, 0.75);
   }
   if (vHigh.a > 0.0) diffuseColor.rgb = mix(diffuseColor.rgb, vHigh.rgb, vHigh.a * 0.75);
 }
@@ -280,7 +214,7 @@ if (vHigh.a > 0.0) totalEmissiveRadiance += vHigh.rgb * vHigh.a * (0.32 + 0.1 * 
 `,
       );
   };
-  m.customProgramCacheKey = () => 'cl-surface-2';
+  m.customProgramCacheKey = () => 'cl-surface-lp';
   return m;
 }
 
@@ -302,7 +236,7 @@ export function makePaintMaterial(shared: Shared, opts: { bias: number; lift: nu
     polygonOffsetUnits: -2,
     side: THREE.DoubleSide,
   });
-  const key = `cl-paint-2-${opts.bias}-${opts.lift}-${opts.fade !== false}`;
+  const key = `cl-paint-lp-${opts.bias}-${opts.lift}-${opts.fade !== false}`;
   m.onBeforeCompile = (s) => {
     s.uniforms.uNoise = shared.uNoise;
     s.uniforms.uPxScale = shared.uPxScale;
@@ -386,12 +320,7 @@ ${CLOUD_SHADOW}
       cover *= clamp(span / fu, 0.0, 1.0);
     }
   }
-  // Worn by tyres: rubbed thin in blotches, chipped through at the aggregate.
-  float blot = texture2D(uNoise, vPlan / 9.0).g;
-  float chip = texture2D(uNoise, vPlan / 1.3).r;
-  float grit = texture2D(uNoise, vPlan / 0.47).a;
-  float wear = smoothstep(0.26, 0.5, blot + (chip - 0.5) * 0.4) * (0.55 + 0.45 * smoothstep(0.12, 0.42, grit));
-  diffuseColor.a *= cover * vFade * mix(0.42, 0.97, wear);
+  diffuseColor.a *= cover * vFade;
   if (diffuseColor.a < 0.004) discard;
 }
 `,

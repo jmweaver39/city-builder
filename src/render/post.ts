@@ -174,10 +174,10 @@ void main() {
   #include <tonemapping_fragment>
   // Subtle lens falloff toward the corners.
   vec2 v = vUv - 0.5;
-  gl_FragColor.rgb *= 1.0 - dot(v, v) * 0.22;
+  gl_FragColor.rgb *= 1.0 - dot(v, v) * 0.06;
   // A touch of grade: filmic curves lift blacks and mute colour.
   float luma = dot(gl_FragColor.rgb, vec3(0.2126, 0.7152, 0.0722));
-  gl_FragColor.rgb = clamp(mix(vec3(luma), gl_FragColor.rgb, 1.16), 0.0, 1.0);
+  gl_FragColor.rgb = clamp(mix(vec3(luma), gl_FragColor.rgb, 1.02), 0.0, 1.0);
   gl_FragColor.rgb = clamp((gl_FragColor.rgb - 0.012) * 1.03, 0.0, 1.0);
   #include <colorspace_fragment>
 }

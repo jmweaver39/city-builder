@@ -40,7 +40,7 @@ export class CameraRig {
   readonly target = new THREE.Vector3(0, 0, 0);
   distance = 620;
   yaw = 0.5;
-  pitch = 0.72;
+  pitch = 1.3;
 
   private goalTarget = this.target.clone();
   private goalDistance = this.distance;

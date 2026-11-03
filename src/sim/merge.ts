@@ -10,7 +10,7 @@
  * the order is entry order too, except that a vehicle already past the merge point
  * goes first, because its body is physically in the way.
  */
-import { ENTRY_REAL } from './buckets';
+import { ENTRY_REAL, ENTRY_REAR } from './buckets';
 import { FREE_MERGE_HORIZON, MAX_DECEL } from './constants';
 import { CTL_NONE } from './junctions';
 import { nextOf } from './pathing';
@@ -53,7 +53,9 @@ export function mergePass(w: World): void {
       const free = jn.ctl[c] === CTL_NONE;
       const zone = laneLen[c] - mergeFrom[c];
       for (let e = start[c]; e < start[c + 1]; e++) {
-        if (eT[e] !== ENTRY_REAL || count >= MAX_LIST) continue;
+        // A tail still on the feeder belongs to a body past the merge, and leads.
+        const t = eT[e];
+        if ((t !== ENTRY_REAL && t !== ENTRY_REAR) || count >= MAX_LIST) continue;
         const u = eV[e];
         const d = laneLen[c] - eS[e];
         const eta = etaOf(d, speed[u]);
@@ -125,13 +127,17 @@ export function mergePass(w: World): void {
     for (let a = 1; a < count; a++) {
       if (listF[a] === listF[a - 1]) continue;
       const u = listV[a];
+      // A tail is listed only to lead; it never follows anything.
+      if (veh.lane[u] !== prevList[listF[a]] && veh.permit[u] !== prevList[listF[a]] && listD[a] < 0) continue;
       const lead = listV[a - 1];
       const spatial = listD[a] - listD[a - 1] - len[lead];
       const timed = (listEta[a] - listEta[a - 1]) * (speed[u] > ORDER_SPEED_FLOOR ? speed[u] : ORDER_SPEED_FLOOR) - len[lead];
       let gap = spatial > timed ? spatial : timed;
-      // A follower level with its leader holds at the merge point rather than braking
-      // for a body it is not yet near. Close to that point it brakes as hard as it must.
-      const hold = listHold[a];
+      // A follower level with its leader may come up to its own merge point, rather than
+      // braking for a body it is not yet near, but only as far as the leader's tail has
+      // passed the leader's merge point. Otherwise it arrives beside that tail.
+      const leaderTail = listHold[a - 1] + len[lead];
+      const hold = listHold[a] - (leaderTail > 0 ? leaderTail : 0) - 1;
       if (hold > gap) gap = hold;
       if (vlTick[u] !== tick || gap < vlGap[u]) {
         vlTick[u] = tick;

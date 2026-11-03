@@ -7,6 +7,7 @@ import { add, clamp, length, normalize, scale, sub } from '../core/math';
 import { ELEVATION_STEP, MAP_HALF_SIZE, MAX_ELEVATION, MIN_ELEVATION } from '../core/terrain';
 import type { Id, Vec3 } from '../core/types';
 import type { ToolMark } from '../render/api';
+import { segmentOverlapIssues } from '../core/overlap';
 import { pickNode, pickRoad } from './pick';
 import { Tool } from './Tool';
 import { COLORS, type ToolId, type ToolKey, type ToolPointer } from './types';
@@ -27,6 +28,8 @@ export class MoveTool extends Tool {
   /** The segment showing handles. Stays while the cursor heads to a handle. */
   private activeSeg: Id | null = null;
   private hoverHandle: 'c1' | 'c2' | null = null;
+  /** The grabbed roads already overlapped something, as an older save may. Then a move is allowed. */
+  private overlapBefore = false;
 
   private handleAt(e: ToolPointer): 'c1' | 'c2' | null {
     const { net, view } = this.ctx;
@@ -95,6 +98,10 @@ export class MoveTool extends Tool {
     if (this.grab) {
       this.dragTo(e);
       this.show(e);
+      const clash = this.overlapBefore ? null : this.overlapOf(this.grab);
+      if (clash) {
+        this.ctx.setHud({ x: e.x, y: e.y, lines: ['Move'], notes: [`${clash} Release to put it back.`], tone: 'error' });
+      }
       return;
     }
     this.updateHover(e);
@@ -109,10 +116,12 @@ export class MoveTool extends Tool {
       const seg = net.getSegment(this.activeSeg)!;
       this.grab = { kind: 'handle', seg: seg.id, which: this.hoverHandle, plane: seg[this.hoverHandle].y };
       this.ctx.history.begin('Bend road');
+      this.overlapBefore = this.overlapOf(this.grab) !== null;
     } else if (this.hoverNode !== null) {
       const y = net.getNode(this.hoverNode)!.pos.y;
       this.grab = { kind: 'node', id: this.hoverNode, plane: y, startY: y, startScreenY: e.y };
       this.ctx.history.begin('Move node');
+      this.overlapBefore = this.overlapOf(this.grab) !== null;
     }
   }
 
@@ -169,9 +178,28 @@ export class MoveTool extends Tool {
     if (!this.grab) return;
     const grab = this.grab;
     this.grab = null;
+    // A road may not end up on top of another road, so such a move is put back.
+    const clash = this.overlapBefore ? null : this.overlapOf(grab);
+    if (clash) {
+      this.ctx.history.abort();
+      this.ctx.toast(`Can't move it there: ${clash.charAt(0).toLowerCase()}${clash.slice(1)}`, 'error');
+      this.updateHover(e);
+      return;
+    }
     this.ctx.history.end();
     this.warnCrossings(grab);
     this.updateHover(e);
+  }
+
+  /** The first overlap a moved road now has with another, or null. */
+  private overlapOf(grab: Grab): string | null {
+    const { net } = this.ctx;
+    const ids = grab.kind === 'node' ? net.getNode(grab.id)?.segments ?? [] : [grab.seg];
+    for (const id of ids) {
+      const issue = segmentOverlapIssues(net, id)[0];
+      if (issue) return issue.message.replace('Overlaps an existing road.', 'It would overlap an existing road.');
+    }
+    return null;
   }
 
   /** Core only makes junctions when drawing, so moved roads can run through others. */

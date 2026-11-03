@@ -4,7 +4,8 @@
  * None of it touches road geometry: colour overlays only write the slot table.
  */
 import * as THREE from 'three';
-import type { Id, RoadTypeDef, Vec3 } from '../core/types';
+import type { Id, RoadTypeDef, Station, Vec3 } from '../core/types';
+import { terrainHeight } from '../core/terrain';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { buildSegmentCurve, buildSegmentGeom } from '../core/geometry';
 import { effectiveSpeedKmh, totalHalfWidth } from '../core/roadTypes';
@@ -13,6 +14,7 @@ import type { DraftState, HighlightSet, OverlayMode, RoadPreview, ToolMark } fro
 import { PaintBuf } from './batch';
 import { arrowShape, placeStamp } from './markings';
 import { hexRGB, ROAD_LIFT } from './constants';
+import { lineWidth, markRadius, metresPerPixelAt, ringThickness } from './markScale';
 import { SLOT_COLS, type Shared } from './materials';
 
 const ARROW_STEP = 22;
@@ -301,6 +303,11 @@ function markColour(color: string): { c: THREE.Color; a: number } {
   return { c: new THREE.Color(color), a: 1 };
 }
 
+/** Point and ring marks, which keep about a constant size on screen. */
+function isSized(m: ToolMark): m is Extract<ToolMark, { kind: 'point' | 'ring' }> {
+  return m.kind === 'point' || m.kind === 'ring';
+}
+
 export class ToolLayer {
   readonly group = new THREE.Group();
   private material = OVER_ALL();
@@ -352,6 +359,7 @@ export class ToolLayer {
         m.idx.push(v, v + 1, v + 3, v, v + 3, v + 2);
       }
     };
+    this.heightCues(m, st, W, c);
     band(-W, W, 0.28);
     band(-W, -W + 0.25, 0.9);
     band(W - 0.25, W, 0.9);
@@ -391,21 +399,100 @@ export class ToolLayer {
     }
   }
 
+  /**
+   * The ghost draws over everything, so a raised road would read as flat. Add a
+   * ground footprint, deck sides and pillars for raised stretches, and shafts up
+   * to the surface for sunken ones. Drawn before the deck so the deck sits on top.
+   */
+  private heightCues(m: OverlayMesh, st: Station[], W: number, c: THREE.Color): void {
+    const ground = st.map((s) => terrainHeight(s.pos.x, s.pos.z));
+    const lift = st.map((s, i) => s.pos.y - ground[i]);
+    if (!lift.some((h) => Math.abs(h) > 1)) return;
+    const quad = (pts: number[], col: THREE.Color, a: number) => {
+      const base = m.pos.length / 3;
+      for (let k = 0; k < 12; k += 3) m.vert(pts[k], pts[k + 1], pts[k + 2], col, a);
+      m.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    };
+    const shadow = new THREE.Color(0.04, 0.05, 0.06);
+    const side = c.clone().multiplyScalar(0.6);
+    const deck = 1.2;
+    for (let i = 0; i + 1 < st.length; i++) {
+      if (lift[i] <= 1 && lift[i + 1] <= 1) continue;
+      const a = st[i];
+      const b = st[i + 1];
+      const ga = ground[i] + 0.15;
+      const gb = ground[i + 1] + 0.15;
+      quad([
+        a.pos.x - a.right.x * W, ga, a.pos.z - a.right.z * W,
+        a.pos.x + a.right.x * W, ga, a.pos.z + a.right.z * W,
+        b.pos.x + b.right.x * W, gb, b.pos.z + b.right.z * W,
+        b.pos.x - b.right.x * W, gb, b.pos.z - b.right.z * W,
+      ], shadow, 0.22);
+      for (const o of [-W, W]) {
+        const ax = a.pos.x + a.right.x * o;
+        const az = a.pos.z + a.right.z * o;
+        const bx = b.pos.x + b.right.x * o;
+        const bz = b.pos.z + b.right.z * o;
+        quad([ax, a.pos.y, az, bx, b.pos.y, bz, bx, b.pos.y - deck, bz, ax, a.pos.y - deck, az], side, 0.4);
+      }
+    }
+    const spacing = 32;
+    const offsets = W > 8 ? [-W * 0.5, W * 0.5] : [0];
+    let next = spacing / 2;
+    for (let i = 0; i < st.length; i++) {
+      const s = st[i];
+      if (s.s < next) continue;
+      next = s.s + spacing;
+      const h = lift[i];
+      if (Math.abs(h) < 1.5) continue;
+      const top = h > 0 ? s.pos.y - deck : ground[i];
+      const bottom = h > 0 ? ground[i] : s.pos.y;
+      const half = h > 0 ? 0.7 : 0.25;
+      for (const o of offsets) {
+        const x = s.pos.x + s.right.x * o;
+        const z = s.pos.z + s.right.z * o;
+        for (const [dx, dz] of [[s.right.x, s.right.z], [s.tangent.x, s.tangent.z]]) {
+          quad([x - dx * half, bottom, z - dz * half, x + dx * half, bottom, z + dz * half, x + dx * half, top, z + dz * half, x - dx * half, top, z - dz * half], side, h > 0 ? 0.5 : 0.35);
+        }
+      }
+    }
+  }
+
   setMarks(marks: ToolMark[]): void {
+    this.clearLabels();
+    for (const mark of marks) if (mark.kind === 'label') this.addLabel(mark.pos, mark.text, mark.color);
+    this.markList = marks;
+    this.buildMarks();
+  }
+
+  /** Last projection seen, so marks can be sized for the screen (markScale.ts). */
+  private project: ((p: Vec3) => { x: number; y: number } | null) | null = null;
+  private markList: ToolMark[] = [];
+  /** Pixel size at the first sized mark when the marks were last built. */
+  private builtMpp = 0;
+
+  private mppAt(pos: Vec3): number {
+    return this.project ? metresPerPixelAt(this.project, pos) : 0;
+  }
+
+  /** Mark geometry, with points and rings kept about a constant size on screen. */
+  private buildMarks(): void {
     const m = this.marks;
     m.reset();
-    this.clearLabels();
-    for (const mark of marks) {
+    const sized = this.markList.find(isSized);
+    this.builtMpp = sized ? this.mppAt(sized.pos) : 0;
+    for (const mark of this.markList) {
       switch (mark.kind) {
         case 'point': {
           const { c, a } = markColour(mark.color);
           const seg = 20;
           const y = mark.pos.y + ROAD_LIFT + 0.25;
+          const r = markRadius(mark.radius, this.mppAt(mark.pos), mark.px);
           const centre = m.vert(mark.pos.x, y, mark.pos.z, c, a);
           const ring = m.pos.length / 3;
           for (let i = 0; i < seg; i++) {
             const t = (i / seg) * Math.PI * 2;
-            m.vert(mark.pos.x + Math.cos(t) * mark.radius, y, mark.pos.z + Math.sin(t) * mark.radius, c, a);
+            m.vert(mark.pos.x + Math.cos(t) * r, y, mark.pos.z + Math.sin(t) * r, c, a);
           }
           for (let i = 0; i < seg; i++) m.idx.push(centre, ring + i, ring + ((i + 1) % seg));
           break;
@@ -414,14 +501,16 @@ export class ToolLayer {
           const { c, a } = markColour(mark.color);
           const seg = 40;
           const y = mark.pos.y + ROAD_LIFT + 0.25;
-          const t = Math.max(0.2, mark.radius * 0.06);
+          const mpp = this.mppAt(mark.pos);
+          const r = markRadius(mark.radius, mpp, mark.px);
+          const t = ringThickness(r, mpp);
           const base = m.pos.length / 3;
           for (let i = 0; i < seg; i++) {
             const q = (i / seg) * Math.PI * 2;
             const cx = Math.cos(q);
             const sz = Math.sin(q);
-            m.vert(mark.pos.x + cx * (mark.radius - t), y, mark.pos.z + sz * (mark.radius - t), c, a);
-            m.vert(mark.pos.x + cx * (mark.radius + t), y, mark.pos.z + sz * (mark.radius + t), c, a);
+            m.vert(mark.pos.x + cx * (r - t), y, mark.pos.z + sz * (r - t), c, a);
+            m.vert(mark.pos.x + cx * (r + t), y, mark.pos.z + sz * (r + t), c, a);
           }
           for (let i = 0; i < seg; i++) {
             const v = base + i * 2;
@@ -432,11 +521,11 @@ export class ToolLayer {
         }
         case 'line': {
           const { c, a } = markColour(mark.color);
-          this.lineMark(m, mark.points, mark.width, c, a, !!mark.dashed);
+          const mpp = mark.points.length ? this.mppAt(mark.points[0]) : 0;
+          this.lineMark(m, mark.points, lineWidth(mark.width, mpp), c, a, !!mark.dashed);
           break;
         }
         case 'label':
-          this.addLabel(mark.pos, mark.text, mark.color);
           break;
       }
     }
@@ -499,6 +588,13 @@ export class ToolLayer {
 
   /** Stick DOM labels to their world positions. */
   updateLabels(project: (p: Vec3) => { x: number; y: number } | null, rect: DOMRect): void {
+    this.project = project;
+    // Zooming changes the pixel size: rebuild the screen-sized marks when it moved.
+    const sized = this.markList.find(isSized);
+    if (sized) {
+      const mpp = this.mppAt(sized.pos);
+      if (mpp > 0 && (this.builtMpp <= 0 || Math.abs(mpp / this.builtMpp - 1) > 0.03)) this.buildMarks();
+    }
     for (const l of this.labels) {
       const p = project(l.pos);
       if (!p) {

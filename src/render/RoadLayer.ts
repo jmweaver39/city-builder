@@ -9,7 +9,8 @@ import type { NetworkChange, RoadNetwork } from '../core/RoadNetwork';
 import { ChunkBatch, HOLE_SCHEMA, HoleBuf, PAINT_SCHEMA, PaintBuf, SURF_SCHEMA, SurfBuf } from './batch';
 import { BIAS_MARKING, MARK_LIFT } from './constants';
 import { buildJunction } from './junctions';
-import { buildSegmentPaint } from './markings';
+import { buildJunctionGuides, buildSegmentPaint } from './markings';
+import { buildRampJunctionPaint, isRampJunction } from './gore';
 import { makeHoleMaterial, makePaintMaterial, makeSurfaceMaterial, type Shared } from './materials';
 import { buildLaneArrows, type SlotOwner } from './overlays';
 import { buildSegment, type RoadOutputs } from './roads';
@@ -179,6 +180,7 @@ export class RoadLayer implements SlotOwner {
     if (!node) {
       this.surf.set(key, null);
       this.hole.set(key, null);
+      this.paint.set(key, null);
       this.releaseSlot(this.nodeSlot, id);
       return;
     }
@@ -186,6 +188,11 @@ export class RoadLayer implements SlotOwner {
     buildJunction(this.net, id, this.slotOfNode(id), out);
     this.surf.set(key, out.surf.toPiece());
     this.hole.set(key, out.hole.toPiece());
+    const guides = new PaintBuf();
+    // Highway diverges and merges get full lane, edge and gore paint (gore.ts) instead.
+    if (isRampJunction(this.net, id)) buildRampJunctionPaint(this.net, id, guides);
+    else buildJunctionGuides(this.net, id, guides);
+    this.paint.set(key, guides.toPiece());
   }
 
   /** Apply what changed since last frame. Null when nothing did. */

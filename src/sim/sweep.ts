@@ -14,6 +14,12 @@
 import type { GLane, Id, LaneGraph } from '../core';
 /** Zone points sit this far past first contact. Guard holds come GUARD_MARGIN before them. */
 const ZONE_OFFSET = 1;
+/** A truck waiting at a stop line is this much wider, each side, than the car allowed for. */
+const WAITING_EXTRA = 0.4;
+/** Zone points along the other path: each covers its margins and a car's length. */
+const OTHER_SPACING = 8;
+/** How much of each exit lane a swinging tail is checked against. */
+const EXIT_REACH = 16;
 
 const STEP = 2.5;
 
@@ -24,8 +30,12 @@ interface Body {
   minTurn: number;
 }
 
-/** A long vehicle: 12 m, half its width plus half a car's plus a margin. */
-const LONG: Body = { length: 12, clearance: 2.4, minTurn: 0.45 };
+/**
+ * A long vehicle: 12 m, half its width plus half a car's plus a margin. Every connector
+ * is walked, even a straight one: the tail may still be on a curved lane behind it, as
+ * coming off a loop ramp, and that is where it swings wide.
+ */
+const LONG: Body = { length: 12, clearance: 2.4, minTurn: 0 };
 /** Any car, on any path. Two cars side by side need 1.8 m plus a margin. */
 const CAR: Body = { length: 4.5, clearance: 2.1, minTurn: 0 };
 
@@ -40,7 +50,8 @@ export interface SweepHit {
 interface NodeSweep {
   lanes: GLane[];
   /** By position in the node's connector list. */
-  hits: { a: number; b: number; aS: number; bS: number; all: boolean }[];
+  /** a by position in the node's list; b a dense lane index; road when b is an exit lane. */
+  hits: { a: number; b: number; road: boolean; aS: number; bS: number; all: boolean }[];
   /** Road lanes into this node whose stop line a turning long body reaches: how far back to wait. */
   setbacks: Map<number, number>;
 }
@@ -84,7 +95,7 @@ function computeNode(graph: LaneGraph, ids: number[]): NodeSweep {
   const lanes = ids.map((i) => graph.lanes[i]);
   const hits: NodeSweep['hits'] = [];
   const setbacks = new Map<number, number>();
-  sweepBody(graph, ids, lanes, CAR, hits, null);
+  sweepBody(graph, ids, lanes, CAR, hits, setbacks);
   sweepBody(graph, ids, lanes, LONG, hits, setbacks);
   return { lanes, hits, setbacks };
 }
@@ -95,22 +106,30 @@ function sweepBody(
   lanes: GLane[],
   body: Body,
   hits: NodeSweep['hits'],
-  setbacks: Map<number, number> | null,
+  setbacks: Map<number, number>,
 ): void {
   const SWEEP_LENGTH = body.length;
   const SWEEP_CLEARANCE = body.clearance;
   const all = body === CAR;
+  // Besides other connectors, the first stretch of each exit lane: a queue there sits
+  // right beside where a long tail swings out of the junction.
+  const exits = [...new Set(lanes.map((l) => l.toLane))];
+  const targets: { lane: GLane; id: number; length: number; road: boolean }[] = [
+    ...lanes.map((l, i) => ({ lane: l, id: ids[i], length: l.length, road: false })),
+    ...exits.map((id) => ({ lane: graph.lanes[id], id, length: Math.min(EXIT_REACH, graph.lanes[id].length), road: true })),
+  ];
   const incoming = [...new Set(lanes.map((l) => l.fromLane))];
   const f = { x: 0, z: 0 };
   const r = { x: 0, z: 0 };
   const p = { x: 0, z: 0 };
   // Other paths, sampled once.
-  const samples = lanes.map((l) => {
-    const count = Math.max(2, Math.ceil(l.length / STEP) + 1);
+  const samples = targets.map((t) => {
+    const l = t.lane;
+    const count = Math.max(2, Math.ceil(t.length / STEP) + 1);
     const xs = new Float64Array(count);
     const zs = new Float64Array(count);
     for (let i = 0; i < count; i++) {
-      pointAt(l, (l.length * i) / (count - 1), p);
+      pointAt(l, (t.length * i) / (count - 1), p);
       xs[i] = p.x;
       zs[i] = p.z;
     }
@@ -122,9 +141,14 @@ function sweepBody(
     const from = graph.lanes[c.fromLane];
     // Crossing pairs still count: the core's point is where centrelines cross, while a
     // tail can reach the other path much earlier. Merges are ordered another way.
-    const known = new Set(c.conflicts.filter((k) => k.kind === 'merge').map((k) => k.lane));
+    // A long body needs more room than merge ordering gives a car, so it sweeps merges too.
+    const known = new Set(all ? c.conflicts.filter((k) => k.kind === 'merge').map((k) => k.lane) : []);
     // First and last contact with each other path, along this one and along that.
-    const seen = new Map<number, { aS: number; aEnd: number; bS: number }>();
+    // Contacts that really happen together: with the nose at q, the body reaches the other
+    // path at its point i. Bucketed, each pair of buckets becomes one zone, earliest
+    // point first. Pairing every point with every other would invent conflicts between
+    // positions that never meet, and those can wait on each other for ever.
+    const seen = new Map<number, Map<number, { aS: number; bS: number }>>();
     const exit = graph.lanes[c.toLane];
     // The nose runs on along the exit lane until the tail has left the connector.
     const reach = c.length + Math.min(SWEEP_LENGTH, exit.length);
@@ -136,46 +160,53 @@ function sweepBody(
       const back = s - SWEEP_LENGTH;
       if (back >= 0) pointAt(c, back, r);
       else pointAt(from, from.length + back, r);
-      for (let b = 0; b < lanes.length; b++) {
+      for (let b = 0; b < targets.length; b++) {
         if (b === a) continue;
-        const d = lanes[b];
-        // Branches from one lane are kept apart by following until they separate, which
-        // is enough for cars. A long body still swings over the other branch after that.
-        if ((all && d.fromLane === c.fromLane) || d.vehicleKind === 'bike' || known.has(ids[b])) continue;
+        const target = targets[b];
+        const d = target.lane;
+        if (target.road) {
+          // Its own exit is followed in the ordinary way.
+          if (target.id === c.toLane || d.vehicleKind === 'bike') continue;
+        } else if ((all && d.fromLane === c.fromLane) || d.vehicleKind === 'bike' || known.has(ids[b])) {
+          // Branches from one lane are kept apart by following until they separate, which
+          // is enough for cars. A long body still swings over the other branch after that.
+          continue;
+        }
         const sample = samples[b];
+        // Every point of the other path in reach, not just the first: along a merge that
+        // stretch is long, and a vehicle past its first point is not yet clear.
         for (let i = 0; i < sample.count; i++) {
-          if (distanceToSegment(sample.xs[i], sample.zs[i], f.x, f.z, r.x, r.z) < SWEEP_CLEARANCE) {
-            const hit = seen.get(b);
-            if (hit) hit.aEnd = s;
-            else seen.set(b, { aS: s, aEnd: s, bS: (d.length * i) / (sample.count - 1) });
-            break;
+          if (distanceToSegment(sample.xs[i], sample.zs[i], f.x, f.z, r.x, r.z) >= SWEEP_CLEARANCE) continue;
+          const at = (target.length * i) / (sample.count - 1);
+          let pairs = seen.get(b);
+          if (!pairs) seen.set(b, (pairs = new Map()));
+          const key = Math.floor(s / SWEEP_LENGTH) * 4096 + Math.floor(at / OTHER_SPACING);
+          const hit = pairs.get(key);
+          if (!hit) pairs.set(key, { aS: s, bS: at });
+          else {
+            if (s < hit.aS) hit.aS = s;
+            if (at < hit.bS) hit.bS = at;
           }
         }
       }
       // Waiting vehicles at another arm's stop line. Going back from the line, find
       // where the lane leaves this body's reach.
-      for (const idx of setbacks ? incoming : []) {
+      for (const idx of incoming) {
         if (idx === c.fromLane) continue;
         const lane = graph.lanes[idx];
         for (let e = 0; e <= MAX_SETBACK; e += 1) {
           if (e > lane.length * 0.5) break;
           pointAt(lane, lane.length - e, p);
-          if (distanceToSegment(p.x, p.z, f.x, f.z, r.x, r.z) >= SWEEP_CLEARANCE) continue;
-          if (e + 1 > (setbacks!.get(idx) ?? 0)) setbacks!.set(idx, e + 1);
+          // The one waiting may be a truck: allow for its width over a car's.
+          if (distanceToSegment(p.x, p.z, f.x, f.z, r.x, r.z) >= SWEEP_CLEARANCE + WAITING_EXTRA) continue;
+          if (e + 1 > (setbacks.get(idx) ?? 0)) setbacks.set(idx, e + 1);
         }
       }
     }
-    for (const [b, hit] of seen) {
-      // A zone point covers a body length past itself, so a long sweep gets a chain of
-      // them. Positions on this connector are where the nose is, which may be beyond
-      // its end on the exit lane while the tail still swings through.
-      // A zone point sits just past first contact: the guard holds a little before a
-      // point, and that must be before the bodies touch, not after.
-      const bS = Math.min(lanes[b].length, hit.bS + ZONE_OFFSET);
-      for (let q = hit.aS; ; q += SWEEP_LENGTH) {
-        const at = Math.min(q, hit.aEnd) + ZONE_OFFSET;
-        hits.push({ a, b, aS: at, bS, all });
-        if (q >= hit.aEnd) break;
+    for (const [b, pairs] of seen) {
+      const limit = targets[b].length;
+      for (const hit of pairs.values()) {
+        hits.push({ a, b: targets[b].id, road: targets[b].road, aS: hit.aS + ZONE_OFFSET, bS: Math.min(limit, hit.bS + ZONE_OFFSET), all });
       }
     }
   }
@@ -204,8 +235,9 @@ export function sweepConflicts(graph: LaneGraph, cache: SweepCache, setback: Flo
     }
     for (const [lane, back] of node.setbacks) setback[lane] = back;
     for (const h of node.hits) {
-      add(ids[h.a], { lane: ids[h.b], selfS: h.aS, otherS: h.bS, all: h.all });
-      add(ids[h.b], { lane: ids[h.a], selfS: h.bS, otherS: h.aS, all: h.all });
+      add(ids[h.a], { lane: h.b, selfS: h.aS, otherS: h.bS, all: h.all });
+      // Road lanes keep no conflicts: their vehicles are on the connector's side of it.
+      if (!h.road) add(h.b, { lane: ids[h.a], selfS: h.bS, otherS: h.aS, all: h.all });
     }
   }
   return out;

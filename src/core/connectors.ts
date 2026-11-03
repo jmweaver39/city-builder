@@ -4,12 +4,13 @@
  * nothing about the dense lane graph: it works on lane ends and returns protos
  * that laneGraph.ts assembles.
  */
-import type { Id, JunctionControl, LaneKind, NodeGeom, RoadTypeDef, SegmentGeom, TurnKind, Vec3 } from './types';
+import type { Id, JunctionControl, LaneKind, NodeGeom, RampAttach, RoadCategory, RoadTypeDef, SegmentGeom, TurnKind, Vec3 } from './types';
 import type { NodeLayout } from './junction';
 import { cubicPoint, cubicDerivative, type Cubic } from './bezier';
 import { toPolylineData, type PolylineData } from './geometry';
 import { clamp, crossXZ, distXZ, dotXZ, lengthXZ, scale, signedTurn, segmentIntersectXZ } from './math';
 import { isOneWay } from './roadTypes';
+import { isControlledAccess, linkControlledAccess } from './ramps';
 
 /** One lane where it meets a node. */
 export interface LaneEnd {
@@ -32,6 +33,10 @@ export interface ArmLanes {
   /** Unit horizontal, away from the node, at the cut. */
   cutDir: Vec3;
   oneWay: boolean;
+  /** The road's category, for the controlled-access rules in ramps.ts. */
+  category?: RoadCategory;
+  /** Set when this end of the road is attached to a lane of another road. */
+  attach?: RampAttach;
   /** Lanes arriving at the node, left to right as the driver sees them. */
   incoming: LaneEnd[];
   /** Lanes leaving the node, left to right as the driver sees them. */
@@ -88,6 +93,7 @@ export function buildArmLanes(
   geomOf: (id: Id) => SegmentGeom | undefined,
   defOf: (id: Id) => RoadTypeDef,
   lanesOf: (id: Id) => readonly (RoadLaneInfo | null)[],
+  attachOf?: (id: Id, atStart: boolean) => RampAttach | undefined,
 ): ArmLanes[] {
   return layout.arms.map((arm, armIndex) => {
     const seg = geomOf(arm.segmentId);
@@ -118,11 +124,15 @@ export function buildArmLanes(
     }
     incoming.sort((a, b) => a.lat - b.lat);
     outgoing.sort((a, b) => a.lat - b.lat);
+    const def = defOf(arm.segmentId);
+    const attach = attachOf?.(arm.segmentId, arm.atStart);
     return {
       segmentId: arm.segmentId,
       atStart: arm.atStart,
       cutDir: cut.cutDir,
-      oneWay: isOneWay(defOf(arm.segmentId)),
+      oneWay: isOneWay(def),
+      category: def.category,
+      ...(attach ? { attach } : {}),
       incoming,
       outgoing,
     };
@@ -193,7 +203,7 @@ export function turnBetween(arms: ArmLanes[], fromArm: number, toArm: number): T
 // Assigning lanes
 // ---------------------------------------------------------------------------
 
-class LinkSet {
+export class LinkSet {
   readonly links = new Map<string, LaneLinkSpec>();
 
   add(from: LaneEnd, to: LaneEnd, turn: TurnKind): void {
@@ -299,7 +309,7 @@ export function shareLanes(
   });
 }
 
-function linkGeneral(set: LinkSet, arms: ArmLanes[], accept: (l: LaneEnd) => boolean): void {
+export function linkGeneral(set: LinkSet, arms: ArmLanes[], accept: (l: LaneEnd) => boolean): void {
   for (let a = 0; a < arms.length; a++) {
     const lanes = arms[a].incoming.filter(accept);
     if (!lanes.length) continue;
@@ -392,7 +402,7 @@ function linkBusLanes(set: LinkSet, arms: ArmLanes[]): void {
 }
 
 /** Give any lane leaving a junction a feeder, taken from the lane beside it. */
-function feedOrphans(set: LinkSet, arms: ArmLanes[], accept: (l: LaneEnd) => boolean): void {
+export function feedOrphans(set: LinkSet, arms: ArmLanes[], accept: (l: LaneEnd) => boolean): void {
   for (const arm of arms) {
     const lanes = arm.outgoing.filter(accept);
     for (let i = 0; i < lanes.length; i++) {
@@ -411,7 +421,7 @@ function feedOrphans(set: LinkSet, arms: ArmLanes[], accept: (l: LaneEnd) => boo
 }
 
 /** Any lane still without an exit turns round, if it can. This is the dead-end rule. */
-function linkTurnarounds(set: LinkSet, arms: ArmLanes[]): void {
+export function linkTurnarounds(set: LinkSet, arms: ArmLanes[]): void {
   for (const arm of arms) {
     for (const bike of [false, true]) {
       // Trains change ends at a dead end, they never loop round.
@@ -484,6 +494,12 @@ export function autoLaneLinks(arms: ArmLanes[]): LaneLinkSpec[] {
     if (arm.incoming.some(drive)) inArms.push(i);
     if (arm.outgoing.some(drive)) outArms.push(i);
   });
+  if (isControlledAccess(arms)) {
+    // Highways: own carriageway only, merge and diverge, no turns across.
+    linkControlledAccess(set, arms);
+    linkRail(set, arms);
+    return [...set.links.values()];
+  }
   const allOneWay = arms.every((a) => a.oneWay);
   if (allOneWay && inArms.length === 1 && outArms.length >= 2) {
     const from = inArms[0];

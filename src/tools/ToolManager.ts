@@ -7,16 +7,19 @@ import type { ToolMark } from '../render/api';
 import type { SimApi } from '../sim/api';
 import { BulldozeTool } from './BulldozeTool';
 import { JunctionTool } from './JunctionTool';
+import { RoundaboutTool } from './RoundaboutTool';
 import { LaneTool } from './LaneTool';
 import { MoveTool } from './MoveTool';
 import { NodeMarkingTool } from './NodeMarkingTool';
 import { PaintTool } from './PaintTool';
+import { LineTool, StationTool, type RailHooks } from './RailTools';
 import { ReverseTool } from './ReverseTool';
 import { RoadTool } from './RoadTool';
 import { SelectTool } from './SelectTool';
 import { TemplateTool } from './TemplateTool';
 import { Tool } from './Tool';
 import { TrafficTool } from './TrafficTool';
+import { ZoneTool } from './ZoneTool';
 import { GridAlignTool, GridBlockTool } from './GridBlockTool';
 import { gridViewFor } from './grid';
 import {
@@ -92,6 +95,7 @@ export class ToolManager {
       bulldoze: new BulldozeTool(this.ctx),
       move: new MoveTool(this.ctx),
       junction: new JunctionTool(this.ctx),
+      roundabout: new RoundaboutTool(this.ctx),
       lanes: new LaneTool(this.ctx),
       paint: new PaintTool(this.ctx),
       traffic: new TrafficTool(this.ctx),
@@ -100,10 +104,28 @@ export class ToolManager {
       reverse: new ReverseTool(this.ctx),
       gridBlock: new GridBlockTool(this.ctx),
       gridAlign: new GridAlignTool(this.ctx),
+      zone: new ZoneTool(this.ctx),
+      station: new StationTool(this.ctx),
+      line: new LineTool(this.ctx),
     };
     (this.tools.gridAlign as GridAlignTool).onDone = () => this.setTool(this.beforeAlign);
     this.current = this.tools.select;
     this.dispose = options.net.onChange((change) => this.networkChanged(change));
+  }
+
+  /** Give the station and line tools the train sim. */
+  setRail(hooks: RailHooks | null): void {
+    this.station.rail = hooks;
+    this.line.rail = hooks;
+    (this.tools.select as SelectTool).pickTrain = hooks ? (x, y) => hooks.pickTrain(x, y) : null;
+  }
+
+  get station(): StationTool {
+    return this.tools.station as StationTool;
+  }
+
+  get line(): LineTool {
+    return this.tools.line as LineTool;
   }
 
   /** Wire late-bound hooks, once the UI exists. */
@@ -129,6 +151,18 @@ export class ToolManager {
 
   get nodeMarkings(): NodeMarkingTool {
     return this.tools.nodeMarkings as NodeMarkingTool;
+  }
+
+  get zone(): ZoneTool {
+    return this.tools.zone as ZoneTool;
+  }
+
+  get roundabout(): RoundaboutTool {
+    return this.tools.roundabout as RoundaboutTool;
+  }
+
+  get junction(): JunctionTool {
+    return this.tools.junction as JunctionTool;
   }
 
   get template(): TemplateTool {

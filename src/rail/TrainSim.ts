@@ -623,7 +623,7 @@ export class TrainSim {
       const t = this.spawn(plan, seq) ?? this.spawn(plan, seq === 0 ? plan.line.stops.length - 1 : 0);
       if (t) {
         c.from++;
-        c.next = this.time_ + (gateway ? gap : Math.min(gap, 240));
+        c.next = this.time_ + (gateway ? gap : Math.min(gap, 120));
       } else {
         c.next = this.time_ + 5;
       }
@@ -700,7 +700,7 @@ export class TrainSim {
       held: new Map(),
       blockedBy: -1,
       stuck: 0,
-      passengers: 0,
+      passengers: consist.type.passengers ? Math.round(consist.seats * 0.15) : 0,
       carried: 0,
       departed: this.time_,
       born: this.time_,

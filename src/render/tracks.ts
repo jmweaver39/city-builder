@@ -7,6 +7,7 @@
  * at RAIL_TOP. Trains ride at RAIL_TOP.
  */
 import * as THREE from 'three';
+import { RAIL } from './style';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { riverDistance, RIVER_HALF_WIDTH, terrainHeight } from '../core/terrain';
 import { RAIL_TOP } from '../rail/constants';
@@ -45,27 +46,8 @@ const PLATFORM_WIDTH = 5;
 const PLATFORM_TOP = 1.1;
 const CHUNK = 300;
 
-const C = {
-  ballast: lin(0x8f897e),
-  ballastDark: lin(0x7b766c),
-  railSide: lin(0x6b4a37),
-  concrete: lin(0xb3b0a8),
-  concreteDark: lin(0x8c8a84),
-  steel: lin(0x6f767c),
-  galv: lin(0x9ba3a8),
-  white: lin(0xe9e7e2),
-  yellow: lin(0xe3b52c),
-  red: lin(0xc0302a),
-  black: lin(0x111214),
-  roof: lin(0x55606a),
-  glass: lin(0x2a3644),
-  tile: lin(0xd8d4cb),
-  grass: lin(0x5c7a3f),
-  lamp: lin(0xffe2b0),
-  dark: lin(0x1c1e22),
-  wood: lin(0x7a5638),
-  bench: lin(0x3b5f86),
-};
+/** Rail colours come from the shared style palette. */
+const C = RAIL;
 
 function chunkKey(x: number, z: number): string {
   return `${Math.floor(x / CHUNK)},${Math.floor(z / CHUNK)}`;
@@ -90,7 +72,7 @@ export class TrackLayer {
   private readonly overlay = new THREE.Group();
   private readonly material: THREE.MeshStandardMaterial;
   private readonly wireMat = new THREE.LineBasicMaterial({ color: 0x24282c, transparent: true, opacity: 0.85 });
-  private readonly overlayMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85, depthWrite: false });
+  private readonly overlayMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9, depthWrite: false, depthTest: false });
   private readonly lampOn = new THREE.MeshBasicMaterial({ color: new THREE.Color(4, 0.4, 0.3), toneMapped: false });
   private readonly lampOff = new THREE.MeshBasicMaterial({ color: 0x2a1010 });
   private readonly gateMat = new THREE.MeshStandardMaterial({ color: 0xf2f0ea, roughness: 0.5 });
@@ -695,8 +677,9 @@ export class TrackLayer {
         const n = used.get(id) ?? 0;
         used.set(id, n + 1);
         const frames = polyFrames(p.pts);
-        const off = (n - 0.5) * 0.9 * (n > 0 ? 1 : 0);
-        sweep(buf, frames, [off - 0.55, RAIL_TOP + 0.4 + n * 0.02], [off + 0.55, RAIL_TOP + 0.4 + n * 0.02], color, M_PLAIN);
+        // Wide enough to read from a map view; lines sharing track sit side by side.
+        const off = n * 4.5;
+        sweep(buf, frames, [off - 2.2, RAIL_TOP + 0.6], [off + 2.2, RAIL_TOP + 0.6], color, M_PLAIN);
       }
     }
     if (!buf.count) return;

@@ -122,6 +122,9 @@ export class JunctionSystem {
 
 export function addClaim(w: World, v: number, c: number, d: number): void {
   const { veh, jn, bk, g } = w;
+  // A vehicle holds one permit at a time. Its route can change while it holds one, and
+  // relinking it without leaving the old list first would corrupt both lists.
+  if (veh.permit[v] >= 0) dropClaim(w, v);
   veh.permit[v] = c;
   veh.permitDist[v] = d;
   const head = jn.claimHead[c];
@@ -203,6 +206,7 @@ function arrivalClashes(
   clear: number,
   headway: number,
   depth: number,
+  sharedExit = false,
 ): boolean {
   const { g, veh, bk } = w;
   const { eV, eS, eT, start } = bk;
@@ -216,8 +220,10 @@ function arrivalClashes(
       if (nextOf(w, u) !== d) continue;
     }
     const dist = g.len[lane] - eS[e] + toConflict;
-    // A driver stopped at the line and refused entry is no threat yet.
-    if (veh.v[u] < 1 && veh.waitSec[u] > 0.5 && veh.permit[u] !== d) continue;
+    // A driver stopped at the line and refused entry is no threat yet, unless it is
+    // waiting for room on the very lane I would merge into: then the space is its
+    // first. Without this, entries fill a roundabout ring the circulating cars need.
+    if (veh.v[u] < 1 && veh.waitSec[u] > 0.5 && veh.permit[u] !== d && !(sharedExit && veh.denied[u] === DENY_EXIT_FULL)) continue;
     const tin = timeToCover(dist - CROSS_MARGIN, veh.v[u], veh.accel[u], Math.max(cap, g.speed[lane]));
     if (tin > clear + headway) return false;
     return true;
@@ -227,7 +233,7 @@ function arrivalClashes(
     if (g.len[lane] + toConflict > reach) return false;
     const { prevStart, prevList } = g;
     for (let k = prevStart[lane]; k < prevStart[lane + 1]; k++) {
-      if (arrivalClashes(w, prevList[k], d, toConflict + g.len[lane], arrive, clear, headway, depth + 1)) return true;
+      if (arrivalClashes(w, prevList[k], d, toConflict + g.len[lane], arrive, clear, headway, depth + 1, sharedExit)) return true;
     }
   }
   return false;
@@ -374,7 +380,7 @@ function conflictsClear(w: World, v: number, c: number, d: number): boolean {
     // Vehicles still coming that I have to give way to.
     if (rel < 0) {
       const closing = merge ? Math.max(0, laneSpeed[g.fromLane[other]] - cap) * 0.12 : 0;
-      if (arrivalClashes(w, g.fromLane[other], other, otherS, arrive, clear, headway + closing, 0)) {
+      if (arrivalClashes(w, g.fromLane[other], other, otherS, arrive, clear, headway + closing, 0, merge)) {
         veh.denied[v] = DENY_ARRIVAL;
         return false;
       }

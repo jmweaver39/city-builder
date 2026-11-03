@@ -178,6 +178,29 @@ export class History implements EditRecorder {
     this.clear();
   }
 
+  /**
+   * Replace the whole project as one undoable step, for New, Load, Import and demos,
+   * so a map replaced by mistake comes back with Undo.
+   */
+  replaceUndoable(label: string, load: () => void): void {
+    this.abort();
+    const before = this.current;
+    this.applying = true;
+    try {
+      load();
+    } finally {
+      this.applying = false;
+    }
+    this.redoStack = [];
+    this.undoStack.push({ label, before });
+    if (this.undoStack.length > this.levels) this.undoStack.shift();
+    this.current = this.net.snapshot();
+    this.lastKey = null;
+    this.nextLabel = null;
+    this.nextKey = null;
+    this.notify();
+  }
+
   /** Forget all steps and treat the current network as the start. */
   clear(): void {
     this.undoStack = [];

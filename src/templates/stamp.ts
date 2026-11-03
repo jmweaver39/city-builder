@@ -22,6 +22,7 @@ import {
   type SignalPlan,
   type Vec3,
 } from '../core';
+import { segmentOverlapIssues } from '../core/overlap';
 import { worldCubics, type Blueprint, type BpLaneLink, type BpPort, type Placement, type WorldFrame, worldFrame } from './blueprint';
 
 export interface StampedPort {
@@ -251,12 +252,16 @@ export function stampBlueprint(net: RoadNetwork, bp: Blueprint, placement: Place
           c2: cubic.p2,
           roadType: seg.road.type,
         })) {
-          if (issue.severity === 'error') problems.push(`${seg.road.name}: ${issue.message}`);
+          // Overlap is checked below against the roads that were here, not the template's own.
+          if (issue.severity === 'error' && issue.code !== 'tooClose') problems.push(`${seg.road.name}: ${issue.message}`);
         }
       }
       const id = net.addSegment(a, b, { c1: cubic.p1, c2: cubic.p2, roadType: seg.road.type, overrides: seg.road.overrides });
       piecesOf.set(i, [id]);
       result.segments.push(id);
+      if (existing.size) {
+        for (const issue of segmentOverlapIssues(net, id, existing)) problems.push(`${seg.road.name}: ${issue.message}`);
+      }
     });
 
     const armSegment = (key: number, arm: BpLaneLink['from']): Id => {

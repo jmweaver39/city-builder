@@ -39,7 +39,8 @@ export interface LaneDef {
   speedKmh?: number;
 }
 
-export type RoadCategory = 'street' | 'avenue' | 'oneway' | 'highway' | 'ramp' | 'custom' | 'rail';
+/** 'roundabout' is the one-way ring of a roundabout, placed only by the Roundabout tool. */
+export type RoadCategory = 'street' | 'avenue' | 'oneway' | 'highway' | 'ramp' | 'custom' | 'rail' | 'roundabout';
 
 export type MedianKind = 'none' | 'paint' | 'grass' | 'barrier';
 
@@ -137,6 +138,14 @@ export interface SignalPlan {
 export interface MarkingAnchor {
   segmentId: Id;
   boundary: number;
+  /**
+   * When set, the anchor is on the junction's outline instead: this fraction of the
+   * way along the kerb from this arm's left edge to the next arm's right edge,
+   * clockwise, so 0 and 1 are those two road edges. `boundary` is then unused.
+   */
+  corner?: number;
+  /** Metres back along the arm from its cut line, for lines laid across the road. */
+  back?: number;
 }
 
 export type NodeLineStyle =
@@ -164,6 +173,12 @@ export interface NodeLineMarking {
   width: number;
   /** True draws a chord. False draws a curve tangent to the lanes at both ends. */
   straight: boolean;
+  /**
+   * 'outline' runs along the junction's kerb between two outline anchors. 'lanes'
+   * follows the lane paths through the junction between the two arms. Absent uses
+   * `straight`.
+   */
+  path?: 'outline' | 'lanes';
 }
 
 /** An area enclosed by three or more anchors. */

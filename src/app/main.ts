@@ -7,6 +7,7 @@ import * as templates from '../templates';
 import { ToolManager } from '../tools/ToolManager';
 import { UI } from '../ui/UI';
 import { History } from './History';
+import { installRail, type RailApp } from './rail';
 import { buildStarterScene } from './starter';
 import { debounce, SaveStore, type KeyValueStore, type SaveRecord } from './storage';
 
@@ -19,6 +20,8 @@ declare global {
       tools: ToolManager;
       history: History;
       ui: UI;
+      trains?: import('../rail/TrainSim').TrainSim;
+      rail?: import('../render/rail').RailLayer;
     };
   }
 }
@@ -27,7 +30,7 @@ const AUTOSAVE_MS = 1500;
 /** Fixed sim steps run before the first frame of the starter, so roads are not empty. */
 const STARTER_WARM_STEPS = 400;
 /** Frames the starter scene. */
-const STARTER_CAMERA = { target: { x: -40, y: 0, z: -90 }, distance: 1050, yaw: 0, pitch: 0.95 };
+const STARTER_CAMERA = { target: { x: -40, y: 0, z: -90 }, distance: 1050, yaw: 0, pitch: 1.3 };
 /** Longest step fed to the sim, so a stalled tab does not run a burst of steps. */
 const MAX_DT = 0.1;
 
@@ -100,9 +103,12 @@ async function boot(): Promise<void> {
   const history = new History(net);
   const tools = new ToolManager({ net, sim, view: renderer, history, templates });
 
-  const load = (fn: () => void): void => {
-    history.replace(fn);
+  let rail: RailApp | null = null;
+  // Replacing the map is one undo step, so a map replaced by mistake comes back.
+  const load = (fn: () => void, label = 'Replace map'): void => {
+    history.replaceUndoable(label, fn);
     sim.reset();
+    rail?.reset();
   };
   const ui = new UI({
     root,
@@ -118,23 +124,23 @@ async function boot(): Promise<void> {
         load(() => {
           net.clear(name);
           if (starter) buildStarterScene(net);
-        });
+        }, 'New map');
         if (starter) warmUp();
         renderer.setCamera(starter ? STARTER_CAMERA : { target: { x: 0, y: 0, z: 0 } }, true);
       },
       loadRecord(record) {
         try {
-          load(() => net.load(record.project, 'replace'));
+          load(() => net.load(record.project, 'replace'), 'Load map');
           if (record.camera) renderer.setCamera(record.camera);
-          ui.context.toast(`Loaded ${net.project.name}.`);
+          ui.context.toast(`Loaded ${net.project.name}. Undo brings back the previous map.`);
         } catch (err) {
           ui.context.toast(`Could not load: ${(err as Error).message}`, 'error');
         }
       },
       importJson(text) {
         try {
-          load(() => net.load(text, 'replace'));
-          ui.context.toast(`Imported ${net.project.name}.`);
+          load(() => net.load(text, 'replace'), 'Import map');
+          ui.context.toast(`Imported ${net.project.name}. Undo brings back the previous map.`);
         } catch (err) {
           const reason = err instanceof ProjectFormatError || err instanceof SyntaxError ? err.message : 'the file is not a Cloverleaf project';
           ui.context.toast(`Could not import: ${reason}`, 'error');
@@ -151,17 +157,22 @@ async function boot(): Promise<void> {
     },
   });
 
+  rail = installRail({ net, sim, renderer, tools, history, ui, warmRoads: warmUp });
+  // Trains go out on the line before the first frame, on a restored map too.
+  rail.warm();
+
   const autosave = debounce(() => saves.autosave(net, renderer.getCamera()), AUTOSAVE_MS);
   net.onChange(autosave);
   window.addEventListener('beforeunload', () => autosave.flush());
 
-  window.__cloverleaf = { net, sim, renderer, tools, history, ui };
+  window.__cloverleaf = { net, sim, renderer, tools, history, ui, trains: rail.trains, rail: rail.layer };
 
   let last = performance.now();
   const frame = (now: number): void => {
     const dt = Math.min((now - last) / 1000, MAX_DT);
     last = now;
     sim.advance(dt);
+    rail?.advance(dt);
     renderer.frame(dt);
     ui.update(dt);
     requestAnimationFrame(frame);

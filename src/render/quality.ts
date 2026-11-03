@@ -23,6 +23,8 @@ export interface QualitySettings {
   /** Trees inside this are full models, then cards, then billboards. Metres. */
   treeNear: number;
   treeMid: number;
+  /** Trees beyond this are not drawn. Metres. */
+  treeFar: number;
   /** Fraction of scattered trees shown. */
   treeDensity: number;
   /** Grass tuft instances near the camera, 0 for none. */
@@ -33,6 +35,9 @@ export interface QualitySettings {
   /** Bring back guard rail posts, drains and other small geometry. */
   detail: boolean;
   cloudShadows: boolean;
+  /** Side and spacing of the fine ground patch under the camera, metres. 0 for none. */
+  groundPatch: number;
+  groundStep: number;
 }
 
 export const QUALITY: Record<QualityName, QualitySettings> = {
@@ -46,12 +51,15 @@ export const QUALITY: Record<QualityName, QualitySettings> = {
     shadowSize: 1536,
     treeNear: 70,
     treeMid: 380,
+    treeFar: 1600,
     treeDensity: 0.55,
     grass: 0,
     vehicleNear: 45,
     vehicleMid: 220,
     detail: false,
     cloudShadows: false,
+    groundPatch: 0,
+    groundStep: 1,
   },
   medium: {
     name: 'medium',
@@ -61,14 +69,17 @@ export const QUALITY: Record<QualityName, QualitySettings> = {
     ao: 0,
     bloom: true,
     shadowSize: 2048,
-    treeNear: 110,
+    treeNear: 90,
     treeMid: 520,
+    treeFar: 2400,
     treeDensity: 0.8,
-    grass: 8000,
+    grass: 0,
     vehicleNear: 70,
     vehicleMid: 320,
     detail: true,
-    cloudShadows: true,
+    cloudShadows: false,
+    groundPatch: 0,
+    groundStep: 1,
   },
   high: {
     name: 'high',
@@ -78,14 +89,17 @@ export const QUALITY: Record<QualityName, QualitySettings> = {
     ao: 0.5,
     bloom: true,
     shadowSize: 4096,
-    treeNear: 170,
-    treeMid: 760,
+    treeNear: 140,
+    treeMid: 700,
+    treeFar: 3200,
     treeDensity: 1,
-    grass: 20000,
+    grass: 0,
     vehicleNear: 110,
     vehicleMid: 480,
     detail: true,
-    cloudShadows: true,
+    cloudShadows: false,
+    groundPatch: 320,
+    groundStep: 1.25,
   },
   ultra: {
     name: 'ultra',
@@ -95,14 +109,17 @@ export const QUALITY: Record<QualityName, QualitySettings> = {
     ao: 1,
     bloom: true,
     shadowSize: 4096,
-    treeNear: 260,
+    treeNear: 220,
     treeMid: 1100,
+    treeFar: 4600,
     treeDensity: 1,
-    grass: 40000,
+    grass: 0,
     vehicleNear: 170,
     vehicleMid: 700,
     detail: true,
-    cloudShadows: true,
+    cloudShadows: false,
+    groundPatch: 480,
+    groundStep: 1,
   },
 };
 

@@ -86,6 +86,60 @@ function finish(c: HTMLCanvasElement, anisotropy: number): THREE.CanvasTexture {
   return tex;
 }
 
+/**
+ * High-resolution tiling detail for ground and roads. R: grass speckle (tiny
+ * blades and seeds over soft clumps). G: asphalt grain. B: small clumps. A: white
+ * noise. Mipmapped with full anisotropy, so it stays sharp from the map view down.
+ */
+export function makeDetailTexture(size: number, anisotropy: number): THREE.DataTexture {
+  const n = size * size;
+  const data = new Uint8Array(n * 4);
+  const r = new Float32Array(n).fill(0.5);
+  const cells = 48;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size;
+      const v = y / size;
+      const i = x + y * size;
+      // Soft clumps under the speckle, then grain for asphalt from two hash scales.
+      r[i] = 0.42 + 0.16 * tileNoise(u * cells, v * cells, cells, 5);
+      const g = 0.6 * hash(x, y, 13) + 0.4 * hash(x >> 1, y >> 1, 17);
+      data[i * 4 + 1] = g * 255;
+      data[i * 4 + 2] = stretch(fbm(u, v, 16, 3, 29)) * 255;
+      data[i * 4 + 3] = hash(x, y, 31) * 255;
+    }
+  }
+  // Speckle: thousands of tiny dots, light seeds and dark blades, wrapped at the edges.
+  let seed = 977;
+  const rnd = () => {
+    seed = (seed * 16807) % 2147483647;
+    return seed / 2147483647;
+  };
+  const dots = Math.floor(n * 0.11);
+  for (let k = 0; k < dots; k++) {
+    const x = Math.floor(rnd() * size);
+    const y = Math.floor(rnd() * size);
+    const light = rnd() < 0.42;
+    const amp = (light ? 1 : -1) * (0.12 + rnd() * 0.22);
+    const big = rnd() < 0.3;
+    for (let dy = 0; dy <= (big ? 1 : 0); dy++) {
+      for (let dx = 0; dx <= (big ? 1 : 0); dx++) {
+        const i = ((x + dx) % size) + ((y + dy) % size) * size;
+        r[i] += amp * (dx || dy ? 0.6 : 1);
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) data[i * 4] = Math.max(0, Math.min(255, r[i] * 255));
+  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.anisotropy = anisotropy;
+  tex.needsUpdate = true;
+  return tex;
+}
+
 /** Road sign faces in a 3 by 1 strip: stop, yield, priority. */
 export function makeSignAtlas(anisotropy = 4): THREE.CanvasTexture {
   const s = 128;

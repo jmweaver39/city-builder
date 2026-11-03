@@ -11,12 +11,7 @@ import type { Shared } from './materials';
 import type { QualitySettings } from './quality';
 import { makeBeamTexture, makeBlobTexture } from './textures';
 import { buildModels, type ModelSet } from './vehicleModels';
-
-/** Linear RGB, 16 entries. Saturated a little: clearcoat and sky wash paint out. */
-const BODY_COLOURS = [
-  0xeeece6, 0xc4c8cc, 0x7c8086, 0x24262a, 0x0f1012, 0x8e1a18, 0xc23222, 0x12356e, 0x2a64aa, 0x6f9cc0, 0x174a36, 0x8c7a58, 0xcfc29c, 0xdc9e20,
-  0x5c3522, 0x4a2a6a,
-].map(hexRGB);
+import { BODY_COLOURS } from './style';
 
 /** Half length, half width, height, for picking. */
 const DIMENSIONS: Record<string, [number, number, number]> = {
@@ -87,10 +82,10 @@ varying float vPaint;
   if (part < 0.5) {
     vColor.rgb *= aInstColor;
     // Metallic flake reads as a higher metalness on mid and dark colours.
-    pbr = vec2(0.36, 0.45);
+    pbr = vec2(0.38, 0.3);
     vPaint = 1.0;
   } else if (part > 5.5 && part < 6.5) {
-    pbr = vec2(0.05, 0.92);
+    pbr = vec2(0.08, 0.85);
   } else if (part > 6.5) {
     pbr = vec2(0.24, 1.0);
   } else if (part > 1.5) {
@@ -123,7 +118,7 @@ varying float vPaint;
       );
     }
   };
-  m.customProgramCacheKey = () => (clearcoat ? 'cl-vehicle-coat' : 'cl-vehicle');
+  m.customProgramCacheKey = () => (clearcoat ? 'cl-vehicle-coat-lp' : 'cl-vehicle-lp');
 }
 
 interface Bucket {
@@ -166,8 +161,8 @@ export class VehicleLayer {
   private midRange = 480;
 
   constructor(private readonly shared: Shared) {
-    this.coat = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.4, clearcoat: 1, clearcoatRoughness: 0.07 });
-    this.plain = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.4 });
+    this.coat = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.3, clearcoat: 1, clearcoatRoughness: 0.08 });
+    this.plain = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.45, metalness: 0.2 });
     patchVehicle(this.coat, shared, true);
     patchVehicle(this.plain, shared, false);
     this.beamTex = makeBeamTexture();

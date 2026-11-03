@@ -852,10 +852,10 @@ describe('whole interchanges', () => {
     // Eastbound off and on, westbound off and on.
     const offE = ramp(onSeg(east, 0.2), atNode(south), v(-300, 20), v(-120, 60, Y));
     const eastAfter = net.nearestSegment(v(400, 20))!.segmentId;
-    const onE = ramp(atNode(south), onSeg(eastAfter, 0.4), v(120, 60, Y), v(300, 20));
+    const onE = ramp(atNode(south), onSeg(eastAfter, 0.75), v(120, 60, Y), v(300, 20));
     const offW = ramp(onSeg(west, 0.2), atNode(north), v(300, -20), v(120, -60, Y));
     const westAfter = net.nearestSegment(v(-400, -20))!.segmentId;
-    const onW = ramp(atNode(north), onSeg(westAfter, 0.4), v(-120, -60, Y), v(-300, -20));
+    const onW = ramp(atNode(north), onSeg(westAfter, 0.75), v(-120, -60, Y), v(-300, -20));
     expect([offE, onE, offW, onW].every((r) => r.segments.length === 1)).toBe(true);
 
     expectClean(net);

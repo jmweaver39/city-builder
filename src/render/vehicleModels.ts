@@ -19,7 +19,7 @@ export const PART_CHROME = 7;
 type C = readonly number[];
 
 const WHITE: C = [1, 1, 1];
-const GLASS: C = hexRGB(0x5a6a78);
+const GLASS: C = hexRGB(0x3c4c5c);
 const TRIM: C = hexRGB(0x141518);
 const RUBBER: C = hexRGB(0x0e0f11);
 const RIM: C = hexRGB(0x9aa0a6);

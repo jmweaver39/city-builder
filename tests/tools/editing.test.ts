@@ -3,8 +3,10 @@ import {
   checkNetworkInvariants,
   curveMidpoint,
   defaultSignalPlan,
+  armFrames,
   lineCurve,
   nodeAnchors,
+  outlineAnchors,
   resolveDecal,
   RoadNetwork,
   rotationFacing,
@@ -389,7 +391,8 @@ describe('Node markings tool', () => {
     r.click(0, 0);
     expect(r.tools.nodeMarkings.node).toBe(j);
     expect(r.inspected.at(-1)).toEqual({ kind: 'nodeMarkings', id: j });
-    expect(r.view.marks.filter((m) => m.kind === 'point').length).toBe(nodeAnchors(r.net, j).length);
+    const points = r.view.marks.filter((m) => m.kind === 'point').length;
+    expect(points).toBe(nodeAnchors(r.net, j).length + outlineAnchors(r.net, j).length);
   });
 
   it('also enters a plain joint', () => {
@@ -432,6 +435,45 @@ describe('Node markings tool', () => {
     clickDot(2);
     clickDot(8);
     expect(r.net.getNode(j)!.control.markings![1]).toMatchObject({ straight: true });
+  });
+
+  it('two anchors on one corner draw a line along the kerb', () => {
+    const j = cross();
+    r.click(0, 0);
+    const corner = outlineAnchors(r.net, j).filter((a) => a.anchor.segmentId === outlineAnchors(r.net, j)[0].anchor.segmentId);
+    const p = corner[0].pos;
+    const q = corner[corner.length - 1].pos;
+    r.click(p.x, p.z);
+    r.click(q.x, q.z);
+    expect(r.net.getNode(j)!.control.markings![0]).toMatchObject({ path: 'outline' });
+  });
+
+  it('with Follow lane paths, a line between arms follows the lanes', () => {
+    const j = cross();
+    r.tools.settings.nodeMarking.followLanes = true;
+    r.click(0, 0);
+    clickDot(1);
+    clickDot(7);
+    expect(r.net.getNode(j)!.control.markings![0]).toMatchObject({ path: 'lanes' });
+  });
+
+  it('hovering back along an arm offers a row, caught at the stop line distance', () => {
+    const j = cross();
+    r.tools.settings.nodeMarking.style = 'stopLine';
+    r.click(0, 0);
+    const frame = armFrames(r.net, j)[0];
+    const at = (lateral: number, back: number) => ({
+      x: frame.pos.x + frame.right.x * lateral - frame.inward.x * back,
+      z: frame.pos.z + frame.right.z * lateral - frame.inward.z * back,
+    });
+    const a = at(frame.offsets[0], 4.5);
+    const b = at(frame.offsets[2], 4.5);
+    r.click(a.x, a.z);
+    r.click(b.x, b.z);
+    const m = r.net.getNode(j)!.control.markings![0] as NodeLineMarking;
+    expect(m.from.back).toBeCloseTo(0.5 + 3 + 0.9 + 0.225, 6);
+    expect(m.from.boundary).toBe(0);
+    expect(m.to.boundary).toBe(2);
   });
 
   it('has no way to bend a marking by hand', () => {

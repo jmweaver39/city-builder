@@ -35,9 +35,10 @@ export interface Place {
   isZone: boolean;
 }
 
-function laneDir(net: RoadNetwork, seg: Id, index: number): 1 | -1 {
-  const s = net.getSegment(seg)!;
-  return effectiveLanes(net.roadTypeOf(seg), s.overrides)[index].dir;
+function laneDir(net: RoadNetwork, seg: Id, index: number): 1 | -1 | 0 {
+  const s = net.getSegment(seg);
+  if (!s) return 0;
+  return effectiveLanes(net.roadTypeOf(seg), s.overrides)[index]?.dir ?? 0;
 }
 
 /** Road lanes arriving at or leaving a dead-end node, kept to those vehicles can use. */
@@ -47,11 +48,13 @@ function gatewayLanes(net: RoadNetwork, g: CompiledGraph, nodeId: Id): { sinks: 
   const sources: LanePoint[] = [];
   if (!node || node.segments.length !== 1) return { sinks, sources };
   const segId = node.segments[0];
-  const seg = net.getSegment(segId)!;
+  const seg = net.getSegment(segId);
+  if (!seg) return { sinks, sources };
   const dense = g.graph.roadLanes.get(segId) ?? [];
   dense.forEach((idx, i) => {
-    if (idx < 0 || g.allow[idx] === 0) return;
+    if (idx < 0 || idx >= g.n || g.allow[idx] === 0) return;
     const dir = laneDir(net, segId, i);
+    if (dir === 0) return;
     const arrives = (seg.b === nodeId && dir === 1) || (seg.a === nodeId && dir === -1);
     if (arrives) sinks.push({ lane: idx, s: Math.max(0.5, g.len[idx] - 1) });
     else sources.push({ lane: idx, s: 0 });

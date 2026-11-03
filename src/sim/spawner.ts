@@ -299,6 +299,7 @@ export class Spawner {
     veh.waitSec[v] = 0;
     veh.stuckSec[v] = 0;
     veh.stuckProgress[v] = 0;
+    veh.held[v] = 0;
     veh.spawnTime[v] = w.time;
     veh.vlTick[v] = -1;
     veh.enterTick[v] = 0;

@@ -7,14 +7,20 @@ import { distXZ } from '../core/math';
 import {
   acrossOneArm,
   anchorCurve,
+  armFrames,
+  armRow,
   fillerPolygon,
-  lineCurve,
+  lanePath,
+  markingPath,
   nodeAnchors,
+  outlineAnchors,
+  outlinePath,
   resolveAnchor,
   sameAnchor,
   sampleCurve,
   type AnchorPoint,
 } from '../core/nodeMarkings';
+import type { NodeLineMarking } from '../core/types';
 import type { NetworkChange, RoadNetwork } from '../core/RoadNetwork';
 import type { Id, MarkingAnchor, NodeLineStyle, NodeMarking, Vec3 } from '../core/types';
 import type { ToolMark } from '../render/api';
@@ -24,6 +30,16 @@ import { COLORS, type ToolId, type ToolKey, type ToolPointer } from './types';
 
 const ANCHOR_REACH = 1.4;
 const PICK_LINE = 1.2;
+/** How far back along an arm a row of anchors can be laid. */
+const ROW_REACH = 40;
+const ROW_STEP = 0.5;
+/**
+ * Distances back from the cut line where the automatic paint sits: the middle of a
+ * crosswalk and its stop line, from src/render/markings.ts. Rows catch on them so
+ * hand-placed lines meet the drawn ones.
+ */
+const AUTO_STOPS = [0.5 + 3 / 2, 0.5 + 3 + 0.9 + 0.45 / 2];
+const STOP_CATCH = 0.6;
 
 export const NODE_LINE_STYLES: readonly { value: NodeLineStyle; label: string }[] = [
   { value: 'solid', label: 'Solid' },
@@ -47,6 +63,19 @@ function pointInPolygon(p: Vec3, poly: readonly Vec3[]): boolean {
   return inside;
 }
 
+/** Points no further apart than a metre, so picking can test distance to points. */
+function dense(path: readonly Vec3[]): Vec3[] {
+  const out: Vec3[] = [];
+  for (let i = 0; i + 1 < path.length; i++) {
+    const a = path[i];
+    const b = path[i + 1];
+    const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.z - a.z)));
+    for (let k = 0; k < n; k++) out.push({ x: a.x + ((b.x - a.x) * k) / n, y: a.y, z: a.z + ((b.z - a.z) * k) / n });
+  }
+  if (path.length) out.push(path[path.length - 1]);
+  return out;
+}
+
 export class NodeMarkingTool extends Tool {
   readonly id: ToolId = 'nodeMarkings';
   private nodeId: Id | null = null;
@@ -54,6 +83,8 @@ export class NodeMarkingTool extends Tool {
   private first: MarkingAnchor | null = null;
   private corners: MarkingAnchor[] = [];
   private hover: AnchorPoint | null = null;
+  /** The row of anchors across an arm under the cursor, if any. */
+  private row: AnchorPoint[] = [];
 
   get node(): Id | null {
     return this.nodeId;
@@ -75,12 +106,38 @@ export class NodeMarkingTool extends Tool {
     return this.nodeId === null ? [] : (this.ctx.net.getNode(this.nodeId)?.control.markings ?? []);
   }
 
+  /** Anchors at this node: cut lines, the outline, and the row under the cursor. */
+  private allAnchors(): AnchorPoint[] {
+    if (this.nodeId === null) return [];
+    const { net } = this.ctx;
+    return [...nodeAnchors(net, this.nodeId), ...outlineAnchors(net, this.nodeId), ...this.row];
+  }
+
+  /** A row across whichever arm the cursor is over, back from its cut line. */
+  private updateRow(e: ToolPointer): void {
+    this.row = [];
+    if (this.nodeId === null) return;
+    const { net, view } = this.ctx;
+    for (const frame of armFrames(net, this.nodeId)) {
+      const raw = view.pickPlane(e.x, e.y, frame.pos.y);
+      if (!raw) continue;
+      const back = -((raw.x - frame.pos.x) * frame.inward.x + (raw.z - frame.pos.z) * frame.inward.z);
+      const across = (raw.x - frame.pos.x) * frame.right.x + (raw.z - frame.pos.z) * frame.right.z;
+      const half = Math.max(...frame.offsets.map(Math.abs));
+      if (back < 0.75 || back > ROW_REACH || Math.abs(across) > half + 1) continue;
+      let at = Math.round(back / ROW_STEP) * ROW_STEP;
+      for (const stop of AUTO_STOPS) if (Math.abs(back - stop) < STOP_CATCH) at = stop;
+      this.row = armRow(net, this.nodeId, frame.segmentId, at);
+      return;
+    }
+  }
+
   private anchorAt(e: ToolPointer): AnchorPoint | null {
     if (this.nodeId === null) return null;
-    const { net, view } = this.ctx;
+    const { view } = this.ctx;
     let best: AnchorPoint | null = null;
     let bestD = ANCHOR_REACH;
-    for (const a of nodeAnchors(net, this.nodeId)) {
+    for (const a of this.allAnchors()) {
       const raw = view.pickPlane(e.x, e.y, a.pos.y);
       if (!raw) continue;
       const d = distXZ(raw, a.pos);
@@ -104,10 +161,23 @@ export class NodeMarkingTool extends Tool {
         if (poly && pointInPolygon(raw, poly)) return m.id;
         continue;
       }
-      const c = lineCurve(net, this.nodeId, m);
-      if (c && sampleCurve(c, 0.6).some((p) => distXZ(p, raw) <= PICK_LINE)) return m.id;
+      const path = markingPath(net, this.nodeId, m);
+      if (path && dense(path).some((p) => distXZ(p, raw) <= PICK_LINE)) return m.id;
     }
     return null;
+  }
+
+  /** The path a new line between two anchors takes. */
+  private pathFor(a: MarkingAnchor, b: MarkingAnchor): Pick<NodeLineMarking, 'straight' | 'path'> {
+    const { net, settings } = this.ctx;
+    const lineLike = ['solid', 'dashed', 'double', 'solidDashed', 'dotted'].includes(settings.nodeMarking.style);
+    if (this.nodeId !== null && lineLike) {
+      if (outlinePath(net, this.nodeId, a, b)) return { straight: false, path: 'outline' };
+      if (settings.nodeMarking.followLanes && a.segmentId !== b.segmentId && lanePath(net, this.nodeId, a, b)) {
+        return { straight: false, path: 'lanes' };
+      }
+    }
+    return { straight: this.isStraight(a, b) };
   }
 
   /** Both anchors on one arm make a line across it, which is never a curve. */
@@ -121,14 +191,15 @@ export class NodeMarkingTool extends Tool {
     const marks: ToolMark[] = [];
     const nodeId = this.nodeId;
     if (nodeId !== null) {
-      for (const a of nodeAnchors(net, nodeId)) {
+      for (const a of this.allAnchors()) {
         const hot = this.hover && sameAnchor(this.hover.anchor, a.anchor);
-        marks.push({ kind: 'point', pos: a.pos, color: hot ? COLORS.ok : a.edge ? COLORS.snap : COLORS.neutral, radius: hot ? 0.6 : 0.4 });
+        const color = hot ? COLORS.ok : a.anchor.corner !== undefined ? COLORS.warn : a.edge ? COLORS.snap : COLORS.neutral;
+        marks.push({ kind: 'point', pos: a.pos, color, radius: hot ? 0.6 : a.anchor.corner !== undefined ? 0.3 : 0.4 });
       }
       const selected = this.markings.find((m) => m.id === this.selectedId);
       if (selected?.kind === 'line') {
-        const c = lineCurve(net, nodeId, selected);
-        if (c) marks.push({ kind: 'line', points: sampleCurve(c, 1), color: COLORS.ok, width: Math.max(0.35, selected.width + 0.2) });
+        const path = markingPath(net, nodeId, selected);
+        if (path) marks.push({ kind: 'line', points: path, color: COLORS.ok, width: Math.max(0.35, selected.width + 0.2) });
       } else if (selected?.kind === 'filler') {
         const poly = fillerPolygon(net, nodeId, selected);
         if (poly) marks.push({ kind: 'line', points: [...poly, poly[0]], color: COLORS.ok, width: 0.3 });
@@ -138,8 +209,8 @@ export class NodeMarkingTool extends Tool {
         if (p) {
           marks.push({ kind: 'ring', pos: p.pos, color: COLORS.ok, radius: 0.9 });
           if (this.hover && !sameAnchor(this.hover.anchor, this.first)) {
-            const c = anchorCurve(p, this.hover, this.isStraight(this.first, this.hover.anchor));
-            marks.push({ kind: 'line', points: sampleCurve(c, 1), color: settings.nodeMarking.color, width: 0.3, dashed: settings.nodeMarking.style === 'dashed' });
+            const path = this.previewPath(this.first, this.hover);
+            marks.push({ kind: 'line', points: path, color: settings.nodeMarking.color, width: 0.3, dashed: settings.nodeMarking.style === 'dashed' });
           }
         }
       }
@@ -169,8 +240,18 @@ export class NodeMarkingTool extends Tool {
     this.ctx.setHud({ x: e.x, y: e.y, lines: ['Node markings'], notes: [note], tone: 'ok' });
   }
 
+  private previewPath(first: MarkingAnchor, hover: AnchorPoint): Vec3[] {
+    const { net } = this.ctx;
+    const p = resolveAnchor(net, this.nodeId!, first)!;
+    const choice = this.pathFor(first, hover.anchor);
+    if (choice.path === 'outline') return outlinePath(net, this.nodeId!, first, hover.anchor) ?? [p.pos, hover.pos];
+    if (choice.path === 'lanes') return lanePath(net, this.nodeId!, first, hover.anchor) ?? [p.pos, hover.pos];
+    return sampleCurve(anchorCurve(p, hover, choice.straight), 1);
+  }
+
   pointerMove(e: ToolPointer): void {
     this.pointer = e;
+    this.updateRow(e);
     this.hover = this.anchorAt(e);
     if (this.nodeId === null) {
       const hover = pickNode(this.ctx, e);
@@ -193,6 +274,7 @@ export class NodeMarkingTool extends Tool {
     if (e.button !== 0) return;
     this.pointer = e;
     const { net, settings } = this.ctx;
+    this.updateRow(e);
     this.hover = this.anchorAt(e);
     const anchor = this.hover;
     if (anchor) {
@@ -235,7 +317,7 @@ export class NodeMarkingTool extends Tool {
       style,
       color,
       width,
-      straight: this.isStraight(this.first, anchor),
+      ...this.pathFor(this.first, anchor),
     });
     this.first = null;
   }

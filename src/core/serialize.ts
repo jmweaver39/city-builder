@@ -135,6 +135,8 @@ function checkAnchor(raw: unknown, where: string): void {
   if (!isObject(raw)) fail(`${where} is not an anchor`);
   checkId(raw.segmentId, `${where}.segmentId`);
   if (!Number.isInteger(raw.boundary) || (raw.boundary as number) < 0) fail(`${where}.boundary must be a whole number`);
+  if (raw.corner !== undefined) checkNumber(raw.corner, `${where}.corner`);
+  if (raw.back !== undefined) checkNumber(raw.back, `${where}.back`);
 }
 
 function checkMarking(raw: unknown, where: string): NodeMarking {

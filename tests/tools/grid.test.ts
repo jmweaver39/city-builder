@@ -12,9 +12,12 @@ import {
   planGridBlock,
   sanitizeGrid,
   saveGridPrefs,
+  snapGridAt,
   toGrid,
   type GridSettings,
 } from '../../src/tools/grid';
+import { totalHalfWidth } from '../../src/core/roadTypes';
+import { GRID_FINEST, GRID_SNAP_PX, gridLevels, levelOpacity, metresPerPixel, visibleSnapSpacing } from '../../src/render/gridLevels';
 import { rig } from './helpers';
 
 const v = (x: number, z: number, y = 0): Vec3 => ({ x, y, z });
@@ -116,10 +119,9 @@ describe('grid snapping on', () => {
     expect(hit.guide).not.toBeNull();
     const ang = Math.atan2(hit.pos.z, hit.pos.x);
     expect(ang).toBeCloseTo(g.rotation, 6);
-    // Without the grid the guide stays on world 15 degree steps (here 15 or 30).
+    // Without the grid there is no guide at 20 degrees.
     const free = snapRoadPoint(empty, query(raw, { from }));
-    const fa = (Math.atan2(free.pos.z, free.pos.x) * 180) / Math.PI;
-    expect(Math.abs(fa / 15 - Math.round(fa / 15))).toBeLessThan(1e-6);
+    expect(Math.atan2(free.pos.z, free.pos.x)).not.toBeCloseTo(g.rotation, 3);
   });
 
   it('lands on a grid line where an angle guide crosses it', () => {
@@ -200,7 +202,7 @@ describe('align to road', () => {
       expect(toGrid(g, p).b).toBeCloseTo(0, 3);
     }
     // And snapping across it lands on grid points along the road.
-    const hit = snapRoadPoint(new RoadNetwork(), query({ x: -100 + Math.cos(ang) * 96 + 1, y: 0, z: -50 + Math.sin(ang) * 96 }, { grid: g }));
+    const hit = snapRoadPoint(new RoadNetwork(), query({ x: -100 + Math.cos(ang) * 152 + 1, y: 0, z: -50 + Math.sin(ang) * 152 }, { grid: g }));
     expect(hit.kind).toBe('grid');
     expect(onPoint(g, hit.pos)).toBe(true);
   });
@@ -288,6 +290,19 @@ describe('Grid Block', () => {
     expect(net.signature()).not.toBe(before);
   });
 
+  it('joins a road a few metres off its edge instead of laying a second one beside it', () => {
+    const net = new RoadNetwork();
+    net.drawRoad({ start: { kind: 'free', pos: v(-50, 3) }, end: { kind: 'free', pos: v(250, 3) }, roadType: 'street-2' });
+    const plan = planGridBlock(grid({ spacing: 64, blockCells: 1 }), v(0, 0), v(128, 128), 0);
+    const check = checkGridBlock(net, plan, 'street-2');
+    expect(check.errors).toEqual([]);
+    expect(check.covered.filter(Boolean).length).toBe(2);
+    net.batch(() => buildGridBlock(net, plan, 'street-2', check.covered));
+    expect(checkNetworkInvariants(net)).toEqual([]);
+    // 1 old road split in 4 plus the rest of a 2 by 2 block: 12 edges, 2 reused.
+    expect(net.segments.length).toBe(4 + 10);
+  });
+
   it('refuses over water and off the map', () => {
     const net = new RoadNetwork();
     const g = grid({ spacing: 64, blockCells: 1 });
@@ -307,14 +322,22 @@ describe('Grid Block', () => {
     const net = new RoadNetwork();
     const small = planGridBlock(grid({ spacing: 8, blockCells: 1 }), v(0, 0), v(32, 32), 0);
     expect(checkGridBlock(net, small, 'street-2').errors[0]).toMatch(/too small/);
-    // A road 4 m off a grid line, nearly parallel: the overlap rule rejects the edge.
-    net.drawRoad({ start: { kind: 'free', pos: v(-50, 4) }, end: { kind: 'free', pos: v(250, 4) }, roadType: 'street-2' });
+    // A street beside a grid line, too far to join but close enough that an avenue
+    // along the line would overlap it: the overlap rule in validateDraft rejects it.
+    const street = net.roadType('street-2')!;
+    const avenue = net.roadType('avenue-6')!;
+    const attach = totalHalfWidth(street) + 1;
+    const overlap = street.halfWidth + avenue.halfWidth;
+    expect(overlap).toBeGreaterThan(attach);
+    const off = (attach + overlap) / 2;
+    net.drawRoad({ start: { kind: 'free', pos: v(-50, off) }, end: { kind: 'free', pos: v(250, off) }, roadType: 'street-2' });
     const plan = planGridBlock(grid({ spacing: 64, blockCells: 1 }), v(0, 0), v(128, 128), 0);
-    const check = checkGridBlock(net, plan, 'street-2');
-    expect(check.errors.length).toBeGreaterThan(0);
+    const check = checkGridBlock(net, plan, 'avenue-6');
+    expect(check.errors.some((e) => /overlap/i.test(e))).toBe(true);
     const r = rig(null, net);
     const sig = net.signature();
     Object.assign(r.tools.settings.grid, { spacing: 64, blockCells: 1 });
+    r.tools.settings.roadType = 'avenue-6';
     r.tools.setTool('gridBlock');
     r.drag([
       [0, 0],
@@ -383,5 +406,96 @@ describe('grid in the road tool', () => {
     r.click(100, 75);
     expect(r.tools.active.id).toBe('road');
     expect(r.tools.settings.grid.rotation).toBeCloseTo(Math.atan2(150, 200), 4);
+  });
+});
+
+describe('adaptive grid levels', () => {
+  const FOV = 40;
+  const H = 900;
+  const spacingAt = (distance: number, base = 64, subdivisions = true) =>
+    visibleSnapSpacing(base, 4, metresPerPixel(distance, FOV, H), subdivisions);
+
+  it('splits the base down to half a metre and builds coarse levels up to map size', () => {
+    const levels = gridLevels(64, 4).map((l) => l.spacing);
+    expect(levels).toEqual([0.5, 1, 2, 4, 8, 16, 32, 64, 256, 1024, 4096]);
+    expect(Math.min(...gridLevels(3, 5).map((l) => l.spacing))).toBeGreaterThanOrEqual(GRID_FINEST);
+    // Major and coarser are brightest.
+    const w = gridLevels(32, 4);
+    const base = w.find((l) => l.kind === 'base')!.weight;
+    for (const l of w) {
+      if (l.kind === 'fine') expect(l.weight).toBeLessThan(base);
+      if (l.kind === 'major' || l.kind === 'super') expect(l.weight).toBeGreaterThan(base);
+    }
+  });
+
+  it('snaps finer as the camera closes in, never below 0.5 m, coarse map-wide', () => {
+    const distances = [7, 15, 30, 60, 120, 250, 500, 1000, 2000, 4000, 6800];
+    const spacings = distances.map((d) => spacingAt(d));
+    for (let i = 1; i < spacings.length; i++) expect(spacings[i]).toBeGreaterThanOrEqual(spacings[i - 1]);
+    expect(spacings[0]).toBe(0.5);
+    expect(spacingAt(60)).toBeLessThanOrEqual(1);
+    expect(spacingAt(250)).toBe(2);
+    expect(spacingAt(1000)).toBe(8);
+    expect(spacingAt(6800)).toBeGreaterThanOrEqual(64);
+    // The chosen level is always at least the snap density on screen, and the next finer one is not.
+    for (const d of distances) {
+      const mpp = metresPerPixel(d, FOV, H);
+      const s = spacingAt(d);
+      if (s > 0.5) {
+        expect(s / mpp).toBeGreaterThanOrEqual(GRID_SNAP_PX);
+        expect(s / 2 / mpp).toBeLessThan(GRID_SNAP_PX);
+      }
+    }
+  });
+
+  it('uses the base spacing only when subdivisions are off', () => {
+    for (const d of [7, 100, 3000]) expect(spacingAt(d, 64, false)).toBe(64);
+  });
+
+  it('fades levels in smoothly by screen density', () => {
+    expect(levelOpacity(1)).toBe(0);
+    expect(levelOpacity(100)).toBe(1);
+    let last = 0;
+    for (let px = 0; px <= 20; px += 0.5) {
+      const o = levelOpacity(px);
+      expect(o).toBeGreaterThanOrEqual(last);
+      expect(o - last).toBeLessThan(0.15);
+      last = o;
+    }
+  });
+
+  it('keeps subdivisions on the rotated, shifted base grid', () => {
+    const g = grid({ spacing: 32, rotation: 0.4, originX: 11, originZ: -5 });
+    const close = snapGridAt(g, metresPerPixel(20, FOV, H));
+    expect(close.spacing).toBeLessThan(4);
+    const empty = new RoadNetwork();
+    for (let i = 0; i < 50; i++) {
+      const raw = v(Math.sin(i) * 40, Math.cos(i * 1.3) * 40);
+      const hit = snapRoadPoint(empty, query(raw, { grid: close, gridMetresPerPixel: metresPerPixel(20, FOV, H) }));
+      // Close up, a fine level catches every cursor position: never free.
+      expect(['grid', 'gridLine']).toContain(hit.kind);
+      expect(onLine(close, hit.pos)).toBe(true);
+      if (hit.kind === 'grid') expect(onPoint(close, hit.pos)).toBe(true);
+      expect(distXZ(hit.pos, raw)).toBeLessThanOrEqual(close.spacing * 0.75);
+    }
+    // Base grid points are still points of the fine grid.
+    expect(onPoint(close, { x: 11, y: 0, z: -5 })).toBe(true);
+  });
+
+  it('shows the snap spacing in the road tool readout, from the view zoom', () => {
+    const r = rig();
+    Object.assign(r.tools.settings.grid, { enabled: true, spacing: 32 });
+    r.tools.setTool('road');
+    // The fake view is 1 m per pixel: 16 m cells are the finest at least 9.5 px.
+    r.hover(17, 1);
+    expect(r.tools.hud?.lines.join(' ')).toContain('Grid 16 m');
+    r.tools.settings.grid.snapSubdivisions = false;
+    r.tools.settingsChanged();
+    r.hover(17, 1);
+    expect(r.tools.hud?.lines.join(' ')).toContain('Grid 32 m');
+    r.tools.settings.grid.enabled = false;
+    r.tools.settingsChanged();
+    r.hover(17, 1);
+    expect(r.tools.hud?.lines.join(' ')).not.toContain('Grid');
   });
 });

@@ -135,10 +135,15 @@ export class NodeMarkingPanel {
           tools.settingsChanged();
           this.render();
         })),
-        row('Follow lanes', checkbox(s.curved, (v) => {
+        row('Curve between arms', checkbox(s.curved, (v) => {
           s.curved = v;
           tools.settingsChanged();
         }), 'Lines between arms curve with the lanes. Off draws them straight'),
+        row('Follow lane paths', checkbox(s.followLanes, (v) => {
+          s.followLanes = v;
+          tools.settingsChanged();
+        }), 'Lines between arms follow the lane paths through the junction'),
+        el('div', { class: 'small muted', text: 'Amber dots run along the kerb: two on one corner make a line that follows it. Hover along an arm for a row of anchors further back.' }),
       );
     } else {
       body.append(

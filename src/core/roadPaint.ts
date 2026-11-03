@@ -5,6 +5,7 @@
  */
 import { cubicTangentXZ, offsetPoint } from './bezier';
 import { clamp, dotXZ, scale } from './math';
+import { alongGuide, connectorGuide } from './nodeMarkings';
 import type { RoadNetwork } from './RoadNetwork';
 import type { Decal, Id, RoadPaintPiece, RoadPaintRef, Vec3 } from './types';
 
@@ -38,17 +39,35 @@ export function piecePoints(net: RoadNetwork, piece: RoadPaintPiece, lateral: nu
   return forward ? out : out.reverse();
 }
 
-/** A line along every piece at one lateral offset. */
+/** The node two consecutive pieces of a path meet at. */
+function sharedNode(net: RoadNetwork, a: RoadPaintPiece, b: RoadPaintPiece): Id | null {
+  const sa = net.getSegment(a.segmentId);
+  const sb = net.getSegment(b.segmentId);
+  if (!sa || !sb) return null;
+  const leaving = a.t0 <= a.t1 ? sa.b : sa.a;
+  return leaving === sb.a || leaving === sb.b ? leaving : null;
+}
+
+/**
+ * A line along every piece at one lateral offset. Where it passes through a
+ * junction it follows the lane path there, not a straight bridge.
+ */
 export function pathPoints(net: RoadNetwork, pieces: readonly RoadPaintPiece[], lateral: number): Vec3[] {
   const out: Vec3[] = [];
-  for (const piece of pieces) {
+  pieces.forEach((piece, i) => {
     const pts = piecePoints(net, piece, lateral);
-    // Pieces meeting at a plain joint share a point.
     const last = out[out.length - 1];
     const first = pts[0];
+    if (last && first) {
+      const gap = Math.hypot(last.x - first.x, last.z - first.z);
+      const node = gap > 0.5 ? sharedNode(net, pieces[i - 1], piece) : null;
+      const guide = node === null ? null : connectorGuide(net, node, last, first, pieces[i - 1].segmentId, piece.segmentId);
+      if (guide) out.push(...alongGuide(guide, last, first).slice(1, -1));
+    }
+    // Pieces meeting at a plain joint share a point.
     const joined = last && first && Math.hypot(last.x - first.x, last.z - first.z) < 0.01;
     out.push(...(joined ? pts.slice(1) : pts));
-  }
+  });
   return out;
 }
 

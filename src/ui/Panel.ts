@@ -70,10 +70,21 @@ export class Panel {
 }
 
 /** A modal dialog. Returns its close function. */
-export function modal(host: HTMLElement, title: string, body: HTMLElement, foot: HTMLElement | null, narrow = false): () => void {
+export function modal(
+  host: HTMLElement,
+  title: string,
+  body: HTMLElement,
+  foot: HTMLElement | null,
+  narrow = false,
+  onClose?: () => void,
+): () => void {
+  let open = true;
   const close = (): void => {
+    if (!open) return;
+    open = false;
     back.remove();
     window.removeEventListener('keydown', esc, true);
+    onClose?.();
   };
   const esc = (e: KeyboardEvent): void => {
     if (e.key === 'Escape') {
@@ -98,4 +109,39 @@ export function modal(host: HTMLElement, title: string, body: HTMLElement, foot:
   window.addEventListener('keydown', esc, true);
   host.append(back);
   return close;
+}
+
+export interface ConfirmOptions {
+  title: string;
+  message: string;
+  confirm: string;
+  cancel?: string;
+  /** Style the confirm button as destructive. */
+  danger?: boolean;
+}
+
+/**
+ * A styled yes or no question. Resolves true on confirm, false on cancel, Esc or a
+ * click outside. The confirm button takes focus, so Enter confirms.
+ */
+export function confirmDialog(host: HTMLElement, opts: ConfirmOptions): Promise<boolean> {
+  return new Promise((resolve) => {
+    let answer = false;
+    const body = el('div', { class: 'dialog-body' }, el('p', { class: 'dialog-message', text: opts.message }));
+    const cancel = el('button', { class: 'btn', text: opts.cancel ?? 'Cancel', attrs: { type: 'button' }, on: { click: () => close() } });
+    const ok = el('button', {
+      class: `btn ${opts.danger ? 'danger-solid' : 'primary'}`,
+      text: opts.confirm,
+      attrs: { type: 'button' },
+      on: {
+        click: () => {
+          answer = true;
+          close();
+        },
+      },
+    });
+    const foot = el('div', { class: 'dialog-foot' }, cancel, ok);
+    const close = modal(host, opts.title, body, foot, true, () => resolve(answer));
+    ok.focus();
+  });
 }

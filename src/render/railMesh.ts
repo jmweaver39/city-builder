@@ -1,5 +1,6 @@
 /**
- * Mesh helpers for track, stations and rolling stock. A MeshBuf collects
+ * Mesh helpers for track, stations and rolling stock, in the game's low-poly style:
+ * flat-shaded facets and flat colours, no texture noise. A MeshBuf collects
  * positions, normals, colours and a material code per vertex; trackMaterial turns
  * the code into ballast, sleepers, steel and concrete in one draw call.
  */
@@ -259,38 +260,27 @@ vec3 gGlow;
   gMetal = 0.0;
   gGlow = vec3(0.0);
   float k = vKind;
-  vec2 p = vWorldPos.xz;
-  vec4 n1 = texture2D(uNoise, p * 0.9);
-  vec4 n2 = texture2D(uNoise, p / 7.0);
   if (k > 0.5 && k < 1.5) {
-    // Ballast: coarse stones, a little lighter where it is fresh.
-    float grit = n1.r * 0.6 + texture2D(uNoise, p * 3.1).g * 0.4;
-    diffuseColor.rgb *= 0.62 + 0.62 * grit + 0.12 * (n2.b - 0.5);
+    // Ballast: one flat colour, faceted by the light.
     gRough = 1.0;
   } else if (k > 1.5 && k < 2.5) {
-    // Concrete sleepers every 0.6 m, ballast between them.
+    // Sleepers every 0.6 m as crisp flat bands, fading to an even tone far off.
     float u = vUV.x / 0.6;
     float w = fwidth(u);
     float f = fract(u);
-    float tie = smoothstep(0.0, w * 1.5, f) * (1.0 - smoothstep(0.42 - w * 1.5, 0.42, f));
-    tie = mix(tie, 0.42, smoothstep(0.25, 0.6, w));
-    float grit = n1.r * 0.6 + texture2D(uNoise, p * 3.1).g * 0.4;
-    vec3 stone = diffuseColor.rgb * (0.58 + 0.6 * grit);
-    vec3 conc = vec3(0.42, 0.41, 0.39) * (0.9 + 0.2 * n2.g);
-    float edge = 1.0 - 0.35 * smoothstep(1.1, 1.3, abs(vUV.y));
-    diffuseColor.rgb = mix(stone, conc * edge, tie);
+    float tie = step(f, 0.42);
+    tie = mix(tie, 0.42, smoothstep(0.2, 0.5, w));
+    diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.36, 0.35, 0.33), tie);
     gRough = 0.95;
   } else if (k > 2.5 && k < 3.5) {
-    // Polished rail head.
-    diffuseColor.rgb = vec3(0.62, 0.63, 0.64);
-    gRough = 0.22;
-    gMetal = 1.0;
+    // Rail head, a bright flat steel.
+    diffuseColor.rgb = vec3(0.6, 0.62, 0.64);
+    gRough = 0.35;
+    gMetal = 0.6;
   } else if (k > 3.5 && k < 4.5) {
-    diffuseColor.rgb *= 0.8 + 0.4 * n1.g;
     gRough = 0.75;
-    gMetal = 0.45;
+    gMetal = 0.3;
   } else if (k > 4.5 && k < 5.5) {
-    diffuseColor.rgb *= 0.88 + 0.22 * n2.g;
     gRough = 0.9;
   } else if (k > 5.5 && k < 6.5) {
     gRough = 0.5;
@@ -305,10 +295,6 @@ vec3 gGlow;
     gMetal = 0.2;
     gGlow = vec3(1.0, 0.82, 0.55) * uNight * 0.6;
   } else if (k > 9.5 && k < 10.5) {
-    vec2 q = vWorldPos.xz / 0.6;
-    vec2 d = abs(fract(q) - 0.5);
-    float joint = smoothstep(0.46, 0.5, max(d.x, d.y));
-    diffuseColor.rgb *= 1.0 - 0.25 * joint;
     gRough = 0.35;
   }
 }

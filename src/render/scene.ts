@@ -1,7 +1,39 @@
 /** Scene, physical sky, sun, image-based ambient and the time-of-day cycle. */
 import * as THREE from 'three';
-import { Sky } from 'three/addons/objects/Sky.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { PALETTE, paintFacets, rgb } from './style';
 import type { Shared } from './materials';
+
+/** Stylised day sky: banded gradient, a crisp sun disc with a soft halo. */
+const SKY_VERTEX = /* glsl */ `
+varying vec3 vDir;
+void main() {
+  vDir = position;
+  vec4 p = projectionMatrix * mat4(mat3(viewMatrix)) * vec4(position, 1.0);
+  gl_Position = p.xyww;
+}
+`;
+
+const SKY_FRAGMENT = /* glsl */ `
+uniform vec3 uTop;
+uniform vec3 uHorizon;
+uniform vec3 uSunDir;
+uniform vec3 uSunCol;
+uniform float uDay;
+varying vec3 vDir;
+void main() {
+  vec3 d = normalize(vDir);
+  float h = d.y;
+  vec3 col = mix(uHorizon, uTop, smoothstep(0.0, 0.55, h));
+  // Below the horizon, a slightly deeper band so hills sit on it.
+  col = mix(col, uHorizon * 0.86, smoothstep(0.0, -0.08, h));
+  float sun = dot(d, uSunDir);
+  col += uSunCol * pow(max(sun, 0.0), 24.0) * 0.35 * uDay;
+  col = mix(col, uSunCol * 2.4, smoothstep(0.9988, 0.9991, sun) * uDay);
+  gl_FragColor = vec4(col, 1.0);
+  #include <colorspace_fragment>
+}
+`;
 
 /** Stars, a moon and a faint night gradient, added on top of the day sky. */
 const NIGHT_VERTEX = /* glsl */ `
@@ -47,16 +79,15 @@ interface Keyframe {
 
 const c = (hex: number) => new THREE.Color(hex);
 const UNDERGROUND_BG = c(0x0c1420);
-const SKY_GAIN = 0.5;
-const ENV_INTENSITY = 0.36;
+const ENV_INTENSITY = 0.55;
 
 const KEYS: Keyframe[] = [
-  { at: -0.35, top: c(0x08101f), horizon: c(0x1b2a45), sun: c(0xa8bce8), sunI: 1.25, hemiSky: c(0x5a74b0), hemiGround: c(0x20283a), hemiI: 1.5 },
-  { at: -0.08, top: c(0x141c3a), horizon: c(0x46395a), sun: c(0xa4a8d0), sunI: 0.9, hemiSky: c(0x5d6ca0), hemiGround: c(0x22222c), hemiI: 1.35 },
-  { at: 0.03, top: c(0x2f4a80), horizon: c(0xe8976a), sun: c(0xff9050), sunI: 2.6, hemiSky: c(0xb0a8b8), hemiGround: c(0x4a3e34), hemiI: 0.6 },
-  { at: 0.2, top: c(0x4f86c6), horizon: c(0xf2d8bc), sun: c(0xffd6a0), sunI: 4.0, hemiSky: c(0xd8d4c8), hemiGround: c(0x6f6a50), hemiI: 0.62 },
-  { at: 0.55, top: c(0x4a8ad0), horizon: c(0xc9dfee), sun: c(0xfff0dc), sunI: 4.8, hemiSky: c(0xdcdcd4), hemiGround: c(0x77725a), hemiI: 0.62 },
-  { at: 1, top: c(0x3f82cc), horizon: c(0xc4dcee), sun: c(0xfff4e6), sunI: 5.0, hemiSky: c(0xdcdcd4), hemiGround: c(0x77725a), hemiI: 0.62 },
+  { at: -0.35, top: c(0x0e1838), horizon: c(0x2a3a66), sun: c(0xb8c2dc), sunI: 1.0, hemiSky: c(0x5a6484), hemiGround: c(0x242830), hemiI: 1.1 },
+  { at: -0.08, top: c(0x22305c), horizon: c(0x7a5a7c), sun: c(0xa4a8d0), sunI: 0.9, hemiSky: c(0x5d6ca0), hemiGround: c(0x22222c), hemiI: 1.35 },
+  { at: 0.03, top: c(0x4a6ab0), horizon: c(0xf6a46a), sun: c(0xff9050), sunI: 2.6, hemiSky: c(0xb0a8b8), hemiGround: c(0x4a3e34), hemiI: 0.6 },
+  { at: 0.2, top: c(0x5aa4e4), horizon: c(0xf6dcb4), sun: c(0xffd6a0), sunI: 4.0, hemiSky: c(0xe4e8f0), hemiGround: c(0x7a7a5a), hemiI: 0.95 },
+  { at: 0.55, top: c(0x5fb0ec), horizon: c(0xcfeaf6), sun: c(0xfff0dc), sunI: 4.8, hemiSky: c(0xe4e8f0), hemiGround: c(0x7a7a5a), hemiI: 0.95 },
+  { at: 1, top: c(0x58aaea), horizon: c(0xcdeaf6), sun: c(0xfff4e6), sunI: 5.0, hemiSky: c(0xe4e8f0), hemiGround: c(0x7a7a5a), hemiI: 0.95 },
 ];
 
 export class SceneRig {
@@ -69,11 +100,13 @@ export class SceneRig {
   /** Colour of the haze for the current hour, linear. */
   readonly haze = new THREE.Color();
   readonly skyTop = new THREE.Color();
-  private sky: Sky;
+  private sky: THREE.Mesh;
+  private skyMat: THREE.ShaderMaterial;
+  private clouds: THREE.Mesh;
   private night: THREE.Mesh;
   private nightMat: THREE.ShaderMaterial;
   private envScene = new THREE.Scene();
-  private envSky: Sky;
+  private envSky: THREE.Mesh;
   private pmrem: THREE.PMREMGenerator;
   private envTarget: THREE.WebGLRenderTarget | null = null;
   private envHour = NaN;
@@ -97,17 +130,36 @@ export class SceneRig {
     sun.shadow.mapSize.set(4096, 4096);
     sun.shadow.bias = -0.00025;
     sun.shadow.normalBias = 0.5;
-    sun.shadow.radius = 2;
+    sun.shadow.radius = 3.2;
     sun.shadow.camera.near = 50;
     sun.shadow.camera.far = 7000;
     this.scene.add(sun, sun.target);
 
-    this.sky = this.makeSky();
+    this.skyMat = new THREE.ShaderMaterial({
+      vertexShader: SKY_VERTEX,
+      fragmentShader: SKY_FRAGMENT,
+      side: THREE.BackSide,
+      depthWrite: false,
+      depthTest: false,
+      toneMapped: false,
+      uniforms: {
+        uTop: { value: new THREE.Color() },
+        uHorizon: { value: new THREE.Color() },
+        uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+        uSunCol: { value: new THREE.Color(PALETTE.sun) },
+        uDay: { value: 1 },
+      },
+    });
+    this.sky = new THREE.Mesh(new THREE.SphereGeometry(10, 32, 16), this.skyMat);
     this.sky.renderOrder = -100;
     this.sky.frustumCulled = false;
     this.scene.add(this.sky);
-    this.envSky = this.makeSky();
+    this.envSky = new THREE.Mesh(new THREE.SphereGeometry(20, 24, 12), this.skyMat);
     this.envScene.add(this.envSky);
+    this.clouds = makeClouds();
+    // The map look is clear from above; clouds would sit between the camera and the land.
+    this.clouds.visible = false;
+    this.scene.add(this.clouds);
     // The world below the horizon, so reflections and ambient are not lit from under.
     const ground = new THREE.Mesh(new THREE.CircleGeometry(30, 16).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x39452c }));
     ground.position.y = -1;
@@ -138,19 +190,6 @@ export class SceneRig {
     this.setTimeOfDay(this.hours);
   }
 
-  private makeSky(): Sky {
-    const sky = new Sky();
-    sky.scale.setScalar(20);
-    sky.material.toneMapped = false;
-    // The addon's radiance is scaled for a low exposure. Bring it to the sun's scale.
-    sky.material.fragmentShader = sky.material.fragmentShader.replace('#include <tonemapping_fragment>', `gl_FragColor.rgb *= ${SKY_GAIN.toFixed(2)};\n#include <tonemapping_fragment>`);
-    const u = sky.material.uniforms;
-    u.cloudCoverage.value = 0.34;
-    u.cloudDensity.value = 0.45;
-    u.cloudElevation.value = 0.55;
-    return sky;
-  }
-
   getTimeOfDay(): number {
     return this.hours;
   }
@@ -161,7 +200,7 @@ export class SceneRig {
     const dayPhase = ((h - 6) / 12) * Math.PI;
     const elev = Math.sin(dayPhase);
     // Sun swings east to west, a little south of overhead.
-    const sunVec = new THREE.Vector3(-Math.cos(dayPhase), elev * 0.86, 0.5).normalize();
+    const sunVec = new THREE.Vector3(-Math.cos(dayPhase), elev * 1.15, 0.42).normalize();
     const k = Math.max(-0.35, Math.min(1, sunVec.y));
     let i = 0;
     while (i + 2 < KEYS.length && KEYS[i + 1].at < k) i++;
@@ -183,17 +222,15 @@ export class SceneRig {
 
     const isDay = sunVec.y > 0.02;
     this.sunVector.copy(sunVec);
-    // Dust and low sun warm the air; clear noon keeps it blue.
-    const low = 1 - THREE.MathUtils.smoothstep(sunVec.y, 0.02, 0.45);
-    for (const sky of [this.sky, this.envSky]) {
-      const su = sky.material.uniforms;
-      su.sunPosition.value.copy(sunVec);
-      su.turbidity.value = 2.4 + low * 5;
-      su.rayleigh.value = 1.9 + low * 1.2;
-      su.mieCoefficient.value = 0.004 + low * 0.004;
-      su.mieDirectionalG.value = 0.8;
-      su.cloudCoverage.value = 0.34 * (1 - 0.6 * (1 - THREE.MathUtils.smoothstep(sunVec.y, -0.1, 0.1)));
-    }
+    const su = this.skyMat.uniforms;
+    su.uTop.value.copy(u.uTop.value);
+    su.uHorizon.value.copy(u.uHorizon.value);
+    su.uSunDir.value.copy(sunVec);
+    su.uSunCol.value.copy(this.sun.color);
+    su.uDay.value = THREE.MathUtils.smoothstep(sunVec.y, -0.05, 0.05);
+    // Clouds take the light of the hour: white by day, warm at dusk, dim blue at night.
+    const cm = this.clouds.material as THREE.MeshStandardMaterial;
+    cm.emissive.copy(u.uHorizon.value).multiplyScalar(0.25);
     // Below the horizon the key light turns into a high moon.
     if (isDay) this.lightDir.copy(sunVec);
     else this.lightDir.set(0.35, 0.8, -0.45).normalize();
@@ -252,7 +289,9 @@ export class SceneRig {
   update(camera: THREE.PerspectiveCamera, focus: THREE.Vector3, distance: number): void {
     this.sky.position.copy(camera.position);
     this.night.position.copy(camera.position);
-    for (const sky of [this.sky, this.envSky]) sky.material.uniforms.time.value = this.shared.uTime.value;
+    // Clouds drift east, wrapping round the map.
+    const drift = (this.shared.uTime.value * 4) % 12000;
+    this.clouds.position.set(drift > 6000 ? drift - 12000 : drift, 0, 0);
     const sun = this.sun;
     if (!this.shadowsOn) return;
     // Quantise the box so it does not rescale, and shimmer, on every zoom step.
@@ -289,9 +328,10 @@ export class SceneRig {
 
   dispose(): void {
     this.sky.geometry.dispose();
-    this.sky.material.dispose();
+    this.skyMat.dispose();
     this.envSky.geometry.dispose();
-    this.envSky.material.dispose();
+    this.clouds.geometry.dispose();
+    (this.clouds.material as THREE.Material).dispose();
     this.night.geometry.dispose();
     this.nightMat.dispose();
     this.envTarget?.dispose();
@@ -304,3 +344,36 @@ const _nightAir = new THREE.Color();
 const _r = new THREE.Vector3();
 const _u = new THREE.Vector3();
 const _t = new THREE.Vector3();
+
+/** Low-poly cumulus: clusters of faceted blobs scattered high over the land. */
+function makeClouds(): THREE.Mesh {
+  const parts: THREE.BufferGeometry[] = [];
+  let seed = 7;
+  const r = () => {
+    seed = (seed * 16807) % 2147483647;
+    return seed / 2147483647;
+  };
+  const white = rgb('cloud');
+  for (let i = 0; i < 46; i++) {
+    const cx = (r() * 2 - 1) * 6000;
+    const cz = (r() * 2 - 1) * 6000;
+    const cy = 520 + r() * 260;
+    const size = 40 + r() * 70;
+    const puffs = 3 + Math.floor(r() * 4);
+    for (let k = 0; k < puffs; k++) {
+      const g = new THREE.IcosahedronGeometry(size * (0.55 + r() * 0.5), 0);
+      g.scale(1.3, 0.62, 1);
+      g.rotateY(r() * Math.PI);
+      g.translate(cx + (k - puffs / 2) * size * 0.8 + r() * size * 0.3, cy + r() * size * 0.25, cz + (r() - 0.5) * size * 0.8);
+      g.deleteAttribute('uv');
+      parts.push(paintFacets(g, white, 0.02, i * 13 + k));
+    }
+  }
+  const geo = mergeGeometries(parts, false)!;
+  for (const p of parts) p.dispose();
+  const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0, emissive: new THREE.Color(0x202830), fog: true });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = -50;
+  return mesh;
+}

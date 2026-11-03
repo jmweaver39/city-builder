@@ -10,12 +10,15 @@ import type { CrossingInfo, DraftIssue, RoadAnchor } from '../core/RoadNetwork';
 import { addScaled, clamp, distXZ, dotXZ, sub } from '../core/math';
 import { isOneWay } from '../core/roadTypes';
 import { ELEVATION_STEP, MAX_ELEVATION, MIN_ELEVATION } from '../core/terrain';
-import type { Id, Vec3 } from '../core/types';
+import type { Id, RampAttach, Vec3 } from '../core/types';
 import type { RoadPreview, ToolMark } from '../render/api';
 import { buildCubic, endState, formatReadout, readout } from './draft';
 import { castRay, chooseHit, nodesNearRay, pickRoad } from './pick';
 import { upgradeSegment } from './roadOps';
+import { groundPixelSize, snapGridAt, type GridSettings } from './grid';
+import { formatSpacing } from '../render/gridLevels';
 import { continuationAt, NODE_CATCH, referenceDirection, snapRoadPoint, type SnapHit } from './snap';
+import { attachFor, flipAttach, laneChoiceAt, reverseCubic, travelChevrons, type LaneChoice } from './laneSnap';
 import { Tool } from './Tool';
 import { COLORS, type ToolId, type ToolKey, type ToolPointer, type Tone } from './types';
 
@@ -27,6 +30,8 @@ interface StartPoint {
   slope: number | null;
   /** Angle guides measure from this. */
   ref: Vec3 | null;
+  /** The highway lane a ramp leaves or joins here. */
+  lane?: LaneChoice | null;
 }
 
 export interface DraftState {
@@ -36,6 +41,11 @@ export interface DraftState {
   issues: DraftIssue[];
   crossings: CrossingInfo[];
   state: Tone;
+  /** Lane attaches at either end, for a ramp on a highway lane. */
+  startAttach?: RampAttach;
+  endAttach?: RampAttach;
+  /** Drawn against the traffic it joins, so it will be built the other way round. */
+  flipped?: boolean;
 }
 
 export function formatElevation(y: number): string {
@@ -208,20 +218,34 @@ export class RoadTool extends Tool {
       },
       disabled: e.ctrl,
       ignoreNodes,
-      grid: settings.grid.enabled ? settings.grid : null,
+      ...this.gridQuery(e),
     });
   }
 
   private startFrom(hit: SnapHit): StartPoint {
     const { net } = this.ctx;
     const cont = hit.anchor.kind === 'node' ? continuationAt(net, hit.anchor.id) : null;
+    const lane = this.laneChoiceFor(hit);
     return {
       anchor: hit.anchor,
-      pos: { ...hit.pos },
+      // A ramp leaves from the outer edge of the chosen lane's carriageway.
+      pos: lane ? { ...lane.chosen.edge } : { ...hit.pos },
       dir: cont?.dir ?? null,
       slope: cont?.slope ?? null,
-      ref: cont?.dir ?? referenceDirection(net, hit.anchor, null),
+      ref: lane ? lane.chosen.travel : (cont?.dir ?? referenceDirection(net, hit.anchor, null)),
+      lane,
     };
+  }
+
+  /** Lane snap points when a one-way road meets a highway here, unless Ctrl is held. */
+  private laneChoiceFor(hit: SnapHit): LaneChoice | null {
+    const { net, settings, view } = this.ctx;
+    const def = net.roadType(settings.roadType);
+    if (!def || !isOneWay(def) || def.category === 'rail' || this.pointer?.ctrl) return null;
+    if (hit.anchor.kind !== 'segment' && hit.anchor.kind !== 'node') return null;
+    const e = this.pointer;
+    const cursor = (e && view.pickPlane(e.x, e.y, hit.pos.y)) ?? hit.pos;
+    return laneChoiceAt(net, hit.anchor, cursor);
   }
 
   private placeStart(hit: SnapHit): void {
@@ -260,12 +284,26 @@ export class RoadTool extends Tool {
         endSlope = -cont.slope;
       }
     }
-    const startDir = ctrl ? null : start.dir;
+    let startDir = ctrl ? null : start.dir;
+    let endPos = hit.pos;
+    // A ramp on a highway lane leaves and joins aligned with its traffic. Heading
+    // back against it draws the other kind of ramp, which is flipped below.
+    const startLane = ctrl ? null : (start.lane ?? null);
+    const endLane = this.laneChoiceFor(hit);
+    if (startLane) {
+      const ahead = dotXZ(sub(hit.pos, start.pos), startLane.chosen.travel) >= 0;
+      startDir = ahead ? startLane.chosen.travel : { x: -startLane.chosen.travel.x, y: 0, z: -startLane.chosen.travel.z };
+    }
+    if (endLane) {
+      endPos = endLane.chosen.edge;
+      const travel = endLane.chosen.travel;
+      endDir = dotXZ(sub(endPos, start.pos), travel) >= 0 ? travel : { x: -travel.x, y: 0, z: -travel.z };
+    }
     const cubic = buildCubic(
       mode,
       {
         start: start.pos,
-        end: hit.pos,
+        end: endPos,
         startDir: mode === 'curved' ? null : startDir,
         endDir,
         startSlope: ctrl ? null : start.slope,
@@ -273,16 +311,24 @@ export class RoadTool extends Tool {
       },
       this.control,
     );
-    const params = { start: start.anchor, end: hit.anchor, c1: cubic.p1, c2: cubic.p2, roadType: settings.roadType };
-    const issues = net.validateDraft(params);
-    const ignore = [start.anchor, hit.anchor].flatMap((a) => (a.kind === 'node' ? [a.id] : []));
-    const crossings = net.findCrossings(cubic, ignore).filter((c) => !this.isEndHit(c, cubic, start.anchor, hit.anchor));
-    const state: Tone = issues.some((i) => i.severity === 'error')
-      ? 'error'
-      : issues.length
-        ? 'warning'
-        : 'ok';
-    return { cubic, start: start.anchor, end: hit.anchor, issues, crossings, state };
+    const startAttach = startLane ? attachFor(startLane, startDir ?? startLane.chosen.travel) : undefined;
+    const endAttach = endLane && endDir ? attachFor(endLane, endDir) : undefined;
+    const evaluate = (c: Cubic, a: RoadAnchor, b: RoadAnchor, sa: RampAttach | undefined, ea: RampAttach | undefined, flipped: boolean): DraftState => {
+      const params = { start: a, end: b, c1: c.p1, c2: c.p2, roadType: settings.roadType, startAttach: sa, endAttach: ea };
+      const issues = net.validateDraft(params);
+      const ignore = [a, b].flatMap((x) => (x.kind === 'node' ? [x.id] : []));
+      const crossings = net.findCrossings(c, ignore).filter((x) => !this.isEndHit(x, c, a, b));
+      const state: Tone = issues.some((i) => i.severity === 'error') ? 'error' : issues.length ? 'warning' : 'ok';
+      return { cubic: c, start: a, end: b, issues, crossings, state, startAttach: sa, endAttach: ea, flipped };
+    };
+    const drawn = evaluate(cubic, start.anchor, hit.anchor, startAttach, endAttach, false);
+    const def = net.roadType(settings.roadType);
+    if (def && isOneWay(def) && drawn.issues.some((i) => i.code === 'wrongWay')) {
+      // Drawn against the traffic it meets: the same road the other way round may work.
+      const flipped = evaluate(reverseCubic(cubic), hit.anchor, start.anchor, flipAttach(endAttach), flipAttach(startAttach), true);
+      if (!flipped.issues.some((i) => i.code === 'wrongWay')) return flipped;
+    }
+    return drawn;
   }
 
   private isEndHit(c: CrossingInfo, cubic: Cubic, start: RoadAnchor, end: RoadAnchor): boolean {
@@ -306,7 +352,16 @@ export class RoadTool extends Tool {
       c1: draft.cubic.p1,
       c2: draft.cubic.p2,
       roadType: settings.roadType,
+      startAttach: draft.startAttach,
+      endAttach: draft.endAttach,
     });
+    if (draft.flipped) {
+      // The far end is where this road begins, so there is nothing to carry on from.
+      toast('Drawn against the traffic, so it was built the other way round.', 'warning');
+      this.start = null;
+      this.control = null;
+      return;
+    }
     const last = result.nodes[result.nodes.length - 1];
     const node = last === undefined ? undefined : net.getNode(last);
     if (!node) {
@@ -329,6 +384,9 @@ export class RoadTool extends Tool {
     const { net, settings } = this.ctx;
     const hit = pickRoad(this.ctx, e);
     if (!hit || this.painted.has(hit.segmentId)) return;
+    // Upgrade never turns track into road or road into track.
+    const isRail = (id: string) => net.roadType(id)?.category === 'rail';
+    if (isRail(net.getSegment(hit.segmentId)!.roadType) !== isRail(settings.roadType)) return;
     const id = upgradeSegment(net, hit.segmentId, settings.roadType, false);
     this.painted.add(hit.segmentId);
     this.painted.add(id);
@@ -404,7 +462,24 @@ export class RoadTool extends Tool {
 
   private elevationLine(hit: SnapHit | null): string {
     const y = hit ? hit.pos.y : this.ctx.settings.elevation;
-    return formatElevation(Math.round(y * 10) / 10);
+    const elevation = formatElevation(Math.round(y * 10) / 10);
+    return this.gridSpacing === null ? elevation : `${elevation} · Grid ${formatSpacing(this.gridSpacing)}`;
+  }
+
+  /** Spacing grid snapping uses at the current zoom, for the readout. Null with the grid off. */
+  gridSpacing: number | null = null;
+
+  /** The optional grid at this zoom: subdivisions follow what is drawn (grid.ts). */
+  private gridQuery(e: ToolPointer): { grid: GridSettings | null; gridMetresPerPixel: number } {
+    const { view, settings } = this.ctx;
+    if (!settings.grid.enabled) {
+      this.gridSpacing = null;
+      return { grid: null, gridMetresPerPixel: 0 };
+    }
+    const mpp = groundPixelSize(view, e.x, e.y, settings.elevation);
+    const grid = snapGridAt(settings.grid, mpp);
+    this.gridSpacing = grid.spacing;
+    return { grid, gridMetresPerPixel: mpp };
   }
 
   private showStart(): void {
@@ -415,15 +490,47 @@ export class RoadTool extends Tool {
       this.ctx.setHud(null);
       return;
     }
-    this.ctx.setMarks(this.snapMarks(hit));
+    const lane = this.laneChoiceFor(hit);
+    const marks = lane ? this.laneMarks(lane) : this.snapMarks(hit);
+    this.ctx.setMarks(marks);
     const e = this.pointer!;
     this.ctx.setHud({
       x: e.x,
       y: e.y,
-      lines: [this.elevationLine(hit), this.snapLabel(hit)],
-      notes: ['Click to start the road'],
+      lines: [this.elevationLine(hit), lane ? this.laneLabel(lane) : this.snapLabel(hit)],
+      notes: [lane ? 'Click to start a ramp from this lane. Ctrl snaps to the centreline' : 'Click to start the road'],
       tone: 'ok',
     });
+  }
+
+  /** Snap points on every lane, the outermost ones larger, and the chosen lane's ramp start. */
+  private laneMarks(lane: LaneChoice): ToolMark[] {
+    const marks: ToolMark[] = [];
+    for (const s of lane.lanes) {
+      const outer = s.fromEdge === 0;
+      marks.push({ kind: 'point', pos: s.centre, color: outer ? COLORS.snap : COLORS.guide, radius: outer ? 1.1 : 0.6 });
+      if (outer) marks.push({ kind: 'ring', pos: s.centre, color: COLORS.snap, radius: 1.8 });
+    }
+    const c = lane.chosen;
+    marks.push({ kind: 'ring', pos: c.centre, color: COLORS.ok, radius: 2.4 });
+    marks.push({ kind: 'point', pos: c.edge, color: COLORS.ok, radius: 1 });
+    // Which way the lane's traffic runs, from the ramp start.
+    const tip = addScaled(c.edge, c.travel, 14);
+    const r = { x: -c.travel.z, y: 0, z: c.travel.x };
+    marks.push({ kind: 'line', points: [c.edge, tip], color: COLORS.ok, width: 0.45 });
+    marks.push({
+      kind: 'line',
+      points: [addScaled(addScaled(tip, c.travel, -3), r, 2), tip, addScaled(addScaled(tip, c.travel, -3), r, -2)],
+      color: COLORS.ok,
+      width: 0.45,
+    });
+    return marks;
+  }
+
+  private laneLabel(lane: LaneChoice): string {
+    const c = lane.chosen;
+    const name = c.fromEdge === 0 ? 'outside lane' : `lane ${c.fromEdge + 1} in from the edge`;
+    return `Snap: ${name}, ${c.fromEdge + 1} of ${c.count} lanes feed the ramp`;
   }
 
   private showControl(e: ToolPointer): void {
@@ -465,7 +572,21 @@ export class RoadTool extends Tool {
       if (!c.atGrade) marks.push({ kind: 'label', pos: c.point, text: `${c.clearance.toFixed(1)} m clear`, color });
     }
     for (const issue of draft.issues) {
-      if (issue.at) marks.push({ kind: 'point', pos: issue.at, color: issue.severity === 'error' ? COLORS.bad : COLORS.warn, radius: 1.5 });
+      const color = issue.severity === 'error' ? COLORS.bad : COLORS.warn;
+      if (issue.at) marks.push({ kind: 'point', pos: issue.at, color, radius: 1.5 });
+      // The stretch that overlaps another road, in red along the draft.
+      if (issue.stretch && issue.stretch.length > 1) {
+        marks.push({ kind: 'line', points: issue.stretch.map((p) => ({ ...p, y: p.y + 0.5 })), color, width: 2.2 });
+      }
+    }
+    const endLane = this.laneChoiceFor(hit);
+    if (endLane) marks.push(...this.laneMarks(endLane));
+    const def = net.roadType(settings.roadType);
+    if (def && isOneWay(def)) {
+      // Travel arrows, the way the road will be built.
+      for (const pts of travelChevrons(draft.cubic)) {
+        marks.push({ kind: 'line', points: pts, color: draft.flipped ? COLORS.warn : COLORS.neutral, width: 0.5 });
+      }
     }
     this.ctx.setMarks(marks);
     const lines = formatReadout(readout(draft.cubic), hit.angle);
@@ -475,6 +596,11 @@ export class RoadTool extends Tool {
     if (atGrade) lines.push(`Junctions: ${atGrade}`);
     if (over) lines.push(`Grade separated: ${over}`);
     const notes = draft.issues.map((i) => i.message);
+    if (draft.flipped) notes.unshift('Drawn against the traffic: it will be built the other way round.');
+    if (draft.startAttach || draft.endAttach) {
+      const a = draft.startAttach ?? draft.endAttach!;
+      lines.push(`Ramp lane: ${a.lane === 0 ? 'outside lane' : `${a.lane + 1} outer lanes`}`);
+    }
     const oneWayNote = this.oneWayClash(draft);
     if (oneWayNote) notes.push(oneWayNote);
     this.ctx.setHud({ x: e.x, y: e.y, lines, notes, tone: draft.state });

@@ -14,7 +14,18 @@ export interface AppActions {
   exportJson(): void;
 }
 
+/** Train sim and its render layer, for the rail panels. */
+export interface RailUi {
+  trains: import('../rail/TrainSim').TrainSim;
+  layer: import('../render/rail').RailLayer;
+  openLines(): void;
+  /** Replace the map with the rail demo, asking first unless `confirmed`. Undoable. */
+  loadDemo(opts?: { confirmed?: boolean }): void;
+}
+
 export interface UiContext {
+  /** Present when the app runs trains. */
+  rail?: RailUi;
   net: RoadNetwork;
   sim: SimApi;
   renderer: RendererApi;

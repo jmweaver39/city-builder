@@ -27,12 +27,16 @@ const GUARD_RANGE = 30;
 const GUARD_LAST_CHANCE = -1.3;
 /** Moving this far resets the stuck timer. */
 const STUCK_PROGRESS = 2;
+/** Queued this close behind a held vehicle counts as held too. */
+const HELD_QUEUE_GAP = 12;
 
 // Results of walkAhead and guard, kept out of the heap.
 let outGap = Infinity;
 let outLeadV = 0;
 let outHard = Infinity;
 let outStop = Infinity;
+/** The vehicle walkAhead found ahead, on a later lane, or -1. */
+let outHeldVeh = -1;
 
 /** IDM with a fixed free-road term. */
 function idm(free: number, v: number, gap: number, dv: number, a: number, b: number, T: number, s0: number): number {
@@ -61,6 +65,7 @@ function walkAhead(w: World, v: number, lane: number, pos: number, sp: number): 
   outLeadV = 0;
   outHard = Infinity;
   outStop = Infinity;
+  outHeldVeh = -1;
   const sink = sinkOn(w, v, lane);
   if (sink >= 0 && sink >= pos) return;
   let d = laneLen[lane] - pos;
@@ -109,6 +114,7 @@ function walkAhead(w: World, v: number, lane: number, pos: number, sp: number): 
       outGap = d + tail;
       outHard = outGap;
       outLeadV = bk.tailV[nxt];
+      outHeldVeh = bk.tailVeh[nxt];
       return;
     }
     d += laneLen[nxt];
@@ -183,7 +189,7 @@ export function accelPass(w: World): void {
   const { n, len: laneLen, isConn, prof, profStart, confStart } = g;
   const { start, eV, eS, eT } = bk;
   const { s, v: speed, len, accel, decel, headway, minGap, maxSpeed, speedFactor, limitV, limitD, acc, gapHard } = veh;
-  const { vlTick, vlGap, vlV, vlFloor, seekV, yieldSec, lcFrom } = veh;
+  const { vlTick, vlGap, vlV, vlFloor, seekV, yieldSec, lcFrom, held } = veh;
 
   for (let l = 0; l < n; l++) {
     const a = start[l];
@@ -209,6 +215,7 @@ export function accelPass(w: World): void {
       let gap = Infinity;
       let leadV = 0;
       let hard = Infinity;
+      let leadU = -1;
       for (let k = e - 1; k >= a; k--) {
         const u = eV[k];
         if (u === v) continue;
@@ -233,7 +240,10 @@ export function accelPass(w: World): void {
         }
         // A ghost is a real body part-way across this lane, so it is solid too.
         if (gk < hard) hard = gk;
-        if (t !== ENTRY_GHOST) break;
+        if (t !== ENTRY_GHOST) {
+          leadU = u;
+          break;
+        }
       }
 
       // Until a lane change finishes the body is still partly in the old lane.
@@ -287,8 +297,13 @@ export function accelPass(w: World): void {
         if (x < out) out = x;
       }
 
+      // Held: waiting at a red light or a closure, or queued close behind someone who
+      // is. That is not being stuck.
+      let isHeld = leadU >= 0 && hard < HELD_QUEUE_GAP && held[leadU] === 1;
       if (!seenReal) {
         walkAhead(w, v, l, pos, sp);
+        if (outStop !== Infinity && (veh.denied[v] === DENY_LIGHT || veh.denied[v] === DENY_BLOCKED)) isHeld = true;
+        else if (outHeldVeh >= 0 && outGap < HELD_QUEUE_GAP && held[outHeldVeh] === 1) isHeld = true;
         if (outGap !== Infinity) {
           const x = idm(free, sp, outGap, sp - outLeadV, ai, bi, T, s0);
           if (x < out) out = x;
@@ -321,6 +336,7 @@ export function accelPass(w: World): void {
         if (limited < out) out = limited;
       }
 
+      held[v] = isHeld ? 1 : 0;
       if (out < -MAX_DECEL) out = -MAX_DECEL;
       acc[v] = out;
       gapHard[v] = hard;
@@ -481,7 +497,7 @@ export function integrate(w: World, sink: ArrivalSink): void {
 
     // Stuck means no progress, so a slow queue creeping forward does not count, and
     // nor does waiting at a red light or a closed lane, which is not being stuck.
-    if (denied[v] !== DENY_LIGHT && denied[v] !== DENY_BLOCKED) stuckSec[v] += DT;
+    if (!veh.held[v]) stuckSec[v] += DT;
     stuckProgress[v] += ds;
     if (stuckProgress[v] > STUCK_PROGRESS) {
       stuckProgress[v] = 0;

@@ -108,6 +108,64 @@ function sampleXZ(pts: Float32Array, cum: Float32Array, s: number, out: { x: num
   out.i = i;
 }
 
+/**
+ * Bend speed limits along a road lane. The polyline's turning at each station is
+ * spread over the half segments either side of it, so the cumulative turn grows
+ * linearly along an arc and a constant radius reads as constant whatever the
+ * station spacing or where samples fall. Windows are kept inside the lane and the
+ * turn is extrapolated over its first and last half segment, so the ends of a lane
+ * see the bend too: a curve cut into several segments (core/curveChain.ts) then
+ * reads the same through every joint instead of as straight at each one.
+ */
+function roadBends(
+  pts: Float32Array,
+  cum: Float32Array,
+  length: number,
+  count: number,
+  chord: number,
+  lateral: number,
+  out: number[],
+  base: number,
+): void {
+  const np = cum.length;
+  if (np < 3) return;
+  const mids = new Float64Array(np - 1);
+  const turns = new Float64Array(np - 1);
+  let total = 0;
+  for (let j = 0; j + 1 < np; j++) {
+    if (j > 0) {
+      const ux = pts[j * 3] - pts[j * 3 - 3];
+      const uz = pts[j * 3 + 2] - pts[j * 3 - 1];
+      const wx = pts[j * 3 + 3] - pts[j * 3];
+      const wz = pts[j * 3 + 5] - pts[j * 3 + 2];
+      total += Math.abs(Math.atan2(ux * wz - uz * wx, ux * wx + uz * wz));
+    }
+    mids[j] = (cum[j] + cum[j + 1]) / 2;
+    turns[j] = total;
+  }
+  const m = np - 1;
+  const turnAt = (s: number): number => {
+    if (m === 1) return 0;
+    let j = 0;
+    if (s <= mids[0]) j = 0;
+    else if (s >= mids[m - 1]) j = m - 2;
+    else while (j < m - 2 && mids[j + 1] < s) j++;
+    const span = mids[j + 1] - mids[j];
+    return span > 1e-9 ? turns[j] + ((turns[j + 1] - turns[j]) * (s - mids[j])) / span : turns[j];
+  };
+  for (let i = 0; i < count; i++) {
+    const s = (length * i) / (count - 1);
+    const lo = Math.max(0, s - chord);
+    const hi = Math.min(length, s + chord);
+    if (hi - lo < 0.5) continue;
+    const kappa = (turnAt(hi) - turnAt(lo)) / (hi - lo);
+    if (kappa > 1e-4) {
+      const v = Math.max(MIN_CURVE_SPEED, Math.sqrt(lateral / kappa));
+      if (v < out[base + i]) out[base + i] = v;
+    }
+  }
+}
+
 /** Append the speed samples of one lane to `out`. Returns the sample count. */
 function writeProfile(
   pts: Float32Array,
@@ -127,26 +185,30 @@ function writeProfile(
   // corner in a junction's curve as one smooth arc, whatever the curve's sharpest point.
   const chord = Math.max(step, connector ? CONNECTOR_CHORD : ROAD_CHORD);
   const lateral = connector ? CONNECTOR_LATERAL_ACCEL : CURVE_LATERAL_ACCEL;
-  const a = { x: 0, z: 0, i: 0 };
-  const b = { x: 0, z: 0, i: 0 };
-  const c = { x: 0, z: 0, i: 0 };
-  for (let i = 0; i < count; i++) {
-    const s = (length * i) / (count - 1);
-    sampleXZ(pts, cum, Math.max(0, s - chord), a);
-    sampleXZ(pts, cum, s, b);
-    sampleXZ(pts, cum, Math.min(length, s + chord), c);
-    const ux = b.x - a.x;
-    const uz = b.z - a.z;
-    const wx = c.x - b.x;
-    const wz = c.z - b.z;
-    const lu = Math.hypot(ux, uz);
-    const lw = Math.hypot(wx, wz);
-    if (lu > 0.5 && lw > 0.5) {
-      const angle = Math.abs(Math.atan2(ux * wz - uz * wx, ux * wx + uz * wz));
-      const kappa = angle / ((lu + lw) / 2);
-      if (kappa > 1e-4) {
-        const v = Math.max(MIN_CURVE_SPEED, Math.sqrt(lateral / kappa));
-        if (v < out[base + i]) out[base + i] = v;
+  if (!connector) {
+    roadBends(pts, cum, length, count, chord, lateral, out, base);
+  } else {
+    const a = { x: 0, z: 0, i: 0 };
+    const b = { x: 0, z: 0, i: 0 };
+    const c = { x: 0, z: 0, i: 0 };
+    for (let i = 0; i < count; i++) {
+      const s = (length * i) / (count - 1);
+      sampleXZ(pts, cum, Math.max(0, s - chord), a);
+      sampleXZ(pts, cum, s, b);
+      sampleXZ(pts, cum, Math.min(length, s + chord), c);
+      const ux = b.x - a.x;
+      const uz = b.z - a.z;
+      const wx = c.x - b.x;
+      const wz = c.z - b.z;
+      const lu = Math.hypot(ux, uz);
+      const lw = Math.hypot(wx, wz);
+      if (lu > 0.5 && lw > 0.5) {
+        const angle = Math.abs(Math.atan2(ux * wz - uz * wx, ux * wx + uz * wz));
+        const kappa = angle / ((lu + lw) / 2);
+        if (kappa > 1e-4) {
+          const v = Math.max(MIN_CURVE_SPEED, Math.sqrt(lateral / kappa));
+          if (v < out[base + i]) out[base + i] = v;
+        }
       }
     }
   }

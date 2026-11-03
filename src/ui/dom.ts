@@ -11,6 +11,8 @@ export interface Props {
   tip?: string;
   /** Hotkey named in the tooltip. */
   keyHint?: string;
+  /** A second line in the tooltip, under the name. */
+  desc?: string;
   style?: Partial<CSSStyleDeclaration>;
   attrs?: Record<string, string>;
   dataset?: Record<string, string>;
@@ -29,6 +31,7 @@ export function el<K extends keyof HTMLElementTagNameMap>(
   if (props.title) node.title = props.title;
   if (props.tip) node.dataset.tip = props.tip;
   if (props.keyHint) node.dataset.key = props.keyHint;
+  if (props.desc) node.dataset.desc = props.desc;
   if (props.style) Object.assign(node.style, props.style);
   if (props.attrs) for (const [k, v] of Object.entries(props.attrs)) node.setAttribute(k, v);
   if (props.dataset) Object.assign(node.dataset, props.dataset);
@@ -130,6 +133,11 @@ export function sliderInput(
     },
   });
   input.value = String(value);
+  // The filled part of the track, for the custom slider style.
+  const fill = () => input.style.setProperty('--fill', `${((input.valueAsNumber - opts.min) / (opts.max - opts.min || 1)) * 100}%`);
+  input.addEventListener('input', fill);
+  input.addEventListener('sync', fill);
+  fill();
   return el('span', { class: 'slider' }, input, out);
 }
 

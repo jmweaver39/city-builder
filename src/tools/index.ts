@@ -20,3 +20,6 @@ export * from './junctionDiagram';
 export * from './roadAnchors';
 export * from './NodeMarkingTool';
 export * from './ReverseTool';
+export * from './ZoneTool';
+export * from './zoneOps';
+export * from './RailTools';

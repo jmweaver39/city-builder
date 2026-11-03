@@ -62,6 +62,8 @@ export interface SnapQuery {
   ignoreNodes?: readonly Id[];
   /** The optional drawing grid. Absent or disabled leaves snapping exactly as without it. */
   grid?: GridSettings | null;
+  /** Ground size of a screen pixel at the cursor, so grid catch radii stay a few pixels when zoomed in. */
+  gridMetresPerPixel?: number;
 }
 
 const BAND_TOLERANCE = 2.5;

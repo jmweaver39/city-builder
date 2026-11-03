@@ -23,7 +23,7 @@ const INT_FIELDS = [
   'spawnTick', 'lane0', 'prev10', 'prev20', 'lcFrom0', 'gridNext',
 ] as const;
 
-const BYTE_FIELDS = ['alive', 'type', 'color', 'needMust', 'needCount', 'denied'] as const;
+const BYTE_FIELDS = ['alive', 'type', 'color', 'needMust', 'needCount', 'denied', 'held'] as const;
 const SBYTE_FIELDS = ['needDir', 'blink'] as const;
 
 type FloatField = (typeof FLOAT_FIELDS)[number];

@@ -18,6 +18,7 @@ import { totalHalfWidth } from '../core/roadTypes';
 import { isWater, MAP_HALF_SIZE } from '../core/terrain';
 import type { Id, Vec3 } from '../core/types';
 import type { GridView } from '../render/api';
+import { visibleSnapSpacing } from '../render/gridLevels';
 import type { SnapFrom, SnapHit, SnapQuery } from './snap';
 
 export interface GridSettings {
@@ -34,6 +35,8 @@ export interface GridSettings {
   majorEvery: number;
   /** Grid Block tool: grid cells per block side. */
   blockCells: number;
+  /** Snap to the finest subdivision visible at the current zoom. Off: base spacing only. */
+  snapSubdivisions: boolean;
 }
 
 export const GRID_SPACINGS: readonly number[] = [8, 16, 32, 64, 128];
@@ -45,7 +48,7 @@ export const GRID_MAX_BLOCKS = 16;
 const QUARTER = Math.PI / 2;
 
 export function defaultGrid(): GridSettings {
-  return { enabled: false, spacing: 32, rotation: 0, originX: 0, originZ: 0, majorEvery: 4, blockCells: 2 };
+  return { enabled: false, spacing: 32, rotation: 0, originX: 0, originZ: 0, majorEvery: 4, blockCells: 2, snapSubdivisions: true };
 }
 
 /** Rotation folded into [0, PI/2). */
@@ -73,6 +76,7 @@ export function sanitizeGrid(raw: Partial<GridSettings> | null | undefined): Gri
     originZ: Math.min(MAP_HALF_SIZE, Math.max(-MAP_HALF_SIZE, num(raw.originZ, d.originZ))),
     majorEvery: major === 5 ? 5 : 4,
     blockCells: Math.min(GRID_MAX_BLOCK_CELLS, Math.max(1, Math.round(num(raw.blockCells, d.blockCells)))),
+    snapSubdivisions: typeof raw.snapSubdivisions === 'boolean' ? raw.snapSubdivisions : d.snapSubdivisions,
   };
 }
 
@@ -125,14 +129,32 @@ export function nearestGridLinePoint(g: GridSettings, p: Vec3, y = p.y): Vec3 {
   return Math.abs(a - ra) <= Math.abs(b - rb) ? fromGrid(g, ra, b, y) : fromGrid(g, a, rb, y);
 }
 
-/** Catch radius of an intersection, metres. */
-export function gridPointCatch(g: GridSettings): number {
-  return Math.min(g.spacing * 0.3, 8);
+/**
+ * Catch radius of an intersection, metres. With the ground size of a screen
+ * pixel, it is at least a few pixels, so fine subdivisions catch the cursor
+ * everywhere, but never more than half a cell.
+ */
+export function gridPointCatch(g: Pick<GridSettings, 'spacing'>, metresPerPixel = 0): number {
+  return Math.min(g.spacing * 0.5, Math.max(Math.min(g.spacing * 0.3, 8), metresPerPixel * 10));
 }
 
 /** Catch distance of a line, metres. */
-export function gridLineCatch(g: GridSettings): number {
-  return Math.min(g.spacing * 0.2, 5);
+export function gridLineCatch(g: Pick<GridSettings, 'spacing'>, metresPerPixel = 0): number {
+  return Math.min(g.spacing * 0.5, Math.max(Math.min(g.spacing * 0.2, 5), metresPerPixel * 7));
+}
+
+/**
+ * The grid snapping uses at this zoom: the base grid with its spacing swapped
+ * for the finest subdivision currently shown (unless subdivisions are off).
+ */
+export function snapGridAt(g: GridSettings, metresPerPixel: number): SnapGrid {
+  const spacing = visibleSnapSpacing(g.spacing, g.majorEvery, metresPerPixel, g.snapSubdivisions);
+  return { ...g, spacing, subdivided: spacing < g.spacing };
+}
+
+/** A grid as snapping sees it. On a subdivision, every cursor position lands on a line. */
+export interface SnapGrid extends GridSettings {
+  subdivided?: boolean;
 }
 
 /** The grid axis direction (u, v, -u or -v) closest to `ref`, or u. */
@@ -170,14 +192,13 @@ function freeHit(pos: Vec3, kind: 'grid' | 'gridLine', from: SnapFrom | null, gu
  * Where the angle guide ray, from `from` along `dir`, crosses a grid line close
  * to where the cursor projects onto it. Null when no crossing is within catch.
  */
-function guideCrossing(g: GridSettings, from: Vec3, dir: Vec3, raw: Vec3): Vec3 | null {
+function guideCrossing(g: GridSettings, from: Vec3, dir: Vec3, raw: Vec3, reach: number): Vec3 | null {
   const s = g.spacing;
   const f = toGrid(g, from);
   const { u, v } = gridAxes(g);
   const da = dir.x * u.x + dir.z * u.z;
   const db = dir.x * v.x + dir.z * v.z;
   const sRaw = (raw.x - from.x) * dir.x + (raw.z - from.z) * dir.z;
-  const reach = gridLineCatch(g);
   let best: number | null = null;
   const consider = (origin: number, rate: number) => {
     if (Math.abs(rate) < 1e-6) return;
@@ -204,18 +225,20 @@ export function snapWithGrid(q: SnapQuery, guides: (q: SnapQuery) => SnapHit): S
   const g = q.grid!;
   const raw = q.raw;
   const point = nearestGridPoint(g, raw, raw.y);
-  if (distXZ(point, raw) <= gridPointCatch(g)) return freeHit(point, 'grid', q.from);
+  const mpp = q.gridMetresPerPixel ?? 0;
+  if (distXZ(point, raw) <= gridPointCatch(g, mpp)) return freeHit(point, 'grid', q.from);
 
   const from: SnapFrom | null = q.from ? { pos: q.from.pos, ref: gridAxisNear(g, q.from.ref) } : null;
   const guided = guides({ ...q, from });
   if (from && guided.guide && (guided.kind === 'angle' || guided.kind === 'angleLength')) {
     const dir = normalizeXZ(sub(guided.pos, from.pos));
-    const cross = guideCrossing(g, from.pos, dir, raw);
+    const cross = guideCrossing(g, from.pos, dir, raw, gridLineCatch(g, mpp));
     if (cross) return freeHit(cross, 'gridLine', q.from, guided.guide);
     return { ...guided, angle: turnFrom(q.from, guided.pos) };
   }
   const line = nearestGridLinePoint(g, raw, raw.y);
-  if (distXZ(line, raw) <= gridLineCatch(g)) return freeHit(line, 'gridLine', q.from);
+  const lineReach = (g as SnapGrid).subdivided ? g.spacing / 2 : gridLineCatch(g, mpp);
+  if (distXZ(line, raw) <= lineReach + 1e-9) return freeHit(line, 'gridLine', q.from);
   return { ...guided, angle: turnFrom(q.from, guided.pos) };
 }
 
@@ -255,7 +278,9 @@ export function refineSegmentHit(net: RoadNetwork, hit: SnapHit, g: GridSettings
       for (let i = 1; i <= steps; i++) {
         const t = lo + ((hi - lo) * i) / steps;
         const cur = lineValue(g, c, t, family) - target;
-        if (prev === 0 || prev * cur < 0) {
+        // A road lying along a line of this family touches it everywhere: no crossing.
+        const along = Math.abs(prev) < 1e-6 && Math.abs(cur) < 1e-6;
+        if (!along && prev * cur <= 0) {
           // Bisect the bracket.
           let a = prevT;
           let b = t;
@@ -412,6 +437,31 @@ export function edgeCovered(net: RoadNetwork, e: BlockEdge): boolean {
   return true;
 }
 
+function roadsAt(net: RoadNetwork, a: RoadAnchor): readonly Id[] {
+  if (a.kind === 'segment') return [a.id];
+  if (a.kind === 'node') return net.getNode(a.id)?.segments ?? [];
+  return [];
+}
+
+/**
+ * Both ends of the edge landed on the same existing road, which runs along the
+ * edge: drawing it would lay a second road over the first.
+ */
+function sharedRoad(net: RoadNetwork, a: RoadAnchor, b: RoadAnchor, e: BlockEdge, block: number): boolean {
+  const other = new Set(roadsAt(net, b));
+  const mid = { x: (e.from.x + e.to.x) / 2, y: e.from.y, z: (e.from.z + e.to.z) / 2 };
+  const dir = normalizeXZ(sub(e.to, e.from));
+  for (const id of roadsAt(net, a)) {
+    if (!other.has(id)) continue;
+    const c = net.cubicOf(id);
+    const hit = closestPointOnCubic(c, mid);
+    if (hit.distance > block * 0.25) continue;
+    const along = cubicTangentXZ(c, hit.t);
+    if (Math.abs(along.x * dir.x + along.z * dir.z) > 0.9) return true;
+  }
+  return false;
+}
+
 export interface BlockCheck {
   /** Per edge: drawn, or skipped because a road is already there. */
   covered: boolean[];
@@ -478,7 +528,7 @@ export function checkGridBlock(net: RoadNetwork, plan: BlockPlan, roadType: stri
   let segments = 0;
   const degree = new Map<string, number>();
   for (const e of plan.edges) {
-    const isCovered = errors.size === 0 && edgeCovered(net, e);
+    const isCovered = errors.size === 0 && (edgeCovered(net, e) || sharedRoad(net, anchorAt(e.i0, e.j0), anchorAt(e.i1, e.j1), e, plan.block));
     covered.push(isCovered);
     for (const k of [`${e.i0},${e.j0}`, `${e.i1},${e.j1}`]) degree.set(k, (degree.get(k) ?? 0) + 1);
     if (isCovered) {
@@ -601,4 +651,18 @@ export function saveGridPrefs(store: GridPrefStore | null, g: GridSettings): voi
   } catch {
     // Storage full or blocked: the grid still works for this session.
   }
+}
+
+/** Ground metres covered by one screen pixel at the cursor, on the plane y = planeY. */
+export function groundPixelSize(
+  view: { pickPlane(x: number, y: number, planeY: number): Vec3 | null },
+  x: number,
+  y: number,
+  planeY: number,
+): number {
+  const p = view.pickPlane(x, y, planeY);
+  const px = view.pickPlane(x + 1, y, planeY);
+  const py = view.pickPlane(x, y + 1, planeY);
+  if (!p || !px || !py) return 0;
+  return Math.max(distXZ(p, px), distXZ(p, py));
 }

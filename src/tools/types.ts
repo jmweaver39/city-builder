@@ -3,10 +3,12 @@
  * ToolContext, so all of their logic runs headless under Vitest with a fake view.
  */
 import type { Cubic } from '../core/bezier';
-import type { CrosswalkStyle, DecalKind, EndpointKind, Id, LineStyle, NodeFillStyle, NodeLineStyle, PaintColor, Vec3 } from '../core/types';
+import type { CrosswalkStyle, DecalKind, EndpointKind, Id, LineStyle, NodeFillStyle, NodeLineStyle, PaintColor, Vec3, ZoneDensity, ZoneKind } from '../core/types';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import type { RendererApi, RendererExtras, ToolMark } from '../render/api';
 import { defaultGrid, type GridSettings } from './grid';
+import type { ControlKind } from './junctionControl';
+import { DEFAULT_ROUNDABOUT, type RoundaboutParams } from '../core/roundabout';
 import type { SimApi } from '../sim/api';
 
 export type ToolId =
@@ -22,14 +24,28 @@ export type ToolId =
   | 'nodeMarkings'
   | 'reverse'
   | 'gridBlock'
-  | 'gridAlign';
+  | 'gridAlign'
+  | 'zone'
+  | 'roundabout'
+  | 'station'
+  | 'line';
 
 export type DrawMode = 'straight' | 'curved' | 'freeform' | 'upgrade';
 
 /** The part of the renderer tools use. */
 export type ToolView = Pick<
   RendererApi,
-  'pickPlane' | 'pickRay' | 'getUnderground' | 'pickVehicle' | 'project' | 'setPreview' | 'setMarks' | 'setHighlight' | 'setLaneDebug'
+  | 'pickPlane'
+  | 'pickRay'
+  | 'getUnderground'
+  | 'pickVehicle'
+  | 'project'
+  | 'setPreview'
+  | 'setMarks'
+  | 'setHighlight'
+  | 'setLaneDebug'
+  | 'setZoneOverlay'
+  | 'setZoneGhost'
 > &
   Partial<Pick<RendererExtras, 'setGrid'>>;
 
@@ -57,7 +73,10 @@ export type InspectTarget =
   | { kind: 'junction'; id: Id }
   | { kind: 'endpoint'; id: Id }
   | { kind: 'vehicle'; id: number }
-  | { kind: 'nodeMarkings'; id: Id };
+  | { kind: 'nodeMarkings'; id: Id }
+  | { kind: 'zone'; id: Id }
+  | { kind: 'train'; id: number }
+  | { kind: 'station'; id: Id };
 
 export type Tone = 'ok' | 'warning' | 'error';
 
@@ -81,6 +100,18 @@ export interface PaintSettings {
   text: string;
 }
 
+export interface ZoneToolSettings {
+  kind: ZoneKind | 'none';
+  mode: 'block' | 'frontage' | 'rect' | 'polygon';
+  density: ZoneDensity;
+  depth: number;
+  setback: number;
+  snap: boolean;
+  snapDistance: number;
+  /** Highways, ramps and rail neither front a zone nor give it access. */
+  excludeFast: boolean;
+}
+
 export interface NodeMarkingSettings {
   mode: 'line' | 'filler';
   style: NodeLineStyle;
@@ -91,6 +122,8 @@ export interface NodeMarkingSettings {
   fillWidth: number;
   /** Lines between arms curve with the lanes. Off draws them straight. */
   curved: boolean;
+  /** Lines between arms follow the lane paths through the junction. */
+  followLanes: boolean;
 }
 
 export interface TemplateSettings {
@@ -115,10 +148,14 @@ export interface EditorSettings {
   reverseWholeRoad: boolean;
   paint: PaintSettings;
   nodeMarking: NodeMarkingSettings;
+  zone: ZoneToolSettings;
   trafficKind: EndpointKind;
   template: TemplateSettings;
   /** Optional drawing grid. Off by default, so roads stay free. */
   grid: GridSettings;
+  /** The Traffic Control card a click applies. 'inspect' opens the detailed editor instead. */
+  junctionControl: ControlKind | 'inspect';
+  roundabout: RoundaboutParams;
 }
 
 export function defaultSettings(): EditorSettings {
@@ -132,10 +169,13 @@ export function defaultSettings(): EditorSettings {
     elevation: 0,
     reverseWholeRoad: false,
     paint: { kind: 'line', lineStyle: 'solid', color: 'white', width: 0.2, text: 'SLOW' },
-    nodeMarking: { mode: 'line', style: 'solid', fill: 'hatch', color: 'white', width: 0.16, fillWidth: 0.25, curved: true },
+    zone: { kind: 'residential', mode: 'block', density: 'medium', depth: 40, setback: 2, snap: true, snapDistance: 8, excludeFast: true },
+    nodeMarking: { mode: 'line', style: 'solid', fill: 'hatch', color: 'white', width: 0.16, fillWidth: 0.25, curved: true, followLanes: false },
     trafficKind: 'gateway',
     template: { id: null, params: {}, rotation: 0, elevation: 0, roadType: null },
     grid: defaultGrid(),
+    junctionControl: 'inspect',
+    roundabout: { ...DEFAULT_ROUNDABOUT },
   };
 }
 

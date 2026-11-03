@@ -4,6 +4,7 @@
  */
 import type {
   Id,
+  JunctionControl,
   MovementKey,
   MovementState,
   NodeArm,
@@ -16,6 +17,7 @@ import type {
 import type { RoadNetwork } from './RoadNetwork';
 import { headingOf, wrapAngle } from './math';
 import { RANK_AVENUE, isOneWay } from './roadTypes';
+import { isControlledAccess } from './ramps';
 
 export type SignalPreset = 'opposing' | 'protectedLefts' | 'split';
 
@@ -197,14 +199,44 @@ function mainAxis(net: RoadNetwork, arms: NodeArm[]): [NodeArm, NodeArm] {
   return best;
 }
 
+const isRing = (net: RoadNetwork, arm: NodeArm) => net.roadTypeOf(arm.segmentId).category === 'roundabout';
+
 function computedSigns(net: RoadNetwork, arms: NodeArm[]): Record<number, SignKind> {
-  const [p, q] = mainAxis(net, arms);
   const signs: Record<number, SignKind> = {};
+  // On a roundabout, traffic on the ring has priority and everyone entering yields.
+  if (arms.some((a) => isRing(net, a))) {
+    for (const arm of arms) signs[arm.segmentId] = isRing(net, arm) ? 'priority' : 'yield';
+    return signs;
+  }
+  const [p, q] = mainAxis(net, arms);
   for (const arm of arms) {
     const main = arm === p || arm === q;
     signs[arm.segmentId] = main ? 'priority' : 'yield';
   }
   return signs;
+}
+
+function roadArms(net: RoadNetwork, nodeId: Id): NodeArm[] {
+  return (net.nodeGeom(nodeId)?.arms ?? []).filter((a) => net.roadTypeOf(a.segmentId).category !== 'rail');
+}
+
+/** True for a highway merge or split, which flows freely and takes no signs or signals. */
+export function isFreeFlowNode(net: RoadNetwork, nodeId: Id): boolean {
+  const arms = roadArms(net, nodeId);
+  return arms.length >= 3 && isFreeFlow(net, arms);
+}
+
+/**
+ * Who would go first at a node with priority signs: the main road's two arms, and
+ * the arms traffic arrives on. Ids are segments.
+ */
+export function priorityLayout(net: RoadNetwork, nodeId: Id): { main: Id[]; incoming: Id[]; arms: Id[] } {
+  const arms = roadArms(net, nodeId);
+  const incoming = incomingArms(net, arms).map((a) => a.segmentId);
+  if (arms.length < 2) return { main: arms.map((a) => a.segmentId), incoming, arms: arms.map((a) => a.segmentId) };
+  const computed = computedSigns(net, arms);
+  const main = arms.filter((a) => computed[a.segmentId] === 'priority').map((a) => a.segmentId);
+  return { main, incoming, arms: arms.map((a) => a.segmentId) };
 }
 
 function incomingArms(net: RoadNetwork, arms: NodeArm[]): NodeArm[] {
@@ -225,15 +257,18 @@ function autoPicksSignal(net: RoadNetwork, arms: NodeArm[]): boolean {
  * What a node really does, resolving 'auto' from the road types. Signs are only
  * given for roads that arrive at the node.
  */
-export function effectiveControl(net: RoadNetwork, nodeId: Id): EffectiveControl {
+export function effectiveControl(net: RoadNetwork, nodeId: Id, control?: JunctionControl): EffectiveControl {
   const node = net.getNode(nodeId);
   const geom = net.nodeGeom(nodeId);
   if (!node || !geom) return { kind: 'none', signs: {}, signal: null, auto: true };
+  // `control` previews a change without applying it.
+  const ctl = control ?? node.control;
   // Track at a level crossing plays no part in who goes first on the road.
   const arms = geom.arms.filter((a) => net.roadTypeOf(a.segmentId).category !== 'rail');
-  const mode = node.control.mode;
+  const mode = ctl.mode;
   const auto = mode === 'auto';
-  const plan = (): SignalPlan => node.control.signal ?? defaultSignalPlan(net, nodeId, 'opposing');
+  const plan = (): SignalPlan => ctl.signal ?? defaultSignalPlan(net, nodeId, 'opposing');
+  const ring = arms.some((a) => isRing(net, a));
 
   if (mode === 'signal') return { kind: 'signal', signs: {}, signal: plan(), auto };
   if (mode === 'allStop') {
@@ -243,13 +278,17 @@ export function effectiveControl(net: RoadNetwork, nodeId: Id): EffectiveControl
   }
   if (arms.length < 3) {
     if (mode === 'auto') return { kind: 'none', signs: {}, signal: null, auto };
-  } else if (mode === 'auto') {
+  } else if (mode === 'auto' && !ring) {
     if (isFreeFlow(net, arms)) return { kind: 'none', signs: {}, signal: null, auto };
+    // Controlled access: every move off or onto a highway is a merge or diverge.
+    if (isControlledAccess(arms.map((a) => ({ category: net.roadTypeOf(a.segmentId).category })))) {
+      return { kind: 'none', signs: {}, signal: null, auto };
+    }
     if (autoPicksSignal(net, arms)) return { kind: 'signal', signs: {}, signal: plan(), auto };
   }
 
   const incoming = new Set(incomingArms(net, arms).map((a) => a.segmentId));
-  const manual = node.control.signs;
+  const manual = ctl.signs;
   const useManual = !auto && Object.keys(manual).length > 0;
   const all = useManual ? manual : arms.length >= 2 ? computedSigns(net, arms) : {};
   const signs: Record<number, SignKind> = {};

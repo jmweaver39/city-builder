@@ -166,9 +166,7 @@ export class Simulation implements SimApi, ArrivalSink {
     this.graphDirty = false;
     const w = this.world;
     if (this.resetDirty) {
-      this.resetDirty = false;
       this.reset();
-      this.rebuild(true);
       return true;
     }
     const version = this.net.laneGraph.version;
@@ -387,13 +385,20 @@ export class Simulation implements SimApi, ArrivalSink {
     this._time = 0;
     this.accumulator = 0;
     this._alpha = 0;
-    const w = this.createWorld(old.g, old.veh, new Rng(this.seed), null);
+    // The network may have moved on since the last step, as after load(): everything
+    // below reads it, so it must be read against the graph it has now.
+    const g = this.net.laneGraph.version === old.g.version ? old.g : compileGraph(this.net, this.sweepCache);
+    this.graphDirty = false;
+    this.placesDirty = false;
+    this.resetDirty = false;
+    const w = this.createWorld(g, old.veh, new Rng(this.seed), null);
     this.world = w;
     w.routes.setPlaces(collectPlaces(this.net, w.g));
     this.spawner = new Spawner();
     this.spawner.setPlaces(w, w.routes.places, []);
     w.bk.build(w.g, w.veh);
     this.updateRefreshPace();
+    if (g !== old.g) this.resizeSegments(old.g, g);
     this.segCount.fill(0);
     this.segSpeed.fill(1);
     this.segEnterNow.fill(0);
@@ -474,6 +479,8 @@ export class Simulation implements SimApi, ArrivalSink {
   }
 
   blockConflict(lane: number, blocked: boolean): void {
+    // The caller's index is into the network's graph as it is now.
+    this.sync();
     const w = this.world;
     const key = w.g.graph.lanes[lane]?.key;
     if (key === undefined) return;

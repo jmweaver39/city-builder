@@ -152,6 +152,8 @@ export const SURF_SCHEMA: AttrSpec[] = [
   { name: 'aExt', size: 3 },
   // Across and along the road in metres. For asphalt, across is from the lane centre.
   { name: 'aRoad', size: 2 },
+  // Surface detail hints, read by the surface shader per kind (see roads.ts, SURF_HINTS).
+  { name: 'aSurf', size: 4 },
 ];
 
 type RGBLike = readonly [number, number, number];
@@ -170,10 +172,16 @@ export class SurfBuf {
   col: number[] = [];
   ext: number[] = [];
   road: number[] = [];
+  hint: number[] = [];
   idx: number[] = [];
   /** Road coordinates given to the next vertices. */
   ru = 0;
   rv = 0;
+  /** Surface hints given to the next vertices (aSurf). Zero means none. */
+  hx = 0;
+  hy = 0;
+  hz = 0;
+  hw = 0;
 
   get vertexCount(): number {
     return this.pos.length / 3;
@@ -186,6 +194,7 @@ export class SurfBuf {
     this.col.push(s.color[0], s.color[1], s.color[2]);
     this.ext.push(s.kind, s.slot, s.bias);
     this.road.push(this.ru, this.rv);
+    this.hint.push(this.hx, this.hy, this.hz, this.hw);
     return i;
   }
 
@@ -301,7 +310,7 @@ export class SurfBuf {
     }
     const m = Math.ceil(n / Math.max(1, n >> 6));
     return {
-      attrs: [new Float32Array(this.pos), new Float32Array(this.nor), new Float32Array(this.col), new Float32Array(this.ext), new Float32Array(this.road)],
+      attrs: [new Float32Array(this.pos), new Float32Array(this.nor), new Float32Array(this.col), new Float32Array(this.ext), new Float32Array(this.road), new Float32Array(this.hint)],
       index: new Uint32Array(this.idx),
       vertexCount: n,
       cx: sx / m,

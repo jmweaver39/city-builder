@@ -2,6 +2,7 @@
  * Holds the tools and routes input to the active one. One tool is active at a
  * time. Esc leaves a tool for Inspect. A right click that did not drag steps back.
  */
+import { MarkingTool } from './MarkingTool';
 import type { NetworkChange, RoadNetwork } from '../core/RoadNetwork';
 import type { ToolMark } from '../render/api';
 import type { SimApi } from '../sim/api';
@@ -22,6 +23,7 @@ import { SelectTool } from './SelectTool';
 import { TemplateTool } from './TemplateTool';
 import { Tool } from './Tool';
 import { TrafficTool } from './TrafficTool';
+import { TrafficRulesTool } from './TrafficRulesTool';
 import { ZoneTool } from './ZoneTool';
 import { GridAlignTool } from './GridAlignTool';
 import { ParallelTool } from './ParallelTool';
@@ -93,6 +95,8 @@ export class ToolManager {
       inspect: (target) => this.options.inspect?.(target),
       changed: () => this.notify(),
     };
+    // Paint and junction markings are one Markings tool (MarkingTool.ts); both ids reach it.
+    const markings = new MarkingTool(this.ctx);
     this.tools = {
       select: new SelectTool(this.ctx),
       road: new RoadTool(this.ctx),
@@ -101,10 +105,10 @@ export class ToolManager {
       junction: new JunctionTool(this.ctx),
       roundabout: new RoundaboutTool(this.ctx),
       lanes: new LaneTool(this.ctx),
-      paint: new PaintTool(this.ctx),
+      paint: markings,
       traffic: new TrafficTool(this.ctx),
       template: new TemplateTool(this.ctx),
-      nodeMarkings: new NodeMarkingTool(this.ctx),
+      nodeMarkings: markings,
       junctionShape: new JunctionShapeTool(this.ctx),
       reverse: new ReverseTool(this.ctx),
       parallel: new ParallelTool(this.ctx),
@@ -115,6 +119,7 @@ export class ToolManager {
       electrify: new ElectrifyTool(this.ctx),
       quay: new QuayTool(this.ctx),
       terrain: new TerrainTool(this.ctx),
+      trafficRules: new TrafficRulesTool(this.ctx),
     };
     (this.tools.gridAlign as GridAlignTool).onDone = () => this.setTool(this.beforeAlign);
     this.current = this.tools.select;
@@ -153,16 +158,23 @@ export class ToolManager {
     return this.tools.road as RoadTool;
   }
 
+  /** The along-road part of the Markings tool. */
   get paint(): PaintTool {
-    return this.tools.paint as PaintTool;
+    return (this.tools.paint as MarkingTool).paint;
+  }
+
+  /** The Markings tool: along roads and at junctions. */
+  get markings(): MarkingTool {
+    return this.tools.paint as MarkingTool;
   }
 
   get lanes(): LaneTool {
     return this.tools.lanes as LaneTool;
   }
 
+  /** The junction-design part of the Markings tool. */
   get nodeMarkings(): NodeMarkingTool {
-    return this.tools.nodeMarkings as NodeMarkingTool;
+    return (this.tools.paint as MarkingTool).node;
   }
 
   get junctionShape(): JunctionShapeTool {
@@ -177,6 +189,10 @@ export class ToolManager {
     return this.tools.roundabout as RoundaboutTool;
   }
 
+  get trafficRules(): TrafficRulesTool {
+    return this.tools.trafficRules as TrafficRulesTool;
+  }
+
   get junction(): JunctionTool {
     return this.tools.junction as JunctionTool;
   }
@@ -186,6 +202,8 @@ export class ToolManager {
   }
 
   setTool(id: ToolId): void {
+    // Junction markings are part of the one Markings tool.
+    if (id === 'nodeMarkings') id = 'paint';
     if (this.current.id === id) {
       this.current.settingsChanged();
       this.notify();

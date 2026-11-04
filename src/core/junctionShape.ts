@@ -12,7 +12,7 @@
  */
 import type { ArmLayout } from './junction';
 import type { ConnectorProto } from './connectors';
-import type { Cubic } from './bezier';
+import { cubicPoint, type Cubic } from './bezier';
 import type { RoadNetwork } from './RoadNetwork';
 import type {
   Id,
@@ -62,7 +62,12 @@ export const ISLAND_DEFAULT_BACK = 6;
 export const EDGE_HOLD = 1.5;
 export const EDGE_TAPER = 6;
 /** Visible road that must be left after an arm trim. */
-const MIN_VISIBLE = 2;
+export const MIN_VISIBLE = 2;
+/** Range of the whole-junction size factor on the automatic trims. */
+export const SCALE_MIN = 0.2;
+export const SCALE_MAX = 4;
+/** An arm trim may run out to its road's length less this. */
+const TRIM_KEEP = MIN_VISIBLE;
 
 export const snapTo = (v: number, step: number): number => Math.round(v / step) * step;
 
@@ -127,11 +132,12 @@ export function normaliseShape(shape: JunctionShape | null | undefined): Junctio
       reach: Math.max(0, Number.isFinite(i.reach) ? i.reach : 0),
     }));
   }
+  if (shape.scale !== undefined && Number.isFinite(shape.scale) && Math.abs(shape.scale - 1) > 1e-6) out.scale = clamp(shape.scale, SCALE_MIN, SCALE_MAX);
   return Object.keys(out).length ? out : undefined;
 }
 
 export function hasShape(shape: JunctionShape | null | undefined): boolean {
-  return !!shape && !!(shape.corners || shape.arms || shape.islands?.length);
+  return !!shape && !!(shape.corners || shape.arms || shape.islands?.length || (shape.scale !== undefined && shape.scale !== 1));
 }
 
 /** Carry the shape over when a road at the node changes id, as in a split. */
@@ -368,9 +374,15 @@ export function applyShapeTrims(
   maxTrim: number,
 ): void {
   const n = arms.length;
+  const scale = shape.scale ?? 1;
+  // Up to most of the road: past MAX_TRIM if the road is long enough. finalizeTrims still
+  // shares a road between its two ends, and validation refuses a trim that leaves no road.
+  const most = (arm: ArmLayout) => Math.max(minTrim, arm.source.curve.length - TRIM_KEEP);
+  void maxTrim;
   for (const arm of arms) {
-    const delta = shape.arms?.[arm.segmentId]?.trim;
-    if (delta) arm.rawTrim = clamp(arm.rawTrim + delta, minTrim, maxTrim);
+    arm.autoTrim = arm.rawTrim;
+    const delta = shape.arms?.[arm.segmentId]?.trim ?? 0;
+    if (delta || scale !== 1) arm.rawTrim = clamp(arm.rawTrim * scale + delta, minTrim, most(arm));
   }
   if (!shape.corners || n < 2) return;
   for (let i = 0; i < n; i++) {
@@ -385,8 +397,8 @@ export function applyShapeTrims(
     const hit = kerbMeet(i, j, wi, wj);
     if (!hit) continue;
     const t = c.radius / Math.tan(theta / 2) + 0.3;
-    arms[i].rawTrim = clamp(Math.max(arms[i].rawTrim, hit.sa + t), 0, maxTrim);
-    arms[j].rawTrim = clamp(Math.max(arms[j].rawTrim, hit.sb + t), 0, maxTrim);
+    arms[i].rawTrim = clamp(Math.max(arms[i].rawTrim, hit.sa + t), 0, most(arms[i]));
+    arms[j].rawTrim = clamp(Math.max(arms[j].rawTrim, hit.sb + t), 0, most(arms[j]));
   }
 }
 
@@ -829,7 +841,7 @@ function slopeOf(v: Vec3): number {
 }
 
 /** A connector curve with handles k times the distance to where the lane lines meet: larger swings wider. */
-export function swungCubic(from: { pos: Vec3; tan: Vec3 }, to: { pos: Vec3; tan: Vec3 }, k: number): Cubic | null {
+export function swungCubic(from: { pos: Vec3; tan: Vec3 }, to: { pos: Vec3; tan: Vec3 }, k: number, k3 = k): Cubic | null {
   const d0 = normalizeXZ(from.tan);
   const d3 = normalizeXZ(to.tan);
   const denom = crossXZ(d0, d3);
@@ -841,7 +853,7 @@ export function swungCubic(from: { pos: Vec3; tan: Vec3 }, to: { pos: Vec3; tan:
   const v = (d0.x * dz - dx * d0.z) / denom;
   if (!(u > 0 && v > 0)) return null;
   const h0 = k * u;
-  const h3 = k * v;
+  const h3 = k3 * v;
   const p0 = from.pos;
   const p3 = to.pos;
   return {
@@ -850,6 +862,14 @@ export function swungCubic(from: { pos: Vec3; tan: Vec3 }, to: { pos: Vec3; tan:
     p2: { x: p3.x - d3.x * h3, y: p3.y - slopeOf(to.tan) * h3, z: p3.z - d3.z * h3 },
     p3,
   };
+}
+
+/** How far a connector's first and last sampled chords turn from its lanes, in radians. */
+function endKink(c: Cubic, t0: Vec3, t3: Vec3): number {
+  const a = cubicPoint(c, 0.015);
+  const b = cubicPoint(c, 0.985);
+  const ang = (d: Vec3, e: Vec3) => Math.abs(Math.atan2(crossXZ(d, e), dotXZ(d, e)));
+  return Math.max(ang(normalizeXZ(t0), normalizeXZ({ x: a.x - c.p0.x, y: 0, z: a.z - c.p0.z })), ang(normalizeXZ(t3), normalizeXZ({ x: c.p3.x - b.x, y: 0, z: c.p3.z - b.z })));
 }
 
 /**
@@ -862,7 +882,11 @@ export function kerbFitter(
   shape: JunctionShape | undefined,
 ): ((link: { from: { pos: Vec3; tan: Vec3 }; to: { pos: Vec3; tan: Vec3 } }, build: (cubic?: Cubic) => ConnectorProto | null) => ConnectorProto | null) | null {
   if (!shape || geom.kind !== 'junction') return null;
-  const moved = Object.values(shape.corners ?? {}).some((c) => c.radius !== undefined || c.kerb) || Object.values(shape.arms ?? {}).some((a) => a.edgeLeft || a.edgeRight);
+  // Moved kerbs, and moved cut lines: a long arm makes the usual curve cut the corner.
+  const moved =
+    Object.values(shape.corners ?? {}).some((c) => c.radius !== undefined || c.kerb || c.sidewalk === false) ||
+    Object.values(shape.arms ?? {}).some((a) => a.edgeLeft || a.edgeRight || a.trim) ||
+    (shape.scale ?? 1) !== 1;
   if (!moved) return null;
   const scene = sceneOf(geom, []);
   if (!scene.kerbs.length) return null;
@@ -873,9 +897,17 @@ export function kerbFitter(
     const need = clearanceNeed(c.width);
     let bestClear = clearanceIn(scene, c.poly.pts, c.poly.cum, c.poly.length);
     if (bestClear >= need) return c;
-    for (const k of [0.75, 0.9, 1.05, 1.2, 1.35]) {
-      const cubic = swungCubic(link.from, link.to, k);
-      if (!cubic) break;
+    // Candidate curves, the ones that meet their lanes most smoothly first.
+    const ks = [0.6, 0.8, 1, 1.2, 1.5, 2];
+    const cands: { cubic: Cubic; kink: number }[] = [];
+    for (const k0 of ks) {
+      for (const k3 of ks) {
+        const cubic = swungCubic(link.from, link.to, k0, k3);
+        if (cubic) cands.push({ cubic, kink: endKink(cubic, link.from.tan, link.to.tan) });
+      }
+    }
+    cands.sort((a, b) => a.kink - b.kink);
+    for (const { cubic } of cands.slice(0, 12)) {
       const alt = build(cubic);
       if (!alt) continue;
       const clear = clearanceIn(scene, alt.poly.pts, alt.poly.cum, alt.poly.length);
@@ -1066,7 +1098,7 @@ function spareWidths(def: RoadTypeDef, overrides: SegmentOverrides | undefined, 
 export function armInfos(net: RoadNetwork, nodeId: Id): ArmInfo[] {
   const geom = net.nodeGeom(nodeId);
   const node = net.getNode(nodeId);
-  if (!geom || !node || geom.kind !== 'junction') return [];
+  if (!geom || !node || (geom.kind !== 'junction' && geom.kind !== 'deadEnd')) return [];
   return geom.arms.map((arm) => {
     const seg = net.getSegment(arm.segmentId)!;
     const def = net.roadTypeOf(arm.segmentId);
@@ -1092,6 +1124,110 @@ export function armInfos(net: RoadNetwork, nodeId: Id): ArmInfo[] {
 }
 
 // ---------------------------------------------------------------------------
+// Arm lengths: how far each arm's cut line sits from the node
+// ---------------------------------------------------------------------------
+
+export interface TrimLimits {
+  /** Length now, the automatic one, and the range it can take. */
+  now: number;
+  auto: number;
+  min: number;
+  max: number;
+}
+
+/**
+ * How short and how long one arm's part of a node can be. The minimum is where its
+ * carriageway edges stop overlapping the neighbouring arms' (plus a little), so the
+ * lanes still meet the junction surface cleanly; the maximum leaves 2 m of road
+ * after the far end's own trim.
+ */
+export function armTrimLimits(net: RoadNetwork, nodeId: Id, segId: Id): TrimLimits | null {
+  const geom = net.nodeGeom(nodeId);
+  const g = net.segmentGeom(segId);
+  if (!geom || !g || (geom.kind !== 'junction' && geom.kind !== 'deadEnd')) return null;
+  const i = geom.arms.findIndex((a) => a.segmentId === segId);
+  if (i < 0) return null;
+  const arm = geom.arms[i];
+  const now = arm.trim;
+  let min = geom.kind === 'deadEnd' ? 0 : 1;
+  const n = geom.arms.length;
+  if (geom.kind === 'junction' && n >= 2) {
+    const next = geom.arms[(i + 1) % n];
+    const prev = geom.arms[(i - 1 + n) % n];
+    const left = meet({ p: kerbLeftOf(arm), dir: arm.cutDir }, { p: kerbRightOf(next), dir: next.cutDir });
+    if (left && openingOf({ p: arm.leftEdge, dir: arm.cutDir }, { p: next.rightEdge, dir: next.cutDir }) < Math.PI - 0.05) min = Math.max(min, now - left.u + 0.3);
+    const right = meet({ p: kerbLeftOf(prev), dir: prev.cutDir }, { p: kerbRightOf(arm), dir: arm.cutDir });
+    if (right && openingOf({ p: prev.leftEdge, dir: prev.cutDir }, { p: arm.rightEdge, dir: arm.cutDir }) < Math.PI - 0.05) min = Math.max(min, now - right.v + 0.3);
+  }
+  const far = arm.atStart ? g.trimB : g.trimA;
+  const max = Math.max(min, g.fullLength - far - MIN_VISIBLE);
+  return { now, auto: arm.autoTrim ?? now, min, max };
+}
+
+/** The length a shape asks of one arm, before any corner radius pushes it out. */
+function trimWanted(lim: TrimLimits, shape: JunctionShape, segId: Id): number {
+  return lim.auto * (shape.scale ?? 1) + (shape.arms?.[segId]?.trim ?? 0);
+}
+
+/** Shape with one arm set to `length` metres from the node, snapped to TRIM_STEP. */
+export function withArmLength(net: RoadNetwork, nodeId: Id, shape: JunctionShape, segId: Id, length: number): JunctionShape {
+  const lim = armTrimLimits(net, nodeId, segId);
+  if (!lim) return shape;
+  const delta = snapTo(length, TRIM_STEP) - lim.auto * (shape.scale ?? 1);
+  return withArm(shape, segId, { trim: Math.abs(delta) > 1e-6 ? delta : undefined });
+}
+
+/** Shape with every arm's automatic length scaled, keeping each arm's own change. */
+export function withScale(shape: JunctionShape, scale: number): JunctionShape {
+  const s = structuredClone(shape);
+  s.scale = Math.round(clamp(scale, SCALE_MIN, SCALE_MAX) * 100) / 100;
+  return normaliseShape(s) ?? {};
+}
+
+/**
+ * The tightest node that still works: each arm at its minimum length, nudged out
+ * 0.5 m at a time where traffic would still hit a kerb. Applies it and says how it went.
+ */
+export function applyShortestShape(net: RoadNetwork, nodeId: Id): ShapeAttempt {
+  const geom = net.nodeGeom(nodeId);
+  if (!geom || (geom.kind !== 'junction' && geom.kind !== 'deadEnd')) {
+    return { ok: false, problems: [{ code: 'noRoom', message: 'Only a junction or dead end has arms to shorten.', target: { kind: 'node' } }] };
+  }
+  const base = structuredClone(net.getNode(nodeId)?.control.shape ?? {});
+  delete base.scale;
+  const lims = new Map<Id, TrimLimits>();
+  for (const arm of geom.arms) {
+    const lim = armTrimLimits(net, nodeId, arm.segmentId);
+    if (lim) lims.set(arm.segmentId, lim);
+  }
+  const lengths = new Map<Id, number>();
+  for (const [id, lim] of lims) lengths.set(id, Math.ceil(lim.min / TRIM_STEP) * TRIM_STEP);
+  let last: ShapeAttempt = { ok: false, problems: [] };
+  for (let tries = 0; tries < 40; tries++) {
+    let shape: JunctionShape = base;
+    for (const [id, len] of lengths) {
+      const delta = len - lims.get(id)!.auto;
+      shape = withArm(shape, id, { trim: Math.abs(delta) > 1e-6 ? delta : undefined });
+    }
+    last = applyJunctionShape(net, nodeId, shape);
+    if (last.ok) return last;
+    // Lengthen the arm named, or every arm when the problem is the whole node.
+    const t = last.problems[0]?.target;
+    const ids = t?.kind === 'arm' ? [t.segmentId] : t?.kind === 'corner' ? (parseCornerKey(t.key) ?? []) : [...lengths.keys()];
+    let grew = false;
+    for (const id of ids) {
+      const lim = lims.get(id);
+      const len = lengths.get(id);
+      if (lim === undefined || len === undefined || len + TRIM_STEP > lim.max) continue;
+      lengths.set(id, len + TRIM_STEP);
+      grew = true;
+    }
+    if (!grew) break;
+  }
+  return last;
+}
+
+// ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
@@ -1113,10 +1249,25 @@ export function shapeParamProblems(net: RoadNetwork, nodeId: Id, shape: Junction
   const node = net.getNode(nodeId);
   const geom = net.nodeGeom(nodeId);
   if (!node || !geom || !shape) return out;
-  if (geom.kind !== 'junction' && hasShape(shape)) {
-    out.push({ code: 'noRoom', message: 'Only a junction has a shape to edit.', target: { kind: 'node' } });
+  const deadEndTrimOnly = geom.kind === 'deadEnd' && !shape.corners && !shape.islands?.length && Object.values(shape.arms ?? {}).every((a) => !a.edgeLeft && !a.edgeRight);
+  if (geom.kind !== 'junction' && hasShape(shape) && !deadEndTrimOnly) {
+    out.push({ code: 'noRoom', message: geom.kind === 'deadEnd' ? 'A dead end only has its end to move.' : 'Only a junction has a shape to edit.', target: { kind: 'node' } });
     return out;
   }
+  // Arm lengths, from where the lanes would overlap the next road to most of the road.
+  for (const arm of geom.arms) {
+    // Only arms this shape lengthens or shortens: a short road may already sit outside the range.
+    if (!shape.arms?.[arm.segmentId]?.trim && (shape.scale ?? 1) === 1) continue;
+    const lim = armTrimLimits(net, nodeId, arm.segmentId);
+    if (!lim) continue;
+    const want = trimWanted(lim, shape, arm.segmentId);
+    if (want < lim.min - 0.05) {
+      out.push({ code: 'tooTight', message: `Too short: under ${lim.min.toFixed(1)} m the lanes would overlap the next road.`, target: { kind: 'arm', segmentId: arm.segmentId } });
+    } else if (want > lim.max + 0.05) {
+      out.push({ code: 'tooShort', message: `Too long: over ${lim.max.toFixed(1)} m there would be no road left.`, target: { kind: 'arm', segmentId: arm.segmentId } });
+    }
+  }
+  if (out.length) return out;
   const arms = armInfos(net, nodeId);
   for (const a of arms) {
     const s = shape.arms?.[a.segmentId];
@@ -1221,7 +1372,13 @@ export function shapeResultProblems(
   const out: ShapeProblem[] = [];
   const geom = net.nodeGeom(nodeId);
   const node = net.getNode(nodeId);
-  if (!geom || !node || geom.kind !== 'junction') return out;
+  if (!geom || !node) return out;
+  if (geom.kind === 'deadEnd') {
+    const g = net.segmentGeom(geom.arms[0]?.segmentId ?? -1);
+    if (g && g.length < MIN_VISIBLE) out.push({ code: 'tooShort', message: 'Not enough road would be left.', target: { kind: 'arm', segmentId: g.segmentId } });
+    return out;
+  }
+  if (geom.kind !== 'junction') return out;
   if (geom.outlineSimplified && !before.simplified) {
     out.push({ code: 'folds', message: 'The junction outline would fold over itself.', target: { kind: 'node' } });
   }
@@ -1229,7 +1386,7 @@ export function shapeResultProblems(
     const missing = nearestIndex(geom.outline, kerbLeftOf(arm)) < 0 || nearestIndex(geom.outline, kerbRightOf(arm)) < 0;
     if (missing && !before.simplified) out.push({ code: 'tooTight', message: 'Too tight: the roads would overlap.', target: { kind: 'arm', segmentId: arm.segmentId } });
     const g = net.segmentGeom(arm.segmentId);
-    if (g && g.length < MIN_VISIBLE && node.control.shape?.arms?.[arm.segmentId]?.trim) {
+    if (g && g.length < MIN_VISIBLE && (node.control.shape?.arms?.[arm.segmentId]?.trim || node.control.shape?.scale)) {
       out.push({ code: 'tooShort', message: 'Not enough road would be left.', target: { kind: 'arm', segmentId: arm.segmentId } });
     }
   }

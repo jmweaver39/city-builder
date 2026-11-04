@@ -6,6 +6,7 @@
 import type { Cubic } from '../core/bezier';
 import type { Id, Vec3 } from '../core/types';
 import type { QualityName } from './quality';
+import type { RoadDetailName, RoadDetailPref } from './roadDetail';
 
 export type OverlayMode = 'none' | 'traffic' | 'speedLimit' | 'lanes' | 'roadType';
 
@@ -29,7 +30,13 @@ export type ToolMark =
   | { kind: 'ring'; pos: Vec3; color: string; radius: number; px?: number }
   | { kind: 'line'; points: Vec3[]; color: string; width: number; dashed?: boolean }
   /** Text label anchored at a world position. */
-  | { kind: 'label'; pos: Vec3; text: string; color?: string };
+  | { kind: 'label'; pos: Vec3; text: string; color?: string }
+  /**
+   * A small picture centred on a world position, kept the same size on screen: an
+   * SVG string (tools/trafficArt.ts). `dim` draws it faded, `ring` outlines it in
+   * that colour (hover), `size` is pixels (default 26).
+   */
+  | { kind: 'icon'; pos: Vec3; svg: string; size?: number; dim?: boolean; ring?: string };
 
 /** A region about to be zoned, drawn as a tinted area. */
 export interface ZoneGhost {
@@ -74,6 +81,8 @@ export interface RendererApi {
   getUnderground?(): boolean;
   /** Vehicle id under the cursor, or null. */
   pickVehicle(clientX: number, clientY: number): number | null;
+  /** A marking preview drawn by the game's own renderer, as an image URL (render/swatch.ts). */
+  paintSwatch?(subject: import('./swatch').SwatchSubject, w: number, h: number): string | null;
   /** Project a world point to client coordinates, null when behind the camera. */
   project(pos: Vec3): { x: number; y: number } | null;
 
@@ -118,6 +127,11 @@ export interface RendererExtras {
   isCameraDragging(): boolean;
   /** Right button pressed and released in about the same spot. Returns an unsubscribe. */
   onRightClick(fn: (clientX: number, clientY: number, event: PointerEvent) => void): () => void;
+  /**
+   * Middle button pressed and released in about the same spot (under 5 px), or the
+   * same with Option and the left button, for trackpads. A drag still orbits. Optional.
+   */
+  onMiddleClick?(fn: (clientX: number, clientY: number, event: PointerEvent) => void): () => void;
   /** Told when the WebGL context is lost (true) and restored (false). Returns an unsubscribe. */
   onContextChange(fn: (lost: boolean) => void): () => void;
   /** Render at a fraction of full resolution, 0.5 to 1. For weak GPUs. */
@@ -127,6 +141,12 @@ export interface RendererExtras {
   getQuality(): QualityName;
   /** Lower quality automatically when frames run long. On by default. */
   setAutoQuality(on: boolean): void;
+  /** Road surface detail, or 'auto' to follow the quality level. Applies live and is remembered. */
+  setRoadDetail(pref: RoadDetailPref): void;
+  /** The road detail choice and the level drawn now (the governor may hold it lower). */
+  getRoadDetail(): { pref: RoadDetailPref; level: RoadDetailName };
+  /** Told when the road detail drawn or chosen changes. Returns an unsubscribe. */
+  onRoadDetailChange(fn: (level: RoadDetailName, pref: RoadDetailPref) => void): () => void;
   /** Q and E turn the camera only while this is on (off while a tool uses them for elevation). Alt+Q/E always turns. */
   setCameraRotateKeys(on: boolean): void;
   /** Show the drawing grid on the ground around a point. Null hides it. */

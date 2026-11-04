@@ -8,13 +8,16 @@ import type { Id, RoadTypeDef, Station, Vec3 } from '../core/types';
 import { terrainHeight } from '../core/terrain';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { buildSegmentCurve, buildSegmentGeom } from '../core/geometry';
-import { effectiveSpeedKmh, totalHalfWidth } from '../core/roadTypes';
+import { effectiveSpeedKmh, laneSpeedKmh, totalHalfWidth } from '../core/roadTypes';
 import type { SimApi } from '../sim/api';
 import type { DraftState, HighlightSet, OverlayMode, RoadPreview, ToolMark } from './api';
 import { PaintBuf } from './batch';
 import { arrowShape, placeStamp } from './markings';
 import { hexRGB, ROAD_LIFT } from './constants';
 import { lineWidth, markRadius, metresPerPixelAt, ringThickness } from './markScale';
+import { buildFrames } from './frames';
+import { planSupports } from './piers';
+import { groundFn } from '../core/terrainMods';
 import { SLOT_COLS, type Shared } from './materials';
 
 const ARROW_STEP = 22;
@@ -143,7 +146,10 @@ export class OverlayPainter {
           break;
         }
         case 'speedLimit': {
-          const kmh = effectiveSpeedKmh(def, seg.overrides);
+          // Lane limits set by hand (Junction > Rules) show as the fastest of them.
+          const kmh = seg.overrides.laneSpeeds
+            ? Math.max(...def.lanes.map((_, i) => laneSpeedKmh(def, seg.overrides, i)))
+            : effectiveSpeedKmh(def, seg.overrides);
           const band = SPEED_BANDS.find(([limit]) => kmh <= limit)!;
           const c = hexRGB(band[1]);
           col[0] = c[0];
@@ -314,7 +320,7 @@ export class ToolLayer {
   private ghosts = new OverlayMesh(this.group, this.material, 20);
   private marks = new OverlayMesh(this.group, this.material, 21);
   private labelRoot: HTMLDivElement;
-  private labels: { el: HTMLDivElement; pos: Vec3 }[] = [];
+  private labels: { el: HTMLDivElement; pos: Vec3; centre?: boolean }[] = [];
   private pool: HTMLDivElement[] = [];
 
   constructor(
@@ -359,7 +365,7 @@ export class ToolLayer {
         m.idx.push(v, v + 1, v + 3, v, v + 3, v + 2);
       }
     };
-    this.heightCues(m, st, W, c);
+    this.heightCues(m, st, W, c, def);
     band(-W, W, 0.28);
     band(-W, -W + 0.25, 0.9);
     band(W - 0.25, W, 0.9);
@@ -404,7 +410,7 @@ export class ToolLayer {
    * ground footprint, deck sides and pillars for raised stretches, and shafts up
    * to the surface for sunken ones. Drawn before the deck so the deck sits on top.
    */
-  private heightCues(m: OverlayMesh, st: Station[], W: number, c: THREE.Color): void {
+  private heightCues(m: OverlayMesh, st: Station[], W: number, c: THREE.Color, def?: RoadTypeDef): void {
     const ground = st.map((s) => terrainHeight(s.pos.x, s.pos.z));
     const lift = st.map((s, i) => s.pos.y - ground[i]);
     if (!lift.some((h) => Math.abs(h) > 1)) return;
@@ -436,31 +442,59 @@ export class ToolLayer {
         quad([ax, a.pos.y, az, bx, b.pos.y, bz, bx, b.pos.y - deck, bz, ax, a.pos.y - deck, az], side, 0.4);
       }
     }
+    // Shafts up to the surface from sunken stretches.
     const spacing = 32;
-    const offsets = W > 8 ? [-W * 0.5, W * 0.5] : [0];
     let next = spacing / 2;
     for (let i = 0; i < st.length; i++) {
       const s = st[i];
       if (s.s < next) continue;
       next = s.s + spacing;
-      const h = lift[i];
-      if (Math.abs(h) < 1.5) continue;
-      const top = h > 0 ? s.pos.y - deck : ground[i];
-      const bottom = h > 0 ? ground[i] : s.pos.y;
-      const half = h > 0 ? 0.7 : 0.25;
-      for (const o of offsets) {
-        const x = s.pos.x + s.right.x * o;
-        const z = s.pos.z + s.right.z * o;
-        for (const [dx, dz] of [[s.right.x, s.right.z], [s.tangent.x, s.tangent.z]]) {
-          quad([x - dx * half, bottom, z - dz * half, x + dx * half, bottom, z + dz * half, x + dx * half, top, z + dz * half, x - dx * half, top, z - dz * half], side, h > 0 ? 0.5 : 0.35);
-        }
+      if (lift[i] > -1.5) continue;
+      const half = 0.25;
+      for (const [dx, dz] of [[s.right.x, s.right.z], [s.tangent.x, s.tangent.z]]) {
+        quad([s.pos.x - dx * half, s.pos.y, s.pos.z - dz * half, s.pos.x + dx * half, s.pos.y, s.pos.z + dz * half, s.pos.x + dx * half, ground[i], s.pos.z + dz * half, s.pos.x - dx * half, ground[i], s.pos.z - dz * half], side, 0.35);
       }
+    }
+    // Piers where the planner will really put them (piers.ts): columns, caps and portal frames.
+    if (!def || !lift.some((h) => h > 1.5)) return;
+    const frames = buildFrames(st, [], groundFn(this.net));
+    const plan = planSupports(this.net, { frames, def, self: null });
+    const box = (x: number, z: number, y0: number, y1: number, ux: number, uz: number, hu: number, hv: number, col: THREE.Color, a: number) => {
+      const vx = -uz;
+      const vz = ux;
+      for (const [px, pz, qx, qz] of [
+        [-hu, -hv, hu, -hv],
+        [hu, -hv, hu, hv],
+        [hu, hv, -hu, hv],
+        [-hu, hv, -hu, -hv],
+      ]) {
+        const ax = x + ux * px + vx * pz;
+        const az = z + uz * px + vz * pz;
+        const bx = x + ux * qx + vx * qz;
+        const bz = z + uz * qx + vz * qz;
+        quad([ax, y0, az, bx, y0, bz, bx, y1, bz, ax, y1, az], col, a);
+      }
+    };
+    for (const p of plan.piers) {
+      const f = p.f;
+      const soffit = f.y - ROAD_LIFT - deck;
+      const capBottom = soffit - p.capDepth;
+      if (p.capDepth > 0 || p.kind === 'portal') {
+        const mid = (p.capL + p.capR) / 2;
+        box(f.x + f.rx * mid, f.z + f.rz * mid, p.capDepth > 0 ? capBottom : soffit - 0.8, soffit, f.rx, f.rz, (p.capR - p.capL) / 2, p.capThick, side, 0.45);
+      }
+      for (const c of p.columns) box(c.x, c.z, c.ground + 0.1, capBottom, f.rx, f.rz, c.rc + c.stretch, c.rc, side, 0.55);
+      // The column's footprint on the ground, so it reads against what is below.
+      for (const c of p.columns) box(c.x, c.z, c.ground + 0.12, c.ground + 0.2, f.rx, f.rz, c.r, c.r, shadow, 0.5);
     }
   }
 
   setMarks(marks: ToolMark[]): void {
     this.clearLabels();
-    for (const mark of marks) if (mark.kind === 'label') this.addLabel(mark.pos, mark.text, mark.color);
+    for (const mark of marks) {
+      if (mark.kind === 'label') this.addLabel(mark.pos, mark.text, mark.color);
+      else if (mark.kind === 'icon') this.addIcon(mark);
+    }
     this.markList = marks;
     this.buildMarks();
   }
@@ -526,6 +560,7 @@ export class ToolLayer {
           break;
         }
         case 'label':
+        case 'icon':
           break;
       }
     }
@@ -578,6 +613,21 @@ export class ToolLayer {
     this.labels.push({ el, pos });
   }
 
+  /** A picture mark (traffic rule icons): an SVG centred on its position. */
+  private addIcon(mark: Extract<ToolMark, { kind: 'icon' }>): void {
+    const el = this.pool.pop() ?? document.createElement('div');
+    const size = mark.size ?? 26;
+    el.innerHTML = mark.svg;
+    el.style.cssText =
+      `position:absolute;left:0;top:0;width:${size}px;height:${size}px;transform-origin:0 0;will-change:transform;` +
+      `opacity:${mark.dim ? 0.38 : 1};filter:drop-shadow(0 1px 2px rgba(0,0,0,.55));` +
+      (mark.ring ? `border-radius:50%;box-shadow:0 0 0 2px ${mark.ring};` : '');
+    const svg = el.firstElementChild as HTMLElement | null;
+    if (svg) svg.style.cssText = 'width:100%;height:100%;display:block;';
+    this.labelRoot.appendChild(el);
+    this.labels.push({ el, pos: mark.pos, centre: true });
+  }
+
   private clearLabels(): void {
     for (const l of this.labels) {
       l.el.remove();
@@ -602,7 +652,9 @@ export class ToolLayer {
         continue;
       }
       l.el.style.display = '';
-      l.el.style.transform = `translate(${Math.round(p.x - rect.left)}px,${Math.round(p.y - rect.top - 28)}px) translateX(-50%)`;
+      l.el.style.transform = l.centre
+        ? `translate(${Math.round(p.x - rect.left)}px,${Math.round(p.y - rect.top)}px) translate(-50%,-50%)`
+        : `translate(${Math.round(p.x - rect.left)}px,${Math.round(p.y - rect.top - 28)}px) translateX(-50%)`;
     }
   }
 

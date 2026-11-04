@@ -1,11 +1,11 @@
 /** Poisson sources and arrival counts per place. */
 import type { Id, VehicleMix } from '../core';
 import { ENTRY_REQUEST } from './buckets';
-import { ALLOW_BIKE, ALLOW_BUS, ALLOW_CAR, type CompiledGraph } from './compiled';
+import { ALLOW_BIKE, ALLOW_CAR, TYPE_BITS, type CompiledGraph } from './compiled';
 import { BIKE_SHARE, DT, SOURCE_QUEUE_CAP } from './constants';
 import { allocVehicle } from './vehicles';
 import type { LanePoint, Place, RouteTable } from './routing';
-import { TYPE_BIKE, TYPE_BUS, VEHICLE_PARAMS } from './vehicleTypes';
+import { TYPE_BIKE, TYPE_TRUCK, TYPE_VAN, VEHICLE_PARAMS } from './vehicleTypes';
 import type { World } from './world';
 
 export interface PlaceCounts {
@@ -176,14 +176,19 @@ export class Spawner {
     if (drawn === TYPE_BIKE) dest = this.pickDest(w, index, table, place.sources, bit);
     if (dest < 0) {
       type = drawn === TYPE_BIKE ? this.pickType(w, mix) : drawn;
-      bit = type === TYPE_BUS ? ALLOW_BUS : ALLOW_CAR;
-      if (!this.hasLane(g, place.sources, bit)) {
+      bit = TYPE_BITS[type];
+      if (this.hasLane(g, place.sources, bit)) {
+        table = routes.tableFor(type);
+        dest = this.pickDest(w, index, table, place.sources, bit);
+      }
+      // Kept off every lane here, or every way out, as a truck ban does: it comes as a car.
+      if (dest < 0 && (type === TYPE_VAN || type === TYPE_TRUCK)) {
         type = 0;
         bit = ALLOW_CAR;
         if (!this.hasLane(g, place.sources, bit)) return 'noRoute';
+        table = routes.car;
+        dest = this.pickDest(w, index, table, place.sources, bit);
       }
-      table = type === TYPE_BUS ? routes.bus : routes.car;
-      dest = this.pickDest(w, index, table, place.sources, bit);
       if (dest < 0) return 'noRoute';
     }
 

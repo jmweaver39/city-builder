@@ -5,6 +5,10 @@ import { clear, el, iconButton } from './dom';
 import { ICONS } from './icons';
 import { confirmDialog, modal } from './Panel';
 import { bindings, formatCombo, GESTURES, keyHint } from './keymap';
+import type { RendererExtras } from '../render/api';
+import { ROAD_DETAIL_LABEL, ROAD_DETAIL_ORDER, type RoadDetailPref } from '../render/roadDetail';
+
+type RoadDetailControl = Partial<Pick<RendererExtras, 'setRoadDetail' | 'getRoadDetail' | 'getQuality'>>;
 
 export class Menu {
   private closeFn: (() => void) | null = null;
@@ -64,6 +68,7 @@ export class Menu {
         }),
         item(ICONS.up, 'Import JSON', () => importInput.click()),
         item(ICONS.help, 'Keyboard reference', () => this.help(), keyHint('app.help')),
+        item(ICONS.menu, 'Graphics', () => this.graphics()),
         importInput,
       ),
     );
@@ -171,6 +176,49 @@ export class Menu {
     };
     draw();
     this.show(saving ? 'Save map' : 'Load map', body, null, false);
+  }
+
+  /** Graphics settings: road detail, on its own scale beside the overall quality. */
+  graphics(): void {
+    const r = this.ui.renderer as unknown as RoadDetailControl;
+    const body = el('div', { class: 'dialog-body' });
+    const draw = (): void => {
+      clear(body);
+      const state = r.getRoadDetail?.();
+      const quality = r.getQuality?.();
+      body.append(
+        el('div', { class: 'section-title', text: 'Road detail' }),
+        el('p', {
+          class: 'dialog-message',
+          text: 'Procedural asphalt, concrete, sidewalks and kerbs. Low is flat and light on the GPU; Ultra uses 4096 textures. Changes apply at once.',
+        }),
+      );
+      const list = el('div', { class: 'menu-list' });
+      for (const pref of ['auto', ...ROAD_DETAIL_ORDER] as RoadDetailPref[]) {
+        const on = state?.pref === pref;
+        list.append(
+          el('button', {
+            class: on ? 'btn primary' : 'btn',
+            text: ROAD_DETAIL_LABEL[pref],
+            attrs: { type: 'button', 'aria-pressed': String(on) },
+            on: {
+              click: () => {
+                r.setRoadDetail?.(pref);
+                draw();
+              },
+            },
+          }),
+        );
+      }
+      body.append(list);
+      if (state) {
+        const held = state.pref !== 'auto' && state.pref !== state.level;
+        const note = `Drawing ${ROAD_DETAIL_LABEL[state.level]}${quality ? ` (graphics quality ${quality})` : ''}${held ? ', held lower to keep frames smooth' : ''}.`;
+        body.append(el('p', { class: 'muted', text: note }));
+      }
+    };
+    draw();
+    this.show('Graphics', body);
   }
 
   /** The keyboard reference, built from the keymap so it is always current. */

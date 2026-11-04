@@ -13,6 +13,9 @@ import type { ControlKind } from './junctionControl';
 import { DEFAULT_ROUNDABOUT, type RoundaboutParams } from '../core/roundabout';
 import type { SimApi } from '../sim/api';
 import { defaultWallSettings, type WallToolSettings } from './wallOps';
+import { defaultUpgradeCardSettings, type UpgradeCardSettings } from './upgradeSettings';
+import { defaultTrafficRuleSettings, type TrafficRuleSettings } from './trafficRuleSettings';
+import type { RoadClip } from './clipFormat';
 
 export type ToolId =
   | 'select'
@@ -35,7 +38,8 @@ export type ToolId =
   | 'line'
   | 'electrify'
   | 'quay'
-  | 'terrain';
+  | 'terrain'
+  | 'trafficRules';
 
 export type DrawMode = 'straight' | 'curved' | 'freeform' | 'upgrade';
 
@@ -108,6 +112,14 @@ export interface PaintSettings {
   color: PaintColor;
   width: number;
   text: string;
+  /**
+   * The look of lines, crosswalks, stop lines and teeth, in the shared marking
+   * vocabulary (core/paintStandard.ts). Starts as a named standard; colour and width
+   * above are written into it when placed. Absent: the standard for `kind`.
+   */
+  look?: LineStyleSpec;
+  /** Which named standard `look` started as, for the panel. */
+  standard?: string;
 }
 
 export interface ZoneToolSettings {
@@ -123,7 +135,7 @@ export interface ZoneToolSettings {
 }
 
 /** The junction marking editor's draw tools. 'line' is armed by default; 'select' only picks. */
-export type MarkingDraw = 'select' | 'line' | 'crosswalk' | 'stop' | 'filler' | 'erase';
+export type MarkingDraw = 'select' | 'line' | 'crosswalk' | 'stop' | 'filler' | 'stamp' | 'erase';
 
 export interface NodeMarkingSettings {
   /** Kept in step with `draw`: 'filler' when drawing an area, 'line' otherwise. */
@@ -184,6 +196,17 @@ export interface EditorSettings {
   roundabout: RoundaboutParams;
   /** Structure, walls, sound barriers and quays (wallOps.ts). */
   walls: WallToolSettings;
+  /** Modify > Upgrade cards: lights, barriers, trees and so on (UpgradeCardTool.ts). */
+  upgradeCards: UpgradeCardSettings;
+  /** Ramps meeting a highway lane: edge merge or full junction, lane add or drop. */
+  rampJoin: RampJoinSettings;
+  /** Junction > Rules: lane arrows, speed limits, vehicle bans and more (TrafficRulesTool.ts). */
+  trafficRules: TrafficRuleSettings;
+  /**
+   * The last road copied with a middle click (clipboard.ts). New roads drawn in its
+   * type get its settings, and Upgrade's Paste style sweeps it over roads. Absent: none.
+   */
+  roadStyle?: RoadClip | null;
 }
 
 export function defaultSettings(): EditorSettings {
@@ -196,20 +219,21 @@ export function defaultSettings(): EditorSettings {
     snapLength: true,
     elevation: 0,
     reverseWholeRoad: false,
-    paint: { kind: 'line', lineStyle: 'solid', color: 'white', width: 0.2, text: 'SLOW' },
+    paint: { kind: 'line', lineStyle: 'dashed', color: 'white', width: 0.14, text: 'SLOW', look: { style: 'dashed', color: 'white', width: 0.14 }, standard: 'lane' },
     zone: { kind: 'residential', mode: 'block', density: 'medium', depth: 40, setback: 2, snap: true, snapDistance: 8, excludeFast: true },
     nodeMarking: {
       mode: 'line',
       draw: 'line',
-      style: 'solid',
+      // New markings start as the marking standard (core/paintStandard.ts): a lane line, a zebra, a stop line.
+      style: 'dashed',
       fill: 'hatch',
       color: 'white',
-      width: 0.16,
-      fillWidth: 0.25,
+      width: 0.14,
+      fillWidth: 0.3,
       curved: true,
       followLanes: false,
       lineExtra: {},
-      crosswalk: { style: 'crosswalkZebra', color: 'white', width: 3, dash: 0.5, space: 0.5 },
+      crosswalk: { style: 'crosswalkZebra', color: 'white', width: 3, dash: 0.6, space: 0.6 },
       stop: { style: 'stopLine', color: 'white', width: 0.45 },
       fillExtra: {},
     },
@@ -221,7 +245,25 @@ export function defaultSettings(): EditorSettings {
     junctionControl: 'inspect',
     roundabout: { ...DEFAULT_ROUNDABOUT },
     walls: defaultWallSettings(),
+    upgradeCards: defaultUpgradeCardSettings(),
+    trafficRules: defaultTrafficRuleSettings(),
+    rampJoin: defaultRampJoinSettings(),
   };
+}
+
+/** How the road tool joins a ramp to a highway lane (core/edgeMerge.ts). */
+export interface RampJoinSettings {
+  /** Blend into the edge lane (true) or make a full junction (false). Alt swaps it while held. */
+  edge: boolean;
+  /** An on-ramp: a taper, an added lane for `addLength` metres, or an added lane for good. */
+  onRamp: 'taper' | 'add' | 'addFull';
+  addLength: number;
+  /** An off-ramp: a taper, or the edge lane exit only (the highway loses it). */
+  offRamp: 'taper' | 'drop';
+}
+
+export function defaultRampJoinSettings(): RampJoinSettings {
+  return { edge: true, onRamp: 'taper', addLength: 300, offRamp: 'taper' };
 }
 
 /** Undo history as tools see it. Edits are captured automatically. */

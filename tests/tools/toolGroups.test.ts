@@ -31,7 +31,10 @@ describe('the eight broad tools', () => {
     expect(groupOf('road', 'curved')).toBe('build');
     expect(modeOf('road', 'upgrade')?.id).toBe('upgrade');
     expect(modeOf('reverse', 'straight')?.id).toBe('reverse');
+    // Junction markings are the one Markings tool now, in the Markings (paint) group.
     expect(modeOf('nodeMarkings', 'straight')?.id).toBe('markings');
+    expect(modeOf('paint', 'straight')?.id).toBe('markings');
+    expect(groupOf('nodeMarkings', 'straight')).toBe('paint');
   });
 
   it('make every mode reachable by a key or the command palette', () => {

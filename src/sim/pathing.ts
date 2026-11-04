@@ -1,19 +1,16 @@
 /** Reading routes out of the cost tables. */
-import { ALLOW_BIKE, ALLOW_BUS, ALLOW_CAR } from './compiled';
+import { TYPE_BITS } from './compiled';
 import { ROUTE_NOISE } from './constants';
 import { hashNoise } from './rng';
 import type { RouteTable } from './routing';
-import { TYPE_BIKE, TYPE_BUS } from './vehicleTypes';
 import type { World } from './world';
 
 export function tableOf(w: World, v: number): RouteTable {
-  const type = w.veh.type[v];
-  return type === TYPE_BUS ? w.routes.bus : type === TYPE_BIKE ? w.routes.bike : w.routes.car;
+  return w.routes.tableFor(w.veh.type[v]);
 }
 
 export function allowBit(w: World, v: number): number {
-  const type = w.veh.type[v];
-  return type === TYPE_BUS ? ALLOW_BUS : type === TYPE_BIKE ? ALLOW_BIKE : ALLOW_CAR;
+  return TYPE_BITS[w.veh.type[v]];
 }
 
 /** Best lane after `lane` for this vehicle, or -1 when no lane on leads to its destination. */

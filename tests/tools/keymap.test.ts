@@ -15,12 +15,15 @@ import {
 import { fuzzyScore, rankCommands, type PaletteCommand } from '../../src/ui/search';
 import { GUIDE_KEYS } from '../../src/ui/guideKeys';
 import { markingKeys } from '../../src/ui/markingKeys';
+import { laneEditKeys } from '../../src/ui/laneKeys';
 import type { UiContext } from '../../src/ui/context';
 
 // The grid agent's keys, registered as the app does, so clashes with them show too.
 registerKeys(GUIDE_KEYS);
 // The junction marking editor's, likewise. They only reach the UI when run.
 registerKeys(markingKeys({} as UiContext));
+// The road inspector's lane editor, likewise.
+registerKeys(laneEditKeys(() => null));
 
 const ev = (key: string, code: string, mods: Partial<{ shift: boolean; alt: boolean; ctrl: boolean; meta: boolean }> = {}) => ({
   key,
@@ -128,11 +131,12 @@ describe('keymap', () => {
     expect(ring.map((r) => r.label)).toContain('Undo');
   });
 
-  it('takes the markings editor keys without clashes, active in the Markings tab', async () => {
+  it('takes the markings editor keys without clashes, active in the one Markings tool', async () => {
     const { markingKeys } = await import('../../src/ui/markingKeys');
     const off = registerKeys(markingKeys({} as never));
     expect(findConflicts()).toEqual([]);
-    const scopes = activeScopes({ tool: 'nodeMarkings', select: null, tab: 'junction' });
+    // Junction and road markings are one tool, id 'paint' (MarkingTool.ts).
+    const scopes = activeScopes({ tool: 'paint', select: null, tab: 'paint' });
     expect(match('L', scopes)?.id).toBe('markings.line');
     expect(match('E', scopes)?.id).toBe('markings.erase');
     off();

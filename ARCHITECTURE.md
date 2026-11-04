@@ -90,6 +90,17 @@ Connectors, auto-generated when `control.laneLinks` is null:
   or into the lanes next to them (merge-only, right in and right out), with no
   turns across a median or opposing traffic. A ramp attached to a lane is fed by
   that lane and every lane outside it. See core/ramps.ts.
+- Highway crossing (`JunctionControl.highwayAccess === 'crossing'`, set by drawRoad on a
+  road drawn across a highway at grade; absent, as in older saves, is controlled access):
+  an ordinary junction where the highway keeps every lane straight on and the side road
+  crosses and turns, under protected signals. Two crossings of a divided highway close
+  together run one linked plan, so nothing waits in the median. See core/highwayCrossing.ts.
+- Edge merge (a ramp attach with `edge`, the road tool's default for a ramp on a
+  highway's outside lane): the highway runs through its node as a plain joint, lane
+  for lane with no connectors, and only the ramp's taper beside the edge is junction
+  surface, with connectors into or out of the edge lane (or the lane added or
+  dropped there). See core/edgeMerge.ts. A narrower road continuing a wider one can
+  line up left, centred or right (core/laneAlign.ts).
 - Every driving lane must have a way out unless the node is a true dead end.
 - Bus lanes join only drive or bus lanes. Bike lanes join bike lanes only.
 
@@ -143,6 +154,13 @@ Connectors, auto-generated when `control.laneLinks` is null:
   offset, depth write off.
 - Bridges get barriers and pillars. Tunnels get portals where they pass below
   ground, and an underground view makes the terrain see-through.
+- Piers are planned in `render/piers.ts` for every elevated road, track and junction:
+  footprints of every carriageway (split at raised medians), sidewalk, track bed,
+  platform, junction surface and zoned lot below, each with its headroom. Columns stand
+  only in the gaps (hammerhead, twin, or a portal frame straddling the road), shifted
+  along the span, with a long girder span as the last resort. The renderer, the draw
+  preview and the tests share the plan, and `RoadLayer` re-plans decks within a portal's
+  reach of any road or station edited below.
 - Vehicles are `InstancedMesh` per model, reading the sim's typed arrays.
 - Trees are instanced and hidden where roads run through them.
 - Procedural everything: textures from canvas, models from primitives. No binary
@@ -171,6 +189,10 @@ Connectors, auto-generated when `control.laneLinks` is null:
   last step, Esc leaves the tool.
 - Camera: WASD pan, Q/E rotate, R/F tilt, wheel zoom, middle or right drag orbits.
 - Undo and redo for all edits, autosave to localStorage, JSON export and import.
+- Middle-click (or Option+click, or Cmd+C) copies what is under the cursor: a road's type and
+  settings, a marking's style, or a junction's control and shape (tools/clipboard.ts). Cmd+V over
+  the same kind of thing pastes it as one undo step; the copy also goes to the system clipboard as
+  strictly checked JSON (app/clipboard.ts).
 
 ## Visual direction
 

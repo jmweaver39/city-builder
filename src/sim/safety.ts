@@ -137,6 +137,8 @@ export function snapshotVehicles(veh: VehicleStore): void {
   veh.lcSec0.set(veh.lcSec);
   veh.latStart0.set(veh.latStart);
   veh.lcLen0.set(veh.lcLen);
+  veh.stuckSec0.set(veh.stuckSec);
+  veh.stuckProgress0.set(veh.stuckProgress);
 }
 
 function moved(veh: VehicleStore, v: number): boolean {
@@ -154,6 +156,8 @@ let keepLat = 0;
 let keepLen = 0;
 let keepV = 0;
 let keepAcc = 0;
+let keepStuck = 0;
+let keepProgress = 0;
 
 function keep(veh: VehicleStore, v: number): void {
   keepLane = veh.lane[v];
@@ -166,6 +170,8 @@ function keep(veh: VehicleStore, v: number): void {
   keepLen = veh.lcLen[v];
   keepV = veh.v[v];
   keepAcc = veh.acc[v];
+  keepStuck = veh.stuckSec[v];
+  keepProgress = veh.stuckProgress[v];
 }
 
 function restore(w: World, v: number): void {
@@ -180,6 +186,8 @@ function restore(w: World, v: number): void {
   veh.lcLen[v] = keepLen;
   veh.v[v] = keepV;
   veh.acc[v] = keepAcc;
+  veh.stuckSec[v] = keepStuck;
+  veh.stuckProgress[v] = keepProgress;
   veh.ptIdx[v] = 0;
   placeVehicle(g, veh, v);
   refreshBox(veh, v);
@@ -201,6 +209,11 @@ function rollBack(w: World, v: number): void {
   veh.s[v] = veh.s0[v];
   veh.v[v] = 0;
   veh.acc[v] = 0;
+  // Ground given back is no progress. Without this, a pair of vehicles put back every
+  // step, each trying to move a few millimetres, reset their stuck timers for ever and
+  // hold up everyone behind them without being cleared.
+  veh.stuckProgress[v] = veh.stuckProgress0[v];
+  if (veh.stuckSec[v] < veh.stuckSec0[v]) veh.stuckSec[v] = veh.stuckSec0[v];
   veh.ptIdx[v] = 0;
   placeVehicle(g, veh, v);
   refreshBox(veh, v);

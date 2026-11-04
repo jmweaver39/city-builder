@@ -1,5 +1,6 @@
 /** Shared numbers and colours for the render module. Metres unless stated. */
 import type { LineStyle, PaintColor, SegmentOverrides } from '../core/types';
+import { autoLineSpec, DOUBLE_SPACING, LINE_W, PAINT_HEX, PAINT_MATERIAL, strokesOfSpec } from '../core/paintStandard';
 
 /** Road surfaces float this far above the sampled height, so flat terrain never fights them. */
 export const ROAD_LIFT = 0.06;
@@ -12,14 +13,15 @@ export const ELEVATED_CLEARANCE = 1;
 export const TUNNEL_Y = -1.5;
 /** Inside height of a tunnel box. */
 export const TUNNEL_CLEARANCE = 5.6;
-/** Paint sits this far above the surface. */
-export const MARK_LIFT = 0.025;
+/** Paint sits this far above the surface (core/paintStandard.ts). */
+export const MARK_LIFT = PAINT_MATERIAL.lift;
 
 /** gl_FragDepth bias per road rank. Higher ranks draw over lower ranks when coplanar. */
 export const BIAS_PER_RANK = 2.5e-7;
 export const BIAS_JUNCTION = 4.5e-6;
-export const BIAS_MARKING = 7e-6;
-export const BIAS_DECAL = 8e-6;
+export const BIAS_MARKING = PAINT_MATERIAL.bias;
+/** Hand-placed paint uses the very same bias as automatic paint: one material for all. */
+export const BIAS_DECAL = PAINT_MATERIAL.bias;
 
 export type RGB = readonly [number, number, number];
 
@@ -37,6 +39,10 @@ export const KIND_JUNCTION = 6;
 export const KIND_STEEL = 7;
 /** Self-lit, for tunnel lamps. */
 export const KIND_LAMP = 8;
+/** Concrete pavement: the 'concrete' surface override on lanes and junctions. Takes overlays. */
+export const KIND_CONCRETE_ROAD = 9;
+/** Kerb stones: faces and chamfers. Takes overlays like plain. */
+export const KIND_KERB = 10;
 
 /** sRGB hex to linear RGB, so vertex colours match Three.js colour management. */
 export function hexRGB(hex: number): RGB {
@@ -73,17 +79,18 @@ export const SURFACE_COL: Record<NonNullable<SegmentOverrides['surface']>, RGB> 
   gravel: hexRGB(0x8c8270),
 };
 
+/** The paint colours, linear, from the one palette in core/paintStandard.ts. */
 export const PAINT_COL: Record<PaintColor, RGB> = {
-  white: hexRGB(0xf2f1ec),
-  yellow: hexRGB(0xe2b33c),
-  blue: hexRGB(0x3e7fd6),
-  red: hexRGB(0xd2402f),
-  green: hexRGB(0x46a85a),
+  white: hexRGB(parseInt(PAINT_HEX.white.slice(1), 16)),
+  yellow: hexRGB(parseInt(PAINT_HEX.yellow.slice(1), 16)),
+  blue: hexRGB(parseInt(PAINT_HEX.blue.slice(1), 16)),
+  red: hexRGB(parseInt(PAINT_HEX.red.slice(1), 16)),
+  green: hexRGB(parseInt(PAINT_HEX.green.slice(1), 16)),
 };
 
-export const LINE_WIDTH = 0.14;
+export const LINE_WIDTH = LINE_W.lane;
 /** Gap between the centres of the two lines of a double. */
-export const DOUBLE_GAP = 0.32;
+export const DOUBLE_GAP = DOUBLE_SPACING;
 
 export interface Stroke {
   /** Lateral shift from the boundary. */
@@ -94,38 +101,11 @@ export interface Stroke {
   duty: number;
 }
 
-const SOLID = { period: 0, duty: 1 };
-const DASH = { period: 9, duty: 1 / 3 };
-const DOT = { period: 1.2, duty: 0.4 };
-
-/** The strokes of a line style. Left and right are as seen along segment forward. */
-export function strokesOf(style: LineStyle): Stroke[] {
-  const g = DOUBLE_GAP / 2;
-  switch (style) {
-    case 'none':
-      return [];
-    case 'solid':
-      return [{ shift: 0, ...SOLID }];
-    case 'dashed':
-      return [{ shift: 0, ...DASH }];
-    case 'dotted':
-      return [{ shift: 0, ...DOT }];
-    case 'double':
-      return [
-        { shift: -g, ...SOLID },
-        { shift: g, ...SOLID },
-      ];
-    case 'solidDashed':
-      return [
-        { shift: -g, ...SOLID },
-        { shift: g, ...DASH },
-      ];
-    case 'dashedSolid':
-      return [
-        { shift: -g, ...DASH },
-        { shift: g, ...SOLID },
-      ];
-  }
+/** The strokes of an automatic line style on a road of the given speed. Left and right are as seen along segment forward. */
+export function strokesOf(style: LineStyle, speedKmh = 50): Stroke[] {
+  const spec = autoLineSpec(style, 'white', LINE_W.lane, speedKmh);
+  if (!spec) return [];
+  return (strokesOfSpec(spec) ?? []).map((k) => ({ shift: k.shift, period: k.period, duty: k.duty }));
 }
 
 export function lerpRGB(a: RGB, b: RGB, t: number): [number, number, number] {

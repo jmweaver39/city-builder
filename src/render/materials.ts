@@ -4,6 +4,10 @@
  */
 import * as THREE from 'three';
 import { makeDetailTexture, makeNoiseTexture } from './textures';
+import { RoadSurfaces } from './roadSurface';
+import { ROAD_SURFACE_MAIN, ROAD_SURFACE_PARS } from './roadShader';
+import { ROAD_DETAIL, type RoadDetailName } from './roadDetail';
+import { PAINT_MATERIAL } from '../core/paintStandard';
 
 export const SLOT_COLS = 1024;
 const SLOT_ROWS = 128;
@@ -32,8 +36,11 @@ export class Shared {
   readonly slotData = new Uint8Array(SLOT_COLS * SLOT_ROWS * 4);
   readonly slotTex: THREE.DataTexture;
   readonly uSlots: { value: THREE.DataTexture };
+  /** Procedural road surface textures, sized by the road detail level (roadSurface.ts). */
+  readonly roadTex: RoadSurfaces;
 
-  constructor(anisotropy: number) {
+  constructor(anisotropy: number, maxAnisotropy = anisotropy) {
+    this.roadTex = new RoadSurfaces(maxAnisotropy);
     this.uNoise = { value: makeNoiseTexture(256, anisotropy) };
     this.uDetail = { value: makeDetailTexture(2048, anisotropy) };
     this.slotTex = new THREE.DataTexture(this.slotData, SLOT_COLS, SLOT_ROWS, THREE.RGBAFormat, THREE.UnsignedByteType);
@@ -46,6 +53,7 @@ export class Shared {
   dispose(): void {
     this.uNoise.value.dispose();
     this.uDetail.value.dispose();
+    this.roadTex.dispose();
     this.slotTex.dispose();
   }
 }
@@ -81,9 +89,12 @@ float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453)
 `;
 
 /** Roads, junctions, decks, pillars: everything in the surface batches. */
-export function makeSurfaceMaterial(shared: Shared): THREE.MeshStandardMaterial {
+export function makeSurfaceMaterial(shared: Shared, detail: RoadDetailName = 'medium'): THREE.MeshStandardMaterial {
   const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0 });
+  setSurfaceDetail(m, detail);
   m.onBeforeCompile = (s) => {
+    s.uniforms.uAsphalt = shared.roadTex.uAsphalt;
+    s.uniforms.uConcrete = shared.roadTex.uConcrete;
     s.uniforms.uSlots = shared.uSlots;
     s.uniforms.uNoise = shared.uNoise;
     s.uniforms.uDetail = shared.uDetail;
@@ -96,7 +107,10 @@ export function makeSurfaceMaterial(shared: Shared): THREE.MeshStandardMaterial 
         /* glsl */ `#include <common>
 attribute vec3 aExt;
 attribute vec2 aRoad;
+attribute vec4 aSurf;
 uniform highp sampler2D uSlots;
+varying vec4 vSurf;
+flat varying float vSlot;
 flat varying float vKind;
 varying float vBias;
 varying vec3 vWorld;
@@ -112,9 +126,11 @@ vKind = aExt.x;
 vBias = aExt.z;
 vWorld = position;
 vRoad = aRoad;
+vSurf = aSurf;
+vSlot = aExt.y;
 int slot = int(aExt.y + 0.5);
 ivec2 st = ivec2(slot % ${SLOT_COLS}, (slot / ${SLOT_COLS}) * 2);
-if (vKind < 4.5 || vKind == 6.0) {
+if (vKind < 4.5 || vKind == 6.0 || vKind == 9.0 || vKind == 10.0) {
   vOverlay = texelFetch(uSlots, st, 0);
   vHigh = texelFetch(uSlots, st + ivec2(0, 1), 0);
 } else {
@@ -144,6 +160,7 @@ vec2 gBump = vec2(0.0);
 vec3 gGlow = vec3(0.0);
 ${SURFACE_PARS}
 ${CLOUD_SHADOW}
+${ROAD_SURFACE_PARS}
 `,
       )
       .replace('#include <logdepthbuf_fragment>', LOG_BIAS)
@@ -151,17 +168,13 @@ ${CLOUD_SHADOW}
         '#include <color_fragment>',
         /* glsl */ `#include <color_fragment>
 {
-  // Clean, even surfaces with fine grain: no patches, wear or stains.
+  // Road surfaces by road detail level (roadShader.ts); the rest as before.
   float k = vKind;
   vec2 wp = vWorld.xz;
   float dist = length(vViewPosition);
-  if (k < 0.5 || k == 6.0) {
-    float g1 = texture2D(uDetail, wp / 3.1).g;
-    float g2 = texture2D(uDetail, wp / 11.3).g;
-    float macro = texture2D(uNoise, wp / 97.0).g;
-    diffuseColor.rgb *= 0.95 + 0.1 * mix(g2, g1, 1.0 - smoothstep(30.0, 140.0, dist)) + 0.03 * (macro - 0.5);
-    gRough = 0.86;
-  } else if (k < 1.5) {
+${ROAD_SURFACE_MAIN}
+  if (rsDone) {
+  } else if (k > 0.5 && k < 1.5) {
     diffuseColor.rgb *= 0.95 + 0.08 * texture2D(uDetail, wp / 2.7).g;
     bool hasRoad = abs(vRoad.y) > 0.001;
     vec2 q = hasRoad ? vec2(vRoad.x / 1.8, vRoad.y / 2.4) : vWorld.xz / 2.2;
@@ -174,13 +187,13 @@ ${CLOUD_SHADOW}
   } else if (k > 6.5 && k < 7.5) {
     gRough = 0.6;
     gMetal = 0.2;
-  } else if (k > 7.5) {
+  } else if (k > 7.5 && k < 8.5) {
     gGlow = diffuseColor.rgb * 4.0;
   } else {
     gRough = 0.88;
   }
   if (vOverlay.a > 0.0) {
-    if (k < 0.5 || k == 6.0) diffuseColor.rgb = mix(diffuseColor.rgb, vOverlay.rgb, vOverlay.a);
+    if (k < 0.5 || k == 6.0 || k == 9.0) diffuseColor.rgb = mix(diffuseColor.rgb, vOverlay.rgb, vOverlay.a);
     else diffuseColor.rgb = mix(diffuseColor.rgb, vOverlay.rgb * 0.75 + 0.1, vOverlay.a * 0.6);
   }
   if (vHigh.a > 0.0) diffuseColor.rgb = mix(diffuseColor.rgb, vHigh.rgb, vHigh.a * 0.75);
@@ -214,8 +227,16 @@ if (vHigh.a > 0.0) totalEmissiveRadiance += vHigh.rgb * vHigh.a * (0.32 + 0.1 * 
 `,
       );
   };
-  m.customProgramCacheKey = () => 'cl-surface-lp';
+  m.customProgramCacheKey = () => `cl-surface-lp-rd${m.defines?.ROAD_DETAIL ?? 1}`;
   return m;
+}
+
+/** Switch a surface material's road detail shader level. Recompiles once on the next draw. */
+export function setSurfaceDetail(m: THREE.Material, detail: RoadDetailName): void {
+  const level = ROAD_DETAIL[detail].level;
+  if (m.defines?.ROAD_DETAIL === level) return;
+  m.defines = { ...(m.defines ?? {}), ROAD_DETAIL: level };
+  m.needsUpdate = true;
 }
 
 /**
@@ -229,7 +250,7 @@ export function makePaintMaterial(shared: Shared, opts: { bias: number; lift: nu
     vertexColors: true,
     transparent: true,
     depthWrite: false,
-    roughness: 0.62,
+    roughness: PAINT_MATERIAL.roughness,
     metalness: 0,
     polygonOffset: true,
     polygonOffsetFactor: -2,
@@ -275,7 +296,7 @@ vU = aLine.z;
 vPeriod = aDash.x;
 vDuty = aDash.y;
 vPlan = transformed.xz;
-vFade = aDash.x < -0.5 ? ${opts.fade === false ? '1.0' : '1.0 - smoothstep(600.0, 1500.0, dist)'} : 1.0;
+vFade = aDash.x < -0.5 ? ${opts.fade === false ? '1.0' : `1.0 - smoothstep(${PAINT_MATERIAL.fadeNear.toFixed(1)}, ${PAINT_MATERIAL.fadeFar.toFixed(1)}, dist)`} : 1.0;
 `,
       );
     s.fragmentShader = s.fragmentShader
@@ -320,7 +341,9 @@ ${CLOUD_SHADOW}
       cover *= clamp(span / fu, 0.0, 1.0);
     }
   }
-  diffuseColor.a *= cover * vFade;
+  // Wear: the same faint mottling on every mark, from the shared noise.
+  float wear = texture2D(uNoise, vPlan / 9.0).r;
+  diffuseColor.a *= cover * vFade * mix(0.86, 1.0, smoothstep(0.25, 0.6, wear));
   if (diffuseColor.a < 0.004) discard;
 }
 `,

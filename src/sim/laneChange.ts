@@ -118,15 +118,19 @@ function sharedOccupied(w: World, v: number, target: number, at: number, length:
 function mergeClash(w: World, v: number, target: number, at: number): boolean {
   const { g, bk, veh } = w;
   const c = pickNext(w, v, target);
-  if (c < 0 || !g.isConn[c]) return false;
-  const toEnd = g.len[target] - at + g.len[c];
+  if (c < 0) return false;
+  // At an edge merge (core/edgeMerge.ts) the target runs straight on into the lane a ramp
+  // joins, with no connector of its own: the merge is just past the target's end.
+  const direct = !g.isConn[c];
+  const toEnd = g.len[target] - at + (direct ? 0 : g.len[c]);
   if (toEnd > MERGE_LOOK) return false;
-  const x = g.toLane[c];
+  const x = direct ? c : g.toLane[c];
+  const self = direct ? target : c;
   const sp = veh.v[v];
   const stopping = (sp * sp) / (2 * MERGE_BRAKE);
   for (let k = g.prevStart[x]; k < g.prevStart[x + 1]; k++) {
     const d = g.prevList[k];
-    if (d === c || !g.isConn[d]) continue;
+    if (d === self || !g.isConn[d]) continue;
     for (let e = bk.start[d]; e < bk.start[d + 1]; e++) {
       const t = bk.eT[e];
       if (t === ENTRY_REQUEST || t === ENTRY_GHOST) continue;

@@ -17,6 +17,8 @@ import {
   KERB_HEIGHT,
   KIND_JUNCTION,
   KIND_CONCRETE,
+  KIND_CONCRETE_ROAD,
+  KIND_KERB,
   KIND_GRASS,
   KIND_PLAIN,
   KIND_SIDEWALK,
@@ -24,13 +26,23 @@ import {
   TUNNEL_Y,
 } from './constants';
 import { surfaceColour, type RoadOutputs } from './roads';
-import { addPierAt } from './structures';
+import { addNodePier } from './structures';
 import { buildJunctionIslands, cornerKerbs } from './junctionShape';
 import { kerbLeftOf, kerbRightOf } from '../core/junctionShape';
+import { buildEdgeMergeSurface } from './edgeMerge';
 
 type Pt = { x: number; y: number; z: number };
 
-function fillPolygon(buf: SurfBuf, poly: readonly Vec3[], dy: number, style: SurfStyle, down = false): void {
+/** Chamfer on a kerb's top arris, as on segments (roads.ts). */
+const CHAMFER = 0.02;
+
+/** Road coordinates for a junction fill: offsets from the node centre, with the junction hints (see roads.ts). */
+interface FillCentre {
+  x: number;
+  z: number;
+}
+
+export function fillPolygon(buf: SurfBuf, poly: readonly Vec3[], dy: number, style: SurfStyle, down = false, centre: FillCentre | null = null): void {
   if (poly.length < 3) return;
   const contour = poly.map((p) => new THREE.Vector2(p.x, p.z));
   let faces: number[][];
@@ -73,13 +85,29 @@ function fillPolygon(buf: SurfBuf, poly: readonly Vec3[], dy: number, style: Sur
   for (let i = 0; i < n; i++) {
     const l = Math.hypot(ny[i * 3], ny[i * 3 + 1], ny[i * 3 + 2]) || 1;
     const p = poly[i];
+    if (centre) {
+      buf.ru = p.x - centre.x;
+      buf.rv = p.z - centre.z;
+      buf.hx = 0;
+      buf.hy = 99;
+      buf.hz = 0;
+      buf.hw = 999;
+    }
     buf.vert(p.x, p.y + dy, p.z, ny[i * 3] / l, ny[i * 3 + 1] / l, ny[i * 3 + 2] / l, style);
   }
+  buf.ru = buf.rv = 0;
+  buf.hx = buf.hy = buf.hz = buf.hw = 0;
   for (const [a, b, c] of tris) buf.tri(base + a, base + b, base + c);
 }
 
+/** Kind for a junction carriageway: concrete pavement keeps its slabs. */
+export function junctionKind(net: RoadNetwork, g: NodeGeom): number {
+  return g.arms.length > 0 && g.arms.every((a) => net.getSegment(a.segmentId)?.overrides.surface === 'concrete') ? KIND_CONCRETE_ROAD : KIND_JUNCTION;
+}
+
 /** Vertical wall under a polyline. Clockwise from above with the inside to the right. */
-function wall(buf: SurfBuf, chain: readonly Pt[], top: (i: number) => number, bottom: (i: number) => number, style: SurfStyle, faceOut: boolean): void {
+function wall(buf: SurfBuf, chain: readonly Pt[], top: (i: number) => number, bottom: (i: number) => number, style: SurfStyle, faceOut: boolean, kerb = false): void {
+  let along = 0;
   for (let i = 0; i + 1 < chain.length; i++) {
     const a = chain[i];
     const b = chain[i + 1];
@@ -91,13 +119,26 @@ function wall(buf: SurfBuf, chain: readonly Pt[], top: (i: number) => number, bo
     const sign = faceOut ? 1 : -1;
     const nx = (sign * dz) / l;
     const nz = (sign * -dx) / l;
+    // Kerbs carry the distance along them, for stone joints, and height up the face.
+    const at = (s: number, h: number) => {
+      if (!kerb) return;
+      buf.rv = s;
+      buf.hx = h;
+    };
+    at(along, 1);
     const v0 = buf.vert(a.x, top(i), a.z, nx, 0, nz, style);
+    at(along + l, 1);
     const v1 = buf.vert(b.x, top(i + 1), b.z, nx, 0, nz, style);
+    at(along + l, 0);
     const v2 = buf.vert(b.x, bottom(i + 1), b.z, nx, 0, nz, style);
+    at(along, 0);
     const v3 = buf.vert(a.x, bottom(i), a.z, nx, 0, nz, style);
     if (faceOut) buf.quad(v0, v1, v2, v3);
     else buf.quad(v1, v0, v3, v2);
+    along += l;
   }
+  buf.rv = 0;
+  buf.hx = 0;
 }
 
 function resample(chain: readonly Pt[], count: number): Pt[] {
@@ -216,7 +257,7 @@ interface EdgeStyles {
 }
 
 /** Sidewalk, kerb, verge, deck and barrier for one edge between two arms. */
-function buildCorner(buf: SurfBuf, innerRaw: readonly Vec3[], outerRaw: readonly Vec3[], kerbA: number, kerbB: number, e: EdgeStyles): void {
+export function buildCorner(buf: SurfBuf, innerRaw: readonly Vec3[], outerRaw: readonly Vec3[], kerbA: number, kerbB: number, e: EdgeStyles): void {
   const slot = e.slot;
   const count = Math.max(innerRaw.length, outerRaw.length, 2);
   const inner = resample(innerRaw.map((p) => ({ x: p.x, y: p.y + ROAD_LIFT, z: p.z })), count);
@@ -224,8 +265,15 @@ function buildCorner(buf: SurfBuf, innerRaw: readonly Vec3[], outerRaw: readonly
   const kerb = (i: number) => kerbA + ((kerbB - kerbA) * i) / (count - 1);
   const hasWalk = kerbA > 0 || kerbB > 0;
   if (hasWalk) {
-    stripBetween(buf, inner, outer, kerb, kerb, { color: COL.sidewalk, kind: KIND_SIDEWALK, slot, bias: 0 });
-    wall(buf, inner, (i) => inner[i].y + kerb(i), (i) => inner[i].y, { color: COL.kerb, kind: KIND_PLAIN, slot, bias: 0 }, false);
+    // Kerb face, a small chamfer on its top arris, then the sidewalk behind it.
+    const ch = (i: number) => Math.min(CHAMFER, kerb(i) * 0.5);
+    const back = offsetChain(inner, CHAMFER);
+    const kerbStyle: SurfStyle = { color: COL.kerb, kind: KIND_KERB, slot, bias: 0 };
+    stripBetween(buf, back, outer, kerb, kerb, { color: COL.sidewalk, kind: KIND_SIDEWALK, slot, bias: 0 });
+    wall(buf, inner, (i) => inner[i].y + kerb(i) - ch(i), (i) => inner[i].y, kerbStyle, false, true);
+    buf.hx = 1;
+    stripBetween(buf, inner, back, (i) => kerb(i) - ch(i), kerb, kerbStyle);
+    buf.hx = 0;
   }
   const raised = e.clearance > 0.08;
   if (!hasWalk && !raised && e.clearance > -0.05) {
@@ -254,7 +302,7 @@ function buildCorner(buf: SurfBuf, innerRaw: readonly Vec3[], outerRaw: readonly
   }
 }
 
-function junctionColour(net: RoadNetwork, g: NodeGeom) {
+export function junctionColour(net: RoadNetwork, g: NodeGeom) {
   // A junction keeps a special surface only when every arm agrees on it.
   const first = net.getSegment(g.arms[0]?.segmentId ?? -1);
   const surface = first?.overrides.surface;
@@ -292,7 +340,8 @@ function buildDeadEnd(net: RoadNetwork, g: NodeGeom, slot: number, out: RoadOutp
     return pts;
   };
   const inner = arc(H);
-  fillPolygon(out.surf, inner, ROAD_LIFT, { color: surfaceColour(net.getSegment(arm.segmentId), net.roadTypeOf(arm.segmentId)), kind: KIND_JUNCTION, slot, bias: 0 });
+  const capKind = net.getSegment(arm.segmentId)?.overrides.surface === 'concrete' ? KIND_CONCRETE_ROAD : KIND_JUNCTION;
+  fillPolygon(out.surf, inner, ROAD_LIFT, { color: surfaceColour(net.getSegment(arm.segmentId), net.roadTypeOf(arm.segmentId)), kind: capKind, slot, bias: 0 }, false, { x: arm.centre.x, z: arm.centre.z });
   const clearance = y - groundHeight(net, arm.centre.x, arm.centre.z);
   const kerb = W > 0 ? KERB_HEIGHT : 0;
   buildCorner(out.surf, inner, arc(H + W), kerb, kerb, { slot, clearance, ground: y - clearance });
@@ -313,10 +362,15 @@ export function buildJunction(net: RoadNetwork, id: Id, slot: number, out: RoadO
     buildDeadEnd(net, g, slot, out);
     return;
   }
+  // An edge merge: only the ramp's taper beside the highway is surface (edgeMerge.ts).
+  if (g.kind === 'merge') {
+    buildEdgeMergeSurface(net, id, slot, out);
+    return;
+  }
   if (g.kind !== 'junction' || g.outline.length < 3) return;
 
   const surf = out.surf;
-  fillPolygon(surf, g.outline, ROAD_LIFT, { color: junctionColour(net, g), kind: KIND_JUNCTION, slot, bias: BIAS_JUNCTION });
+  fillPolygon(surf, g.outline, ROAD_LIFT, { color: junctionColour(net, g), kind: junctionKind(net, g), slot, bias: BIAS_JUNCTION }, false, { x: node.pos.x, z: node.pos.z });
 
   const ground = groundHeight(net, node.pos.x, node.pos.z);
   const clearance = node.pos.y - ground;
@@ -345,8 +399,8 @@ export function buildJunction(net: RoadNetwork, id: Id, slot: number, out: RoadO
     const under: SurfStyle = { color: COL.concreteDark, kind: KIND_CONCRETE, slot, bias: 0 };
     fillPolygon(surf, g.outerOutline, ROAD_LIFT - depth, under, true);
     if (clearance > 3.2) {
-      const style: SurfStyle = { color: COL.concrete, kind: KIND_CONCRETE, slot: 0, bias: 0 };
-      addPierAt(surf, node.pos.x, node.pos.y + ROAD_LIFT, node.pos.z, 1.6, style);
+      // One column, placed clear of whatever passes under the junction (piers.ts).
+      addNodePier(net, id, surf);
     }
   }
   // Any part below the ground needs the terrain opened over the whole junction.

@@ -1,6 +1,6 @@
 /** The floating panel of the Junction shape tool: every corner, arm and island of one junction. */
 import type { Id } from '../core/types';
-import { armInfos, cornerInfos, RADIUS_MAX, RADIUS_MIN } from '../core/junctionShape';
+import { armInfos, armTrimLimits, cornerInfos, RADIUS_MAX, RADIUS_MIN, SCALE_MAX, SCALE_MIN } from '../core/junctionShape';
 import type { UiContext } from './context';
 import { checkbox, clear, el, iconButton, row, sliderInput } from './dom';
 import { ICONS } from './icons';
@@ -26,7 +26,7 @@ export class JunctionShapePanel {
 
   private key(): string {
     const node = this.ui.net.getNode(this.nodeId);
-    return JSON.stringify([node?.control.shape ?? null, this.tool.problem, this.tool.islandMode, this.tool.selected, node?.segments]);
+    return JSON.stringify([node?.control.shape ?? null, this.tool.problem, this.tool.islandMode, this.tool.selected, node?.segments, node?.pos.y, this.ui.net.nodeGeom(this.nodeId)?.arms.map((a) => a.trim.toFixed(1))]);
   }
 
   /** Rebuild only when something shown has changed. */
@@ -57,12 +57,26 @@ export class JunctionShapePanel {
         button('Drag handles', tool.islandMode ? '' : 'primary', () => tool.setIslandMode(false)),
         button('Add island', tool.islandMode ? 'primary' : '', () => tool.setIslandMode(true), 'Click two lane boundaries on one arm. Key I'),
         button('Markings', '', () => {
-          tools.setTool('nodeMarkings');
+          tools.setTool('paint');
           tools.nodeMarkings.open(this.nodeId);
         }, 'Back to Node markings for this junction'),
       ),
     );
     if (tool.problem) body.append(el('div', { class: 'small', text: tool.problem, style: { color: '#ff7b7b', margin: '4px 0' } }));
+
+    // The whole node: how big, how high.
+    body.append(
+      el('div', { class: 'section-title', text: 'Node size' }),
+      row('All arms', sliderInput(tool.scale, { min: SCALE_MIN, max: SCALE_MAX, step: 0.05, format: (v) => `${Math.round(v * 100)}%` }, (v) => tool.setScale(v)), 'Every arm\'s automatic length together. Keys [ and ]'),
+      el(
+        'div',
+        { class: 'btn-row' },
+        button('Shortest possible', '', () => tool.shortest(), 'Each arm as short as it can be with the lanes still meeting. Key X'),
+        button('Lower', '', () => tool.stepHeight(-1), 'Key Q'),
+        button('Raise', '', () => tool.stepHeight(1), 'Key E'),
+      ),
+      el('div', { class: 'small muted', text: `Height ${node.pos.y.toFixed(0)} m. Drag the square at the centre to move the node.` }),
+    );
 
     const corners = cornerInfos(net, this.nodeId);
     body.append(el('div', { class: 'section-title', text: 'Corners' }));
@@ -96,10 +110,15 @@ export class JunctionShapePanel {
           el('span', { class: 'phase-name', text: this.name(a.segmentId) }),
           iconButton(ICONS.undo, { tip: 'Reset this arm', onClick: () => tool.resetArm(a.segmentId) }),
         ),
-        row('Trim', sliderInput(a.setting.trim ?? 0, { min: -10, max: 30, step: 0.5, format: (v) => signed(v) }, (v) => tool.setValue('trim', String(a.segmentId), v)), 'Move the cut line out for a larger junction, in for a tighter one'),
       );
-      if (a.walkLeft > 0) box.append(row('Left kerb', sliderInput(a.setting.edgeLeft ?? 0, { min: -a.walkLeft, max: Math.max(a.spareLeft, 0), step: 0.25, format: (v) => signed(v, 2) }, (v) => tool.setValue('edgeLeft', String(a.segmentId), v)), 'Looking at the junction. Negative narrows the sidewalk, positive builds it out over spare road edge'));
-      if (a.walkRight > 0) box.append(row('Right kerb', sliderInput(a.setting.edgeRight ?? 0, { min: -a.walkRight, max: Math.max(a.spareRight, 0), step: 0.25, format: (v) => signed(v, 2) }, (v) => tool.setValue('edgeRight', String(a.segmentId), v))));
+      const lim = armTrimLimits(net, this.nodeId, a.segmentId);
+      if (lim) {
+        const top = Math.min(lim.max, Math.max(lim.now + 30, lim.auto * 3));
+        box.append(row('Length', sliderInput(Math.round(lim.now * 2) / 2, { min: Math.ceil(lim.min * 2) / 2, max: Math.max(Math.ceil(lim.min * 2) / 2 + 0.5, Math.floor(top * 2) / 2), step: 0.5, format: (v) => `${v.toFixed(1)} m` }, (v) => tool.setValue('trim', String(a.segmentId), v)), `From the node to the cut line. Automatic ${lim.auto.toFixed(1)} m (${signed(lim.now - lim.auto)})`));
+      }
+      const isJunction = net.nodeGeom(this.nodeId)?.kind === 'junction';
+      if (isJunction && a.walkLeft > 0) box.append(row('Left kerb', sliderInput(a.setting.edgeLeft ?? 0, { min: -a.walkLeft, max: Math.max(a.spareLeft, 0), step: 0.25, format: (v) => signed(v, 2) }, (v) => tool.setValue('edgeLeft', String(a.segmentId), v)), 'Looking at the junction. Negative narrows the sidewalk, positive builds it out over spare road edge'));
+      if (isJunction && a.walkRight > 0) box.append(row('Right kerb', sliderInput(a.setting.edgeRight ?? 0, { min: -a.walkRight, max: Math.max(a.spareRight, 0), step: 0.25, format: (v) => signed(v, 2) }, (v) => tool.setValue('edgeRight', String(a.segmentId), v))));
       body.append(box);
     }
 

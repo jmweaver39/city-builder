@@ -44,6 +44,12 @@ Built-in road ids: `street-2`, `street-2-bike`, `street-2-oneway`, `street-4`, `
   `roadPathBetween` walks a road through joints. Splits carry paint over; deleting a road removes or cuts it.
 - `reverseSegment(id)` turns a road in place, same id, and returns a report. Change events list
   `reversedSegments`; the sim drops or re-seats vehicles on those lanes.
+- `setRoadType` (and replacing a custom type) with a different lane layout lists the segment in change events'
+  `relaidSegments`: lane indices may name other lanes now, so the sim re-seats vehicles there by position.
+- Editing a placed road's lanes: `stripForSegment` and `applyLaneStrip` in `tools/laneEdit.ts`. Applying reuses a type
+  with the same layout or adds a `custom-lanes-N` type (unused ones are tidied on the next edit), as one batch, and
+  remaps lane-indexed data (lane speeds and line styles, `laneLinks`, boundary anchors, hidden arrows, islands, paint
+  and zone offsets) by lane identity. It reports what it had to drop.
 
 ## Gotchas
 
@@ -75,6 +81,41 @@ Built-in road ids: `street-2`, `street-2-bike`, `street-2-oneway`, `street-4`, `
   `effectiveControl` gives `none` there in auto mode. Hand-set `laneLinks` still win.
 - `validateDraft` adds `wrongWay` (error: a one-way road joining against the highway traffic) and
   `atGradeHighway` (warning: a two-way road joining a highway at grade).
+- Crossings (`highwayCrossing.ts`): `JunctionControl.highwayAccess` is `'crossing'` or `'rightInOut'`; absent means
+  right in, right out, so old saves keep their junctions. `drawRoad` sets `'crossing'` on nodes it makes that are shaped
+  like a road passing straight across a highway (`crossingShaped`, `tagNewCrossings`), never on a node that already was.
+  Connectors come from `linkHighwayCrossing`, auto control is signals from `autoSignalPlan`: protected lefts, or for two
+  crossings of one-way carriageways joined by a side road of at most `PAIR_MAX` m (`crossingPair`), `pairedSignalPlan`,
+  the same fixed cycle at both nodes with every move protected and the median cleared before the far side moves.
+  `validateDraft` warns `atGradeHighway` on such a crossing too. The junction panel switches it.
+- Streets and avenues take attaches too (`isStreetHost`). No `lanes`: a side merge or slip lane on the kerb, as on a
+  highway, only the carriageway on its side, free-flow in auto mode (`isStreetMerge`), `wrongWay` if drawn against
+  it. `RampAttach.lanes` set: a terminal on the node that turns into or out of exactly those host lanes, counted
+  across the road from the edge on the attached road's side (`hostCrossSection`); left turns take the attached
+  road's left lanes. `linkStreetAttaches` links the rest of the junction as if the attached road were not there.
+  Signals, signs and `movementsAt` follow the resulting connectors. The road tool offers street lane snaps to ramps
+  (other roads with Shift held); Shift-click picks several lanes (`tools/laneSnap.ts`, `streetEndFor`).
+
+## Edge merges and lane line-ups (`edgeMerge.ts`, `laneAlign.ts`)
+
+- `RampAttach.edge` (`EdgeMergeSpec`: `mode`, `taper`, `addLength`): the ramp blends into the highway's outermost lane
+  instead of making a full junction. Absent (older saves) is a full junction. The ramp end sits beside the carriageway
+  edge (`edgeAttachPoint`), its inner carriageway edge on the narrower host's. The node lays out as `NodeGeom.kind
+  'merge'` with `NodeGeom.edge` (`EdgeMergeGeom`: taper outline and edge line, host lane edge, gore): the two highway
+  arms are untrimmed with a shared cross section, their lanes join directly (`NodeLanes.direct`), and only the ramp
+  (trimmed by the taper) has connectors, to or from the edge lane. `outline` is the taper beside the edge only.
+- Needs exactly three arms, two highway arms within 3 degrees of straight through, a one-way ramp within 25 degrees
+  of the traffic, on the outside of its carriageway (either side of a one-way highway), `lane` 0, and lanes that line
+  up. Otherwise it is the usual full junction; `net.edgeMergeProblem(node)` says why.
+- Lane add or drop: the highway past the node has one lane more or fewer and is lined up on the side away from the
+  ramp; the ramp links with the lane that has no partner. `tools/edgeMergeOps.ts` `applyRampLaneChange` builds them.
+- Sim: a lane fed by a connector and a road lane is a merge lane (`sim/compiled.ts`); `sim/merge.ts` orders vehicles
+  on the road feeder too, by time to the merge point, and `mergeClash` checks lane changes into such a lane.
+- `SegmentOverrides.alignA` / `alignB` (`'left' | 'centre' | 'right'`, along the segment's a to b): a narrower road
+  lines up with the wider one it continues at that node. The curve end (and its handle) moves sideways; only the
+  narrower road moves, and only while narrower. `endShift`, `alignedCubic`; `LaneEnd.lat` includes the shift, so
+  lanes pair by where they are. Split keeps it with its end, reverse swaps left and right. The road tool shows three
+  points across a road end of another width (`tools/endAlign.ts`); the junction panel changes it later.
 
 ## Junction shape (`junctionShape.ts`)
 
@@ -91,6 +132,10 @@ Built-in road ids: `street-2`, `street-2-bike`, `street-2-oneway`, `street-4`, `
 - Connectors: `buildNodeLanes` drops connectors through an island (`islandBlocker`) and swings turns wider round
   moved kerbs (`kerbFitter`, via `buildConnector(node, link, cubic?)`). Both are inert without a shape.
 - `segmentKerbShift(net, seg)` and `shapedKerbLines` give the kerb along a road near a shaped arm end.
+- Arm lengths: `armTrimLimits(net, node, seg)` gives `{ now, auto, min, max }` (min where the carriageway edges stop
+  overlapping the neighbours, max leaving 2 m of road). `withArmLength` sets one arm in metres from the node,
+  `withScale` multiplies every automatic trim (`shape.scale`), `applyShortestShape` finds the tightest valid node.
+  `NodeArm.autoTrim` is the trim without the shape. A dead end takes an arm trim too (its road stops short).
 
 ## Walls, barriers and quays (`walls.ts`, `terrainMods.ts`, `quays.ts`)
 
@@ -137,3 +182,58 @@ Built-in road ids: `street-2`, `street-2-bike`, `street-2-oneway`, `street-4`, `
 - `net.setTerrain(data, box)` stores a stroke (one undo step), touches the roads in the box so everything on the ground
   rebuilds, and fires `terrainChanged`. Roads are never moved by landscaping.
 
+
+## One marking standard (`paintStandard.ts`, `paintCoherence.ts`, `render/paint.ts`)
+
+- Every mark, automatic or hand-placed, takes its measures from `core/paintStandard.ts`: `LINE_W`, `DASH` by speed
+  class (`dashFor(kmh)`), `standardWidth` (a width of exactly `LINE_W.lane`/`LINE_W.edge` is drawn at the road's own
+  width: wider on fast roads), `PAINT_HEX` (one white, one yellow), `CROSSWALK`, `STOP`, `TEETH`, `ARROW`, `TEXT`,
+  `HATCH`, `GORE`, `EXIT_ONLY`, `LANE_DROP`, `PAINT_MATERIAL`, `PAINT_LAYERS`. Named looks: `LINE_STANDARDS`,
+  `FILL_STANDARDS` (the editor's built-in presets), `matchStandard(spec)`.
+- Automatic lines are `boundaryLines(...)` (now in core, with a stable `key` and `role` per line) turned into a
+  `LineStyleSpec` by `autoLineSpec`; both they and user lines become strokes through `strokesOfSpec`. Render through
+  `render/paint.ts`: `paintRoadLine` (a line along a road in the road's dash phase, `segmentDashPhase`),
+  `paintSpecAlong`, `paintCrossing`, `paintArea`, `PaintBatches` (one chunk batch per layer, one shared material from
+  `markingMaterial(shared)`). `PaintBuf.inLayer(layer, fn)` picks the stacking layer: fill < line < bar < symbol.
+- Decals store their look in `Decal.style` (lines, crosswalks, stop lines, teeth) or `Decal.fill` (areas). Saves
+  without `Project.paintStandard` are migrated on load (`markingMigrate.ts`): placement untouched, old defaults to the
+  standard, chosen measures kept.
+- Coherence (`paintCoherence.ts`): `snapToAutoLine`, `userRoadLines` / `coveredStretches` (the renderer leaves an
+  automatic line off where a hand-placed one holds it), `userRoadStamps` / `userArmMarks` (same for crosswalks, stop
+  lines, arrows). One marking per place: `slotsOf`, `stackedWith(net, item)` (what a placement would replace, named),
+  enforced in `addDecal` / `addMarking` / `addNodeMarking` (older one removed in the same batch; `net.lastReplaced`
+  names what went) and on load (`cleanStacked`, newest kept). Lines down the middle of a lane are not a slot.
+- `SegmentOverrides.paintOff`: automatic lines along a road taken away by key (`autoLinePatch`); mirrored on reverse.
+- Ordinary junctions (3+ arms, not a ramp junction; highway crossings at grade included), `render/markings.ts`: every
+  arm ends alike at `junctionSetback` (one value per junction): crosswalk kerb to kerb (shaped kerbs too), stop line
+  across the incoming lanes (always at lights or a stop sign, even where the road's `stopLines` is off), lane lines
+  square at its back. Median edge lines end where the nose narrows and turn round its tip (`medianNoseBack`, shared
+  with `render/roads.ts`); the pale outline leaves the crosswalk clear. `junctionGuides` paints nothing in the box but
+  dashed left-turn guides on big junctions (`GUIDE_MIN_TURN` metres of turn, two or more lanes in), parts `T` / `T0`...,
+  none crossing another (the main road's turns win) or a crosswalk.
+
+## Traffic rules (`trafficRules.ts`, `signalTools.ts`)
+
+- `JunctionControl.rules` (optional, types in `trafficRuleTypes.ts`): `laneArrows[`${seg}:${lane}`]` turns allowed per arriving
+  lane, and `arms[seg]` switches `uturn`, `laneChange` (straight lanes may end next door), `enterBlocked` (no wait for room
+  on the exit), `pedestrians` (false also sets the arm's crosswalk to 'none'), `nearTurnOnRed`, `farTurnOnRed` (one-way to
+  one-way). Keyed by reference: split renames, removal strips, reverse moves arrows to the mirrored lane, save keeps.
+- `applyTrafficRules(links, arms, control)` runs in `buildNodeLanes` after the automatic or hand links, so connectors,
+  painted arrows, signals and the sim follow. Without rules it returns the links untouched.
+- Edit with `setLaneArrows`, `toggleLaneArrow` (refuses the last arrow), `resetLaneArrows`, `setArmRule`, `toggleArmRule`;
+  read with `laneArrowsAt` and `armRule`; `armRuleRefusal` says when a switch does not apply.
+- `SegmentOverrides.laneBans[lane]`: vehicle classes kept off a lane (`setLaneVehicles`, `toggleLaneVehicle`). The sim
+  compiles them into `allow` bits (one per class: car, van, truck, bus, bike) and keeps a route table per class only
+  where classes differ. Speed limits are the existing `speedKmh` / `laneSpeeds` (`setRoadSpeed`, `setLaneSpeed`);
+  `UNLIMITED_KMH` (250) is "no limit".
+- `applyPriorityRoad(net, seg)` signs every junction along `priorityRoadPath` (through junctions on the straightest arm):
+  the road's arms priority, side roads yield; junctions with lights are skipped.
+- `copySignalPlan` / `pasteSignalPlan` map a plan by arm order and turn; `applyGreenWave(net, nodes, kmh)` gives each
+  plan the first one's cycle and an offset from the road distance, as fixed time.
+- Sim extras (`SimApi`, all optional): `setManualSignal`, `setManualMovement`, `signalMovements` (hand light control,
+  not saved), `clearTraffic({ stuckOnly })`, `setSpawnPaused`.
+- Transitions (two roads end to end over a junction surface): `transitionLines` in `render/markings.ts` carries the
+  centre, edge and lane lines across (lane-drop look, `lineStandard('laneDrop')`, where a lane ends; highway lane
+  drops and exits get `laneEndLines`). Lane-drop paint comes only from these two. `RoadPaintPiece.offset` lets one
+  Paint line keep its own offset on each road it crosses; the Paint tool's cursor over a junction surface lands on the
+  nearest arm's cut (`junctionCursor` in `tools/roadAnchors.ts`).

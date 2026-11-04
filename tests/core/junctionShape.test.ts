@@ -2,6 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   RoadNetwork,
   applyJunctionShape,
+  applyShortestShape,
+  armTrimLimits,
+  editableShape,
+  withArmLength,
+  withCorner,
+  withScale,
   armInfos,
   checkNetworkInvariants,
   connectorClearances,
@@ -384,5 +390,120 @@ describe('Connectors and kerbs', () => {
       }
       expect(accepted).toBeGreaterThan(tries.length / 2);
     }
+  });
+});
+
+describe('Node length', () => {
+  const lengthOf = (net: RoadNetwork, node: Id, seg: Id) => net.nodeGeom(node)!.arms.find((a) => a.segmentId === seg)!.trim;
+
+  it('shortens and lengthens one arm, with the road, lanes and outline following', () => {
+    const { net, node } = crossing();
+    const seg = net.getNode(node)!.segments[0];
+    const before = lengthOf(net, node, seg);
+    for (const want of [5, 12, 30, 100]) {
+      const res = applyJunctionShape(net, node, withArmLength(net, node, editableShape(net, node), seg, want));
+      expect(res.ok, `${want}: ${res.problems.map((p) => p.message)}`).toBe(true);
+      expect(lengthOf(net, node, seg)).toBeCloseTo(want, 5);
+      const g = net.segmentGeom(seg)!;
+      expect(net.getSegment(seg)!.a === node ? g.trimA : g.trimB).toBeCloseTo(want, 5);
+      expect(polygonSelfIntersects(net.nodeGeom(node)!.outline)).toBe(false);
+      expect(checkNetworkInvariants(net)).toEqual([]);
+      expectConnectorsContinuous(net.laneGraph, node);
+      expect(lanesWithoutExit(net.laneGraph)).toEqual([]);
+    }
+    // 100 m is past the 80 m an automatic trim can reach: the limits come from the road.
+    expect(lengthOf(net, node, seg)).toBeGreaterThan(80);
+    expect(before).toBeLessThan(10);
+  });
+
+  it('refuses an arm shorter than where its lanes would overlap the next road, and says how short it can go', () => {
+    const { net, node } = crossing();
+    const seg = net.getNode(node)!.segments[0];
+    const lim = armTrimLimits(net, node, seg)!;
+    // street-2 meeting street-2 square on: the carriageway edges cross 3.5 m out.
+    expect(lim.min).toBeCloseTo(3.8, 1);
+    expect(lim.max).toBeGreaterThan(100);
+    const res = applyJunctionShape(net, node, withArmLength(net, node, {}, seg, 3.5));
+    expect(res.ok).toBe(false);
+    expect(res.problems[0].code).toBe('tooTight');
+    expect(res.problems[0].message).toMatch(/3\.8 m/);
+    expect(res.problems[0].target).toEqual({ kind: 'arm', segmentId: seg });
+    expect(applyJunctionShape(net, node, withArmLength(net, node, {}, seg, 4)).ok).toBe(true);
+    const tooLong = applyJunctionShape(net, node, withArmLength(net, node, editableShape(net, node), seg, lim.max + 5));
+    expect(tooLong.ok).toBe(false);
+    expect(tooLong.problems[0].message).toMatch(/no road left/);
+  });
+
+  it('scales the whole junction, and finds the shortest it can be', () => {
+    const { net, node } = crossing();
+    const segs = net.getNode(node)!.segments;
+    const auto = segs.map((s) => lengthOf(net, node, s));
+    expect(applyJunctionShape(net, node, withScale({}, 1.5)).ok).toBe(true);
+    segs.forEach((s, i) => expect(lengthOf(net, node, s)).toBeCloseTo(auto[i] * 1.5, 5));
+    expect(applyJunctionShape(net, node, withScale({}, 0.6)).ok).toBe(true);
+    segs.forEach((s, i) => expect(lengthOf(net, node, s)).toBeCloseTo(auto[i] * 0.6, 5));
+    const tight = applyJunctionShape(net, node, withScale({}, 0.3));
+    expect(tight.ok).toBe(false);
+    expect(tight.problems[0].code).toBe('tooTight');
+    const res = applyShortestShape(net, node);
+    expect(res.ok, res.problems.map((p) => p.message).join()).toBe(true);
+    for (const s of segs) {
+      const lim = armTrimLimits(net, node, s)!;
+      expect(lengthOf(net, node, s)).toBeGreaterThanOrEqual(lim.min - 1e-6);
+      expect(lengthOf(net, node, s)).toBeLessThan(auto[0] * 0.6);
+    }
+    expectConnectorsContinuous(net.laneGraph, node);
+    expect(lanesWithoutExit(net.laneGraph)).toEqual([]);
+    // Scale is saved with the shape.
+    applyJunctionShape(net, node, withScale({}, 1.25));
+    expect(new RoadNetwork(net.serialize()).getNode(node)!.control.shape?.scale).toBe(1.25);
+  });
+
+  it('keeps its shape when the node is moved', () => {
+    const { net, node } = crossing('avenue-4', 'street-2');
+    const segs = net.getNode(node)!.segments;
+    const key = cornerInfos(net, node)[0].key;
+    let shape = withCorner({}, key, { radius: 6 });
+    shape = withArmLength(net, node, shape, segs[1], 14);
+    expect(applyJunctionShape(net, node, shape).ok).toBe(true);
+    const saved = structuredClone(net.getNode(node)!.control.shape);
+    const pos = net.getNode(node)!.pos;
+    net.moveNode(node, { x: pos.x + 6, y: pos.y, z: pos.z - 4 });
+    expect(net.getNode(node)!.control.shape).toEqual(saved);
+    expect(lengthOf(net, node, segs[1])).toBeCloseTo(14, 0);
+    expect(cornerInfos(net, node).find((c) => c.key === key)!.radius).toBe(6);
+    expect(net.nodeGeom(node)!.outlineSimplified).toBe(false);
+    expect(checkNetworkInvariants(net)).toEqual([]);
+  });
+
+  it('stretches the taper where a road changes lane count', () => {
+    const net = new RoadNetwork();
+    const first = net.drawRoad({ start: free(-120, 0), end: free(0, 0), roadType: 'street-4' });
+    const node = net.getSegment(first.segments[0])!.b;
+    net.drawRoad({ start: { kind: 'node', id: node }, end: free(120, 0), roadType: 'street-2' });
+    expect(net.nodeGeom(node)!.kind).toBe('junction');
+    const segs = net.getNode(node)!.segments;
+    const short = segs.map((s) => lengthOf(net, node, s));
+    let shape: JunctionShape = {};
+    for (const s of segs) shape = withArmLength(net, node, shape, s, 20);
+    expect(applyJunctionShape(net, node, shape).ok).toBe(true);
+    for (const s of segs) expect(lengthOf(net, node, s)).toBeCloseTo(20, 5);
+    expect(Math.max(...short)).toBeLessThan(20);
+    expectConnectorsContinuous(net.laneGraph, node);
+    expect(lanesWithoutExit(net.laneGraph)).toEqual([]);
+  });
+
+  it('lets a dead end stop short of its node', () => {
+    const net = new RoadNetwork();
+    const r = net.drawRoad({ start: free(0, 0), end: free(60, 0), roadType: 'street-2' });
+    const seg = r.segments[0];
+    const end = net.getSegment(seg)!.b;
+    expect(net.nodeGeom(end)!.kind).toBe('deadEnd');
+    expect(applyJunctionShape(net, end, withArmLength(net, end, {}, seg, 10)).ok).toBe(true);
+    expect(net.segmentGeom(seg)!.trimB).toBeCloseTo(10, 5);
+    expect(net.nodeGeom(end)!.arms[0].trim).toBeCloseTo(10, 5);
+    expect(applyJunctionShape(net, end, withArmLength(net, end, editableShape(net, end), seg, 59)).ok).toBe(false);
+    expect(applyJunctionShape(net, end, { corners: { [`${seg}>${seg}`]: { radius: 3 } } }).ok).toBe(false);
+    expect(checkNetworkInvariants(net)).toEqual([]);
   });
 });

@@ -9,6 +9,7 @@ import type { RoadNetwork } from '../core/RoadNetwork';
 import { closestPointOnCubic } from '../core/bezier';
 import { totalHalfWidth } from '../core/roadTypes';
 import { effectiveControl } from '../core/signals';
+import { autoLampSide } from '../core/roadUpgrades';
 import { surfaceLevel, terrainHeight } from '../core/terrain';
 import type { LightState, SignalHead, SimApi } from '../sim/api';
 import { ChunkBatch, SURF_SCHEMA, SurfBuf, type SurfStyle } from './batch';
@@ -366,6 +367,8 @@ export class FurnitureLayer {
         const z = a.pos.z + (b.pos.z - a.pos.z) * f;
         // Alternate sides on streets. Fast roads keep to the right edge.
         const side = isFast || k % 2 === 0 ? 1 : -1;
+        // Street lights set by the Upgrade cards replace the automatic ones on that side.
+        if (!autoLampSide(seg.overrides, side)) continue;
         const rx = a.right.x * side;
         const rz = a.right.z * side;
         const px = x + rx * reach;

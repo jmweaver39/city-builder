@@ -5,7 +5,7 @@
  * flag saying which way to go. Infinity means no route at all.
  */
 import { effectiveLanes, type Id, type RoadNetwork, type TrafficEndpoint, type VehicleMix } from '../core';
-import { ALLOW_BIKE, ALLOW_BUS, ALLOW_CAR, type CompiledGraph } from './compiled';
+import { ALLOW_CAR, TYPE_BITS, type CompiledGraph } from './compiled';
 import { LANE_CHANGE_COST_SEC } from './constants';
 import type { JunctionSystem } from './junctions';
 
@@ -229,11 +229,21 @@ export class RouteTable {
 export class Routing {
   places: Place[] = [];
   n = 0;
+  /**
+   * One table per vehicle class (VEHICLE_TYPES order). Classes that may use exactly
+   * the same lanes share one object, so a network without bus lanes, bike lanes or
+   * vehicle bans computes a single table.
+   */
+  tables: RouteTable[] = [];
   car: RouteTable;
-  /** Same object as `car` when the network has no bus-only lanes. */
+  /** Same object as `car` when buses may use exactly the lanes cars may. */
   bus: RouteTable;
-  /** Empty when the network has no bike lanes. */
+  /** Same object as `car` when the network has no bike lanes. */
   bike: RouteTable;
+  van: RouteTable;
+  truck: RouteTable;
+  /** Per class: the class whose table it shares (itself when it has its own). */
+  private owner: number[] = [0, 0, 0, 0, 0];
   /** Per lane: 1 when some place sinks here. */
   sinkFlag: Uint8Array;
   /** Turnarounds at gateways, which routes may not use. */
@@ -251,6 +261,9 @@ export class Routing {
     this.car = new RouteTable(0, 0);
     this.bus = this.car;
     this.bike = this.car;
+    this.van = this.car;
+    this.truck = this.car;
+    this.tables = TYPE_BITS.map(() => this.car);
     this.sinkFlag = new Uint8Array(g.n);
     this.edgeOfMap = new Uint8Array(g.n);
     this.laneFlow = new Float64Array(g.n).fill(1);
@@ -270,15 +283,31 @@ export class Routing {
     this.places = places;
     const { g } = this;
     const rows = places.length;
-    this.car = new RouteTable(rows, g.n);
-    let busOnly = false;
-    let bikes = false;
-    for (let i = 0; i < g.n; i++) {
-      if (g.allow[i] === ALLOW_BUS) busOnly = true;
-      else if (g.allow[i] === ALLOW_BIKE) bikes = true;
-    }
-    this.bus = busOnly ? new RouteTable(rows, g.n) : this.car;
-    this.bike = bikes ? new RouteTable(rows, g.n) : this.car;
+    // Classes allowed on exactly the same lanes share a table.
+    const owner: number[] = [];
+    this.tables = [];
+    TYPE_BITS.forEach((bit, t) => {
+      let same = -1;
+      for (let u = 0; u < t && same < 0; u++) {
+        const other = TYPE_BITS[u];
+        let equal = true;
+        for (let i = 0; i < g.n; i++) {
+          if (!(g.allow[i] & bit) !== !(g.allow[i] & other)) {
+            equal = false;
+            break;
+          }
+        }
+        if (equal) same = owner[u];
+      }
+      owner.push(same >= 0 ? same : t);
+      this.tables.push(same >= 0 ? this.tables[same] : new RouteTable(rows, g.n));
+    });
+    this.owner = owner;
+    this.car = this.tables[0];
+    this.van = this.tables[1];
+    this.truck = this.tables[2];
+    this.bus = this.tables[3];
+    this.bike = this.tables[4];
     this.sinkFlag.fill(0);
     this.edgeOfMap.fill(0);
     for (const p of places) {
@@ -311,9 +340,12 @@ export class Routing {
   }
 
   private compute(row: number): void {
-    this.computeFor(row, this.car, ALLOW_CAR);
-    if (this.bus !== this.car) this.computeFor(row, this.bus, ALLOW_BUS);
-    if (this.bike !== this.car) this.computeFor(row, this.bike, ALLOW_BIKE);
+    for (let t = 0; t < this.tables.length; t++) if (this.owner[t] === t) this.computeFor(row, this.tables[t], TYPE_BITS[t]);
+  }
+
+  /** The cost table a vehicle of this type (VEHICLE_TYPES index) routes by. */
+  tableFor(type: number): RouteTable {
+    return this.tables[type] ?? this.car;
   }
 
   private computeFor(row: number, table: RouteTable, bit: number): void {

@@ -9,6 +9,8 @@ import type { World } from './world';
 const RELOCATE_BUDGET = 3_000_000;
 /** How far a vehicle may be snapped to a lane near where it was. */
 const SNAP_DIST = 25;
+/** How far a vehicle on a connector may be moved when the connectors are rebuilt. */
+const CONNECTOR_KEEP = 2;
 
 function pointOn(old: CompiledGraph, lane: number, s: number, out: { x: number; z: number; dx: number; dz: number }): void {
   const { ptStart, cum, pts } = old;
@@ -87,11 +89,14 @@ export function remapVehicles(w: World, oldG: CompiledGraph, oldGraph: LaneGraph
   }
   const canSnap = changed.length * veh.liveCount * 24 < RELOCATE_BUDGET;
   const p = { x: 0, z: 0, dx: 0, dz: 0 };
+  const q = { x: 0, z: 0, dx: 0, dz: 0 };
   const hit = { lane: -1, s: 0 };
   const carry = (l: number): number => {
     if (l < 0 || same) return l;
-    const key = oldGraph.lanes[l]?.key;
-    return key === undefined ? -1 : (graph.byKey.get(key) ?? -1);
+    const old = oldGraph.lanes[l];
+    // On a turned or re-laid road the same key may name another lane now.
+    if (!old || reversed?.has(old.segmentId)) return -1;
+    return graph.byKey.get(old.key) ?? -1;
   };
 
   for (let i = veh.liveCount - 1; i >= 0; i--) {
@@ -105,11 +110,32 @@ export function remapVehicles(w: World, oldG: CompiledGraph, oldGraph: LaneGraph
     const oldLen = oldG.len[old];
     let s = veh.s[v];
     let placed = false;
-    if (!same && canSnap && changed.length && (lane < 0 || Math.abs(g.len[lane] - oldLen) > 2)) {
+    // A connector's key names the lanes it joins by index, so when a road at its node is
+    // re-laid or turned round the same key can name another path through the junction.
+    // Keep it only if it still runs where the vehicle is; otherwise look for the path now
+    // under the vehicle among the node's connectors.
+    if (!same && oldG.isConn[old]) {
+      pointOn(oldG, old, s, p);
+      if (lane >= 0) {
+        pointOn(g, lane, (s / oldLen) * g.len[lane], q);
+        if (Math.hypot(p.x - q.x, p.z - q.z) > CONNECTOR_KEEP || p.dx * q.dx + p.dz * q.dz < 0.9) lane = -1;
+      }
+      if (lane < 0) {
+        const at = graph.connectorsAt.get(oldGraph.lanes[old].nodeId);
+        if (at && nearestOn(g, at, p, hit) < CONNECTOR_KEEP) {
+          lane = hit.lane;
+          s = hit.s;
+          placed = true;
+        }
+      }
+    }
+    if (!same && canSnap && changed.length && !placed && (lane < 0 || Math.abs(g.len[lane] - oldLen) > 2)) {
       pointOn(oldG, old, s, p);
       const candidates = lane >= 0 && !changed.includes(lane) ? [...changed, lane] : changed;
       const dist = nearestOn(g, candidates, p, hit);
-      if (dist < SNAP_DIST) {
+      // Inside a junction the road lanes are well off to the side: none of them is a place
+      // to put a vehicle that was turning across it.
+      if (dist < (oldG.isConn[old] ? CONNECTOR_KEEP : SNAP_DIST)) {
         lane = hit.lane;
         s = hit.s;
         placed = true;
@@ -128,7 +154,8 @@ export function remapVehicles(w: World, oldG: CompiledGraph, oldGraph: LaneGraph
     veh.nextLane[v] = -1;
     veh.stratTick[v] = 0;
     veh.reqLane[v] = -1;
-    veh.lcFrom[v] = carry(veh.lcFrom[v]);
+    // Re-seated by position, a lane change in progress has nothing to slide from.
+    veh.lcFrom[v] = placed ? -1 : carry(veh.lcFrom[v]);
     veh.prev1[v] = carry(veh.prev1[v]);
     veh.prev2[v] = carry(veh.prev2[v]);
     veh.permit[v] = -1;

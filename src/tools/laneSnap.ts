@@ -1,5 +1,5 @@
 /**
- * Lane snapping for ramps. Hovering a highway with the road tool offers a snap
+ * Lane snapping for ramps. Hovering a highway (or a street, see streetEndFor) offers a snap
  * point on every lane. The chosen lane decides where a ramp leaves or joins (the
  * outer edge of its carriageway, aligned with the traffic) and which lanes feed
  * it (the chosen lane and every lane outside it). Pure functions over a network.
@@ -7,7 +7,7 @@
 import { cubicPoint, cubicTangentXZ, type Cubic } from '../core/bezier';
 import { addScaled, dotXZ, rightOf, scale, sub } from '../core/math';
 import type { RoadAnchor, RoadNetwork } from '../core/RoadNetwork';
-import { carriagewayEdge, hostDirection, makeAttach, pickHost } from '../core/ramps';
+import { carriagewayEdge, hostDirection, isStreetHost, makeAttach, pickHost } from '../core/ramps';
 import { effectiveLanes, isOneWay } from '../core/roadTypes';
 import type { Id, RampAttach, Vec3 } from '../core/types';
 
@@ -24,6 +24,8 @@ export interface LaneSpot {
   edge: Vec3;
   /** Direction the lane's traffic runs. */
   travel: Vec3;
+  /** Offset right of the host's a-to-b at the snap. */
+  lateral: number;
 }
 
 export interface LaneChoice {
@@ -32,6 +34,12 @@ export interface LaneChoice {
   hostDir: Vec3;
   lanes: LaneSpot[];
   chosen: LaneSpot;
+  /** The host is a street or avenue rather than a highway: terminals and side merges. */
+  street: boolean;
+  /** Snap point on the host centreline. */
+  pos: Vec3;
+  /** Lanes picked with Shift-click, as well as or instead of the chosen one. */
+  picked: LaneSpot[];
 }
 
 /** The highway under a segment or node anchor, with its direction there. */
@@ -59,7 +67,8 @@ export function laneChoiceAt(net: RoadNetwork, anchor: RoadAnchor, cursor: Vec3)
   if (!at) return null;
   const seg = net.getSegment(at.host)!;
   const def = net.roadTypeOf(at.host);
-  if (def.category !== 'highway') return null;
+  const street = isStreetHost(def.category);
+  if (def.category !== 'highway' && !street) return null;
   const all = effectiveLanes(def, seg.overrides);
   const lanes = all.filter((l) => l.kind === 'drive' || l.kind === 'bus');
   if (!lanes.length) return null;
@@ -79,6 +88,7 @@ export function laneChoiceAt(net: RoadNetwork, anchor: RoadAnchor, cursor: Vec3)
       centre: addScaled(at.pos, right, l.offset),
       edge: addScaled(at.pos, right, carriagewayEdge(all, 1, side)),
       travel,
+      lateral: l.offset,
     };
   });
   const lateral = dotXZ(sub(cursor, at.pos), right);
@@ -86,7 +96,52 @@ export function laneChoiceAt(net: RoadNetwork, anchor: RoadAnchor, cursor: Vec3)
   for (const s of spots) {
     if (Math.abs(dotXZ(sub(s.centre, at.pos), right) - lateral) < Math.abs(dotXZ(sub(chosen.centre, at.pos), right) - lateral)) chosen = s;
   }
-  return { host: at.host, hostDir: at.dir, lanes: spots, chosen };
+  return { host: at.host, hostDir: at.dir, lanes: spots, chosen, street, pos: { ...at.pos }, picked: [] };
+}
+
+/** Sharpest a one-way road may meet a street and still merge along its kerb, radians. */
+const SIDE_MERGE_ANGLE = (35 * Math.PI) / 180;
+
+/** How a road meets a street at a lane choice: where its end goes and the attach it gets. */
+export interface StreetEnd {
+  attach: RampAttach;
+  /** A side merge on the kerb, rather than a terminal on the node. */
+  side: boolean;
+  /** Where the road's end goes. */
+  pos: Vec3;
+  /** Direction its traffic must run there, or null when free (a terminal). */
+  travel: Vec3 | null;
+  /** The lanes used, nearest the road first, with the turn into or out of each. */
+  lanes: { spot: LaneSpot; turn: 'left' | 'right' | 'merge' }[];
+}
+
+/**
+ * A road from `other` meeting a street at a lane choice. A one-way road arriving
+ * along the kerb, on lanes of its own side only, merges there like a highway ramp;
+ * anything else is a terminal on the node that turns into exactly the lanes used.
+ */
+export function streetEndFor(choice: LaneChoice, other: Vec3, oneWay: boolean): StreetEnd {
+  const right = rightOf(choice.hostDir);
+  const away = sub(other, choice.pos);
+  const roadSide: 1 | -1 = dotXZ(away, right) >= 0 ? 1 : -1;
+  // Every lane across, nearest the road's side first: the order RampAttach.lanes counts in.
+  const across = [...choice.lanes].sort((a, b) => (b.lateral - a.lateral) * roadSide);
+  const used = choice.picked.length ? choice.picked : [choice.chosen];
+  const positions = [...new Set(used.map((u) => across.findIndex((s) => Math.abs(s.lateral - u.lateral) < 1e-3)))].filter((p) => p >= 0).sort((a, b) => a - b);
+  const near = across[0];
+  const len = Math.hypot(away.x, away.z);
+  const shallow = len > 1e-3 && Math.abs(dotXZ(away, choice.hostDir)) / len > Math.cos(SIDE_MERGE_ANGLE);
+  const sameWay = positions.every((p) => dotXZ(across[p].travel, near.travel) > 0);
+  const hostSide = makeAttach(0, choice.hostDir, scale(choice.hostDir, 1), roadSide).hostSide;
+  if (oneWay && shallow && sameWay && positions.length) {
+    const lane = positions[positions.length - 1];
+    // The road runs with the near lanes' traffic.
+    const attach = makeAttach(lane, choice.hostDir, near.travel, roadSide);
+    return { attach, side: true, pos: { ...near.edge }, travel: near.travel, lanes: positions.map((p) => ({ spot: across[p], turn: 'merge' })) };
+  }
+  // A lane running the same way as the near kerb lane is turned into to the right.
+  const lanes = positions.map((p) => ({ spot: across[p], turn: (dotXZ(across[p].travel, near.travel) > 0 ? 'right' : 'left') as 'left' | 'right' }));
+  return { attach: { lane: 0, hostSide, lanes: positions }, side: false, pos: { ...choice.pos }, travel: null, lanes };
 }
 
 /** The attach for a road leaving (or joining) the chosen lane along `rampDir`. */

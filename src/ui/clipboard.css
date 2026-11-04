@@ -1,0 +1,47 @@
+/* The clipboard chip by the cursor (app/clipboard.ts): what a middle-click copied. */
+.clip-chip {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 40;
+  display: none;
+  align-items: center;
+  gap: 5px;
+  max-width: 260px;
+  padding: 2px 8px 2px 6px;
+  border-radius: 10px;
+  border: 1px solid rgba(79, 209, 255, 0.55);
+  background: rgba(14, 26, 44, 0.86);
+  color: #cfefff;
+  font: 500 11px/16px system-ui, -apple-system, 'Segoe UI', sans-serif;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.clip-chip.shown {
+  display: inline-flex;
+}
+.clip-chip span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.clip-chip .clip-icon {
+  display: inline-flex;
+  color: #4fd1ff;
+}
+.clip-chip.pulse {
+  animation: clip-pulse 0.6s ease-out;
+}
+@keyframes clip-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(79, 209, 255, 0.7);
+  }
+  100% {
+    box-shadow: 0 0 0 10px rgba(79, 209, 255, 0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .clip-chip.pulse {
+    animation: none;
+  }
+}

@@ -1,179 +1,111 @@
 /** Pillars, barriers and tunnel portals, swept or placed along road frames. */
 import type { Id, RoadTypeDef } from '../core/types';
 import type { RoadNetwork } from '../core/RoadNetwork';
-import { closestPointOnCubic } from '../core/bezier';
 import { sidewalkOn, totalHalfWidth } from '../core/roadTypes';
-import { terrainHeight } from '../core/terrain';
-import { COL, DECK_DEPTH, ELEVATED_CLEARANCE, KIND_CONCRETE, KIND_PLAIN, KIND_STEEL, TUNNEL_CLEARANCE, TUNNEL_Y, ROAD_LIFT } from './constants';
+import { COL, DECK_DEPTH, ELEVATED_CLEARANCE, KIND_CONCRETE, KIND_PLAIN, KIND_STEEL, TUNNEL_CLEARANCE, TUNNEL_Y, ROAD_LIFT, hexRGB } from './constants';
 import type { SurfBuf, SurfStyle } from './batch';
 import { isTunnelFrame, type Frame } from './frames';
 import { ribbon, runsOf, type RoadOutputs } from './roads';
-import { belowDeck, columnClear } from './piers';
+import { FOOTING, frameAt, planNodeSupport, planSupports, soffitLayout, type PierPlan, type PlannedPier } from './piers';
+import { beam, column } from './pierKit';
 
-const PILLAR_SPACING = 34;
-/** Below this clearance a span needs no pier. */
-const MIN_PIER_CLEARANCE = 3.2;
+export type { PierPlan, PlannedPier } from './piers';
 
-function frameAt(frames: readonly Frame[], s: number): Frame | null {
-  if (s < frames[0].s || s > frames[frames.length - 1].s) return null;
-  for (let i = 0; i + 1 < frames.length; i++) {
-    const a = frames[i];
-    const b = frames[i + 1];
-    if (s > b.s) continue;
-    const f = (s - a.s) / Math.max(b.s - a.s, 1e-6);
-    const x = a.x + (b.x - a.x) * f;
-    const y = a.y + (b.y - a.y) * f;
-    const z = a.z + (b.z - a.z) * f;
-    const rx = a.rx + (b.rx - a.rx) * f;
-    const rz = a.rz + (b.rz - a.rz) * f;
-    const rl = Math.hypot(rx, rz) || 1;
-    // The frames' own ground, which knows about embankments and cuts.
-    const ground = a.ground + (b.ground - a.ground) * f;
-    return { ...a, x, y, z, rx: rx / rl, rz: rz / rl, s, ground, c: y - ROAD_LIFT - ground };
-  }
-  return null;
-}
+/** Pier concrete: clean, the underside of caps a shade darker, and a weathered foot. */
+const PIER: SurfStyle = { color: COL.concrete, kind: KIND_CONCRETE, slot: 0, bias: 0 };
+const PIER_UNDER: SurfStyle = { color: COL.concreteDark, kind: KIND_CONCRETE, slot: 0, bias: 0 };
+const PIER_STAIN: SurfStyle = { color: hexRGB(0x8c887f), kind: KIND_CONCRETE, slot: 0, bias: 0 };
+const BEARING: SurfStyle = { color: hexRGB(0x5d6266), kind: KIND_STEEL, slot: 0, bias: 0 };
+/** Gap between a cap's top and the deck soffit, where the bearings sit. */
+const BEARING_GAP = 0.12;
+const COLUMN_SIDES = 18;
 
-/** True when a column at this spot would stand in another road. */
-function hitsLowerRoad(net: RoadNetwork, selfId: Id, x: number, z: number, y: number, radius: number): boolean {
-  const r = 26;
-  const near = net.segmentsInRegion({ minX: x - r, minZ: z - r, maxX: x + r, maxZ: z + r }, true);
-  for (const id of near) {
-    if (id === selfId) continue;
-    const seg = net.getSegment(id);
-    if (!seg) continue;
-    const hit = closestPointOnCubic(net.cubicOf(id), { x, y: 0, z });
-    const dx = hit.point.x - x;
-    const dz = hit.point.z - z;
-    const reach = totalHalfWidth(net.roadTypeOf(id)) + radius + 0.6;
-    if (dx * dx + dz * dz < reach * reach && hit.point.y < y - 2) return true;
-  }
-  return false;
-}
-
-/** One bridge pier: footing, column or columns, a flared cap and bearings. */
-function addPier(buf: SurfBuf, f: Frame, halfWidth: number, style: SurfStyle): void {
-  const fx = f.rz;
-  const fz = -f.rx;
-  const top = f.y - DECK_DEPTH;
-  const capH = 1.1;
-  const base = f.ground - 1;
-  const capHalf = Math.max(1.8, halfWidth * 0.86);
-  const dark: SurfStyle = { ...style, color: COL.concreteDark };
-  buf.taperBeam(f.x, top - capH, top, f.z, capHalf, capHalf * 0.42, 0.95, f.rx, f.rz, fx, fz, style);
-  const count = Math.max(2, Math.round((halfWidth * 2) / 3.4));
-  for (let g = 0; g < count; g++) {
-    const o = -halfWidth * 0.8 + (halfWidth * 1.6 * g) / (count - 1);
-    buf.box(f.x + f.rx * o, top + 0.04, f.z + f.rz * o, 0.32, 0.05, 0.3, f.rx, f.rz, fx, fz, dark);
-  }
-  const col = (x: number, z: number, r: number) => {
-    buf.prism(x, z, base, top - capH + 0.05, r, 12, style);
-    buf.prism(x, z, top - capH - 0.5, top - capH + 0.05, r * 1.16, 12, style);
-    const g = terrainHeight(x, z);
-    buf.box(x, g + 0.1, z, r * 1.7, 0.3, r * 1.7, f.rx, f.rz, fx, fz, dark);
-  };
-  if (halfWidth > 13) {
-    const off = halfWidth * 0.46;
-    col(f.x + f.rx * off, f.z + f.rz * off, 1.05);
-    col(f.x - f.rx * off, f.z - f.rz * off, 1.05);
-  } else {
-    col(f.x, f.z, Math.min(1.5, 0.8 + halfWidth * 0.07));
-  }
-}
-
-export function addPierAt(buf: SurfBuf, x: number, y: number, z: number, radius: number, style: SurfStyle): void {
-  buf.prism(x, z, terrainHeight(x, z) - 1, y - DECK_DEPTH + 0.1, radius, 12, style);
-}
-
-/** Columns of a pier at frame f, as addPier places them. */
-function pierColumns(f: Frame, halfWidth: number): { x: number; z: number; r: number }[] {
-  if (halfWidth > 13) {
-    const off = halfWidth * 0.46;
-    return [
-      { x: f.x + f.rx * off, z: f.z + f.rz * off, r: 1.05 * 1.7 },
-      { x: f.x - f.rx * off, z: f.z - f.rz * off, r: 1.05 * 1.7 },
-    ];
-  }
-  const r = Math.min(1.5, 0.8 + halfWidth * 0.07);
-  return [{ x: f.x, z: f.z, r: r * 1.7 }];
-}
-
-/** A portal frame: two legs outside the deck edges and a cross beam, straddling what is below. */
-function addPortal(buf: SurfBuf, f: Frame, halfWidth: number, legOff: number, style: SurfStyle): void {
-  const fx = f.rz;
-  const fz = -f.rx;
-  const top = f.y - DECK_DEPTH;
-  for (const side of [-1, 1]) {
-    const x = f.x + f.rx * side * legOff;
-    const z = f.z + f.rz * side * legOff;
-    buf.prism(x, z, terrainHeight(x, z) - 1, top - 1.2, 0.9, 12, style);
-  }
-  buf.box(f.x, top - 0.6, f.z, legOff + 0.9, 0.6, 1.0, f.rx, f.rz, fx, fz, style, { bottom: true });
-  void halfWidth;
-}
-
-export interface PierPlan {
-  piers: { f: Frame; kind: 'pier' | 'portal'; columns: { x: number; z: number; r: number }[]; legOff: number }[];
-  /** Spans with nowhere to stand, carried by steel girders: [from s, to s]. */
-  girders: [number, number][];
+/** A tapered column on a footing pad, from the ground up to `top`. */
+function addColumn(buf: SurfBuf, x: number, z: number, ax: number, az: number, ground: number, top: number, rc: number, stretch: number, taper = 0.86): void {
+  column(buf, { x, z, ax, az, y0: ground - 0.6, y1: top, ground, r0: rc, r1: rc * taper, stretch, sides: COLUMN_SIDES }, PIER, PIER_STAIN);
+  // Footing pad, flush with the ground, rounded like the column.
+  const pad = rc + FOOTING;
+  column(buf, { x, z, ax, az, y0: ground - 0.3, y1: ground + 0.08, ground: ground - 0.3, r0: pad, r1: pad - 0.04, stretch, sides: COLUMN_SIDES, top: true }, PIER_STAIN, PIER_STAIN);
 }
 
 /**
- * Where a deck's supports go: regular spacing, shifted along the span to miss
- * whatever is below, a portal frame straddling it where a pier cannot stand, and
- * a long girder span where neither fits.
+ * One planned support in the shared style: tapered round or rounded-rectangle
+ * columns with a weathered foot, a hammerhead or portal cap beam with rounded ends
+ * (cut back to sit inside the deck where what passes under needs the headroom),
+ * and bearings between cap and soffit.
  */
+function addSupport(buf: SurfBuf, detail: SurfBuf, p: PlannedPier, def: RoadTypeDef): void {
+  const f = p.f;
+  const soffit = f.y - DECK_DEPTH;
+  const lay = soffitLayout(def);
+  const fx = f.rz;
+  const fz = -f.rx;
+  let colTop = soffit + 0.05;
+  if (p.capDepth > 0) {
+    const top = soffit - BEARING_GAP;
+    const d = p.capDepth;
+    const cols = p.columns.map((c) => c.o);
+    let depth: (u: number) => number;
+    const breaks: number[] = [];
+    if (p.kind === 'hammer') {
+      // Deep over the column, thinning towards the rounded ends.
+      const c = cols[0];
+      const core = p.columns[0].rc * 1.15 + p.columns[0].stretch + 0.25;
+      const reach = Math.max(0.5, Math.max(c - p.capL, p.capR - c) - core);
+      depth = (u) => d * (0.48 + 0.52 * Math.max(0, Math.min(1, 1 - (Math.abs(u - c) - core) / reach)));
+      breaks.push(c - core, c + core);
+    } else {
+      // Even depth with a gentle haunch over each leg.
+      depth = (u) => {
+        let h = 0;
+        for (const c of cols) h = Math.max(h, 1 - Math.abs(u - c) / 2.4);
+        return d * (0.88 + 0.12 * Math.max(0, h));
+      };
+      for (const c of cols) breaks.push(c - 2.4, c, c + 2.4);
+    }
+    for (let u = Math.ceil(p.capL); u < p.capR; u += 1.5) breaks.push(u);
+    beam(buf, { x: f.x, z: f.z, ux: f.rx, uz: f.rz, u0: p.capL, u1: p.capR, thick: p.capThick, top, depth, breaks, endSteps: 5 }, PIER, PIER_UNDER);
+    // Bearings under each girder web (or along the trough), on the cap.
+    const at = lay.kind === 'box' ? lay.boxes.flatMap((b) => [b.c - b.bottom * 0.7, b.c + b.bottom * 0.7]) : [lay.centre - lay.capHalf * 0.7, lay.centre + lay.capHalf * 0.7];
+    for (const o of at) detail.box(f.x + f.rx * o, top + BEARING_GAP / 2, f.z + f.rz * o, 0.32, BEARING_GAP / 2, 0.28, f.rx, f.rz, fx, fz, BEARING);
+    colTop = top - depth(0) + 0.05;
+    for (const c of p.columns) {
+      addColumn(buf, c.x, c.z, f.rx, f.rz, c.ground, top - depth(c.o) + 0.05, c.rc, c.stretch);
+    }
+    return;
+  }
+  // Cap built into the deck: a portal still needs its cross beam, inside the deck depth.
+  if (p.kind === 'portal') {
+    const top = f.y - 0.45;
+    const dd = top - soffit;
+    beam(buf, { x: f.x, z: f.z, ux: f.rx, uz: f.rz, u0: p.capL, u1: p.capR, thick: p.capThick, top, depth: () => dd, endSteps: 5 }, PIER, PIER_UNDER);
+    colTop = soffit + 0.05;
+  }
+  for (const c of p.columns) addColumn(buf, c.x, c.z, f.rx, f.rz, c.ground, colTop, c.rc, c.stretch);
+}
+
+/** The column under an elevated junction, with a flared head under its slab, clear of what is below. */
+export function addNodePier(net: RoadNetwork, nodeId: Id, buf: SurfBuf): void {
+  const s = planNodeSupport(net, nodeId);
+  if (!s) return;
+  const head = Math.min(1.1, (s.top - s.ground) * 0.25);
+  addColumn(buf, s.x, s.z, 1, 0, s.ground, s.top - head + 0.02, s.rc, 0, 0.9);
+  column(buf, { x: s.x, z: s.z, ax: 1, az: 0, y0: s.top - head, y1: s.top + 0.05, ground: s.top - head, r0: s.rc * 0.9, r1: s.rc * 1.7, stretch: 0, sides: COLUMN_SIDES }, PIER, PIER);
+}
+
+/** A placed segment's supports (planSupports in piers.ts does the work). */
 export function planPiers(net: RoadNetwork, id: Id, def: RoadTypeDef, frames: readonly Frame[]): PierPlan {
-  const halfWidth = totalHalfWidth(def);
-  // Rail viaducts have regular, shorter spans than road bridges.
-  const spacing = def.category === 'rail' ? 30 : PILLAR_SPACING;
-  const s0 = frames[0].s;
-  const s1 = frames[frames.length - 1].s;
-  const plan: PierPlan = { piers: [], girders: [] };
-  const missed: number[] = [];
-  for (let k = Math.ceil((s0 + 4) / spacing); k * spacing < s1 - 4; k++) {
-    const home = k * spacing;
-    let done = false;
-    for (const nudge of [0, 4, -4, 8, -8, 12, -12, 16, -16]) {
-      const f = frameAt(frames, home + nudge);
-      if (!f || f.c < (f.viaduct ? 1.4 : MIN_PIER_CLEARANCE)) continue;
-      const below = belowDeck(net, id, { minX: f.x - halfWidth - 3, minZ: f.z - halfWidth - 3, maxX: f.x + halfWidth + 3, maxZ: f.z + halfWidth + 3 }, f.y);
-      const columns = pierColumns(f, halfWidth);
-      if (columns.every((c) => columnClear(below, c.x, c.z, c.r))) {
-        plan.piers.push({ f, kind: 'pier', columns, legOff: 0 });
-        done = true;
-        break;
-      }
-      // Straddle it: legs outside the deck edges.
-      const legOff = halfWidth + 1.4;
-      const legs = [-1, 1].map((side) => ({ x: f.x + f.rx * side * legOff, z: f.z + f.rz * side * legOff, r: 1.4 }));
-      if (legs.every((l) => columnClear(below, l.x, l.z, l.r))) {
-        plan.piers.push({ f, kind: 'portal', columns: legs, legOff });
-        done = true;
-        break;
-      }
-    }
-    if (!done) {
-      const f = frameAt(frames, home);
-      if (f && f.c >= MIN_PIER_CLEARANCE) missed.push(home);
-    }
-  }
-  const stops = [s0, ...plan.piers.map((p) => p.f.s), s1].sort((a, b) => a - b);
-  for (let i = 0; i + 1 < stops.length; i++) {
-    if (missed.some((m) => m > stops[i] && m < stops[i + 1])) plan.girders.push([stops[i], stops[i + 1]]);
-  }
-  return plan;
+  return planSupports(net, { frames, def, self: id });
 }
 
 function pillars(net: RoadNetwork, id: Id, def: RoadTypeDef, frames: readonly Frame[], out: RoadOutputs): void {
-  const style: SurfStyle = { color: COL.concrete, kind: KIND_CONCRETE, slot: 0, bias: 0 };
   const halfWidth = totalHalfWidth(def);
   const plan = planPiers(net, id, def, frames);
+  const detail = out.detail ?? out.surf;
   // Expansion joints: a steel strip across the deck over each support.
   const joint: SurfStyle = { color: COL.girder, kind: KIND_STEEL, slot: 0, bias: 0 };
   for (const p of plan.piers) {
-    if (p.kind === 'pier') addPier(out.surf, p.f, halfWidth, style);
-    else addPortal(out.surf, p.f, halfWidth, p.legOff, style);
+    addSupport(out.surf, detail, p, def);
     if (def.category !== 'rail') out.surf.box(p.f.x, p.f.y + 0.012, p.f.z, def.halfWidth, 0.012, 0.11, p.f.rx, p.f.rz, p.f.rz, -p.f.rx, joint);
   }
   // Nowhere to stand: a longer steel girder span carries the deck over, edge girders below it.
@@ -274,11 +206,73 @@ function vergeDrop(f: Frame): number {
 
 function barriers(def: RoadTypeDef, frames: readonly Frame[], out: RoadOutputs): void {
   const style: SurfStyle = { color: COL.barrier, kind: KIND_PLAIN, slot: 0, bias: 0 };
+  const rail = def.category === 'rail';
   for (const [a, b] of runsOf(frames, (f) => f.c > ELEVATED_CLEARANCE, 1)) {
     for (const side of [1, -1] as const) {
       const W = sidewalkOn(def, side);
+      if (rail) {
+        // The trough's own walls, with a rounded top and a thin railing along it.
+        troughWall(out.surf, frames, a, b, side, def.halfWidth, PIER);
+        railing(out.surf, out.detail ?? out.surf, frames, a, b, side * (def.halfWidth - 0.16), TROUGH_WALL + 0.02);
+        continue;
+      }
       barrierStrip(out.surf, frames, a, b, side, () => def.halfWidth + W - 0.3, W > 0 ? 0.15 : 0, style);
+      // Where people walk, a thin handrail rides on the barrier.
+      if (W > 0) railing(out.surf, out.detail ?? out.surf, frames, a, b, side * (def.halfWidth + W - 0.18), 0.15 + 0.95);
     }
+  }
+}
+
+/** Height of a rail trough's walls over the track bed. */
+const TROUGH_WALL = 1.05;
+
+/** One wall of a rail trough at offset H: inner face, rounded top, outer face down to the deck side. */
+function troughWall(buf: SurfBuf, frames: readonly Frame[], a: number, b: number, side: -1 | 1, H: number, style: SurfStyle): void {
+  const t = 0.32;
+  const r = 0.12;
+  const h = TROUGH_WALL;
+  // Clockwise for the right wall (up the inner face, over the top, down the outside).
+  const pts: [number, number][] = [[H - t, -0.02], [H - t, h - r]];
+  for (let k = 1; k <= 3; k++) {
+    const q = Math.PI - (k / 3) * (Math.PI / 2);
+    pts.push([H - t + r + Math.cos(q) * r, h - r + Math.sin(q) * r]);
+  }
+  for (let k = 0; k <= 3; k++) {
+    const q = Math.PI / 2 - (k / 3) * (Math.PI / 2);
+    pts.push([H - r + Math.cos(q) * r, h - r + Math.sin(q) * r]);
+  }
+  // Down to the bed; the deck side carries on below it.
+  pts.push([H, 0]);
+  const path = side > 0 ? pts : pts.map(([o, y]) => [-o, y] as [number, number]).reverse();
+  for (let k = 0; k + 1 < path.length; k++) {
+    const p = path[k];
+    const q = path[k + 1];
+    ribbon(buf, frames, a, b, () => p, () => q, style);
+  }
+}
+
+/** A thin steel railing: a top rail swept along, and posts in the detail buffer. */
+function railing(buf: SurfBuf, detail: SurfBuf, frames: readonly Frame[], a: number, b: number, offset: number, base: number): void {
+  const steel: SurfStyle = { color: COL.steel, kind: KIND_STEEL, slot: 0, bias: 0 };
+  const top = base + 0.62;
+  const w = 0.035;
+  // A small square tube, faces listed clockwise.
+  const sq: [number, number][] = [[offset - w, top - w], [offset - w, top + w], [offset + w, top + w], [offset + w, top - w], [offset - w, top - w]];
+  for (let k = 0; k + 1 < sq.length; k++) {
+    const p = sq[k];
+    const q = sq[k + 1];
+    ribbon(buf, frames, a, b, () => p, () => q, steel);
+  }
+  const mid: [number, number][] = [[offset - 0.02, base + 0.3], [offset - 0.02, base + 0.34], [offset + 0.02, base + 0.34], [offset + 0.02, base + 0.3], [offset - 0.02, base + 0.3]];
+  for (let k = 0; k + 1 < mid.length; k++) {
+    const p = mid[k];
+    const q = mid[k + 1];
+    ribbon(detail, frames, a, b, () => p, () => q, steel);
+  }
+  for (let k = Math.ceil(frames[a].s / 2); k * 2 < frames[b].s; k++) {
+    const f = frameAt(frames, k * 2);
+    if (!f) continue;
+    detail.box(f.x + f.rx * offset, f.y + base + 0.31, f.z + f.rz * offset, 0.025, 0.31, 0.025, f.rx, f.rz, f.rz, -f.rx, steel);
   }
 }
 

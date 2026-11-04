@@ -9,6 +9,8 @@ import type { RoadNetwork } from '../core/RoadNetwork';
 import type { DecalKind, Id, MarkingAnchor, MarkingHost, NodeLineStyle, TurnKind, Vec3 } from '../core/types';
 import { autoItemAt, autoMarkingItems, type AutoItem, type AutoItemRef } from '../render/autoItems';
 import { CROSSWALK_DEPTH, STOP_WIDTH, TEETH_DEPTH } from '../render/markings';
+import { autoLinePatch, autoLinesOf, roleName } from '../core/paintCoherence';
+import { resolveDecal } from '../core/roadPaint';
 
 /** Take one automatic marking away. */
 export function removeAutoItem(net: RoadNetwork, nodeId: Id, ref: AutoItemRef): void {
@@ -158,8 +160,65 @@ export function cachedAutoItems(net: RoadNetwork, nodeId: Id): AutoItem[] {
   return items;
 }
 
-/** What is under a ground point at a node: a hand-placed marking first, then an automatic one. */
-export type MarkingHit = { kind: 'user'; host: MarkingHost; id: Id } | { kind: 'auto'; nodeId: Id; item: AutoItem };
+/**
+ * What is under a ground point: a hand-placed marking first, then an automatic one
+ * at a junction, then an automatic line along a road (lane, centre or edge line).
+ */
+export type MarkingHit =
+  | { kind: 'user'; host: MarkingHost; id: Id }
+  | { kind: 'auto'; nodeId: Id; item: AutoItem }
+  | { kind: 'autoLine'; segmentId: Id; key: string; label: string; outline: Vec3[] };
+
+/** The automatic line along a road under a ground point, if any. */
+export function autoRoadLineAt(net: RoadNetwork, p: Vec3, reach = 0.2): Extract<MarkingHit, { kind: 'autoLine' }> | null {
+  const near = net.nearestSegment(p, 12);
+  if (!near) return null;
+  const geom = net.segmentGeom(near.segmentId);
+  if (!geom || geom.stations.length < 2) return null;
+  let best: ReturnType<typeof autoLinesOf>[number] | null = null;
+  for (const l of autoLinesOf(net, near.segmentId)) {
+    if (l.off) continue;
+    const d = Math.abs(l.offset - near.lateral);
+    if (d <= l.width / 2 + reach && (!best || d < Math.abs(best.offset - near.lateral))) best = l;
+  }
+  if (!best) return null;
+  const off = best.offset;
+  const outline = geom.stations.map((st) => ({ x: st.pos.x + st.right.x * off, y: st.pos.y + 0.06, z: st.pos.z + st.right.z * off }));
+  return { kind: 'autoLine', segmentId: near.segmentId, key: best.key, label: roleName(best.role), outline };
+}
+
+/** Take an automatic line along a road away, as one edit (restorable from the road's markings). */
+export function removeAutoLine(net: RoadNetwork, segId: Id, key: string): void {
+  net.setSegmentOverrides(segId, autoLinePatch(net, segId, key, false) as never);
+}
+
+export function restoreAutoLine(net: RoadNetwork, segId: Id, key: string): void {
+  net.setSegmentOverrides(segId, autoLinePatch(net, segId, key, true) as never);
+}
+
+/** The outline of a Paint tool decal, for hovering. */
+export function decalOutline(net: RoadNetwork, id: Id): Vec3[] {
+  const d = net.decals.find((x) => x.id === id);
+  if (!d) return [];
+  const r = resolveDecal(net, d);
+  const pts = r.points;
+  if (pts.length >= 3 && (d.kind === 'hatch' || d.kind === 'fill')) return [...pts, pts[0]];
+  if (pts.length >= 2) return pts;
+  if (!pts.length) return [];
+  // A stamp: a box round it, facing its way.
+  const fx = -Math.sin(r.rotation);
+  const fz = -Math.cos(r.rotation);
+  const p = pts[0];
+  const l = 2.8 * (d.width > 0 && d.kind.startsWith('arrow') ? d.width : 1);
+  const w = 1.2;
+  return [
+    { x: p.x - fx * l - fz * w, y: p.y, z: p.z - fz * l + fx * w },
+    { x: p.x + fx * l - fz * w, y: p.y, z: p.z + fz * l + fx * w },
+    { x: p.x + fx * l + fz * w, y: p.y, z: p.z + fz * l - fx * w },
+    { x: p.x - fx * l + fz * w, y: p.y, z: p.z - fz * l - fx * w },
+    { x: p.x - fx * l - fz * w, y: p.y, z: p.z - fz * l + fx * w },
+  ];
+}
 
 function distToPolyline(p: { x: number; z: number }, pts: readonly Vec3[]): number {
   let best = Infinity;
@@ -218,7 +277,7 @@ export function markingHostsNear(net: RoadNetwork, p: Vec3, reach = 40): Marking
  * The single marking under a ground point anywhere: hand-placed ones at nearby
  * nodes and along segments first, then automatic ones at nearby junctions.
  */
-export function markingAt(net: RoadNetwork, p: Vec3, opts: { auto?: boolean; reach?: number } = {}): MarkingHit | null {
+export function markingAt(net: RoadNetwork, p: Vec3, opts: { auto?: boolean; reach?: number; lineReach?: number } = {}): MarkingHit | null {
   const hosts = markingHostsNear(net, p);
   for (const host of hosts) {
     const id = userMarkingAt(net, host, p, opts.reach ?? 0.6);
@@ -237,11 +296,13 @@ export function markingAt(net: RoadNetwork, p: Vec3, opts: { auto?: boolean; rea
       break;
     }
   }
-  return best;
+  // Automatic lines along roads only when asked, with a tight reach: a click on a road is mostly for the road.
+  return best ?? (opts.lineReach !== undefined ? autoRoadLineAt(net, p, opts.lineReach) : null);
 }
 
 /** The outline to draw round a hit marking: its path, or its area closed. */
 export function hitOutline(net: RoadNetwork, hit: MarkingHit): Vec3[] {
+  if (hit.kind === 'autoLine') return hit.outline;
   if (hit.kind === 'auto') {
     const o = hit.item.outline;
     return hit.item.closed && o.length > 2 ? [...o, o[0]] : o;
@@ -257,6 +318,7 @@ export function hitOutline(net: RoadNetwork, hit: MarkingHit): Vec3[] {
 
 /** A short name for a hit marking. */
 export function hitLabel(net: RoadNetwork, hit: MarkingHit): string {
+  if (hit.kind === 'autoLine') return `this ${hit.label}`;
   if (hit.kind === 'auto') return hit.item.label.charAt(0).toLowerCase() + hit.item.label.slice(1);
   const m = net.markingsOf(hit.host).find((x) => x.id === hit.id);
   if (!m) return 'marking';

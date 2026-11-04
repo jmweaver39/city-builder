@@ -27,6 +27,8 @@ import type {
   NodeMarking,
   Project,
   RampAttach,
+  LaneAlign,
+  LaneDef,
   RoadNode,
   RoadTypeDef,
   Segment,
@@ -41,6 +43,7 @@ import type {
 } from './types';
 import type { Quay } from './wallTypes';
 import { mirrorBarriers, mirrorStructure } from './walls';
+import { mirrorUpgrades } from './roadUpgrades';
 import { quaySamples } from './quays';
 import {
   closestPointOnCubic,
@@ -88,6 +91,7 @@ import {
 import { piecesWithout, splitPaintPieces } from './roadPaint';
 import { zonePolygon } from './zones';
 import { boundaryOffsets } from './nodeMarkings';
+import { cleanStacked, mirrorPaintOff, stackedWith, type PaintItem, type PaintRef } from './paintCoherence';
 import {
   flipPaintOn,
   flipT,
@@ -100,9 +104,13 @@ import {
   strandedNodes,
   type ReverseReport,
 } from './reverse';
+import { mirrorRulesOnReverse, renameRulesSegment, stripRulesSegment } from './trafficRules';
 import { autoRefSegments, renameAutoRef, sameAutoRef } from './autoMarkings';
 import { SpatialHash } from './spatial';
-import { attachAt, attachedCubic, attachPointFrom, hostDirection, pickHost, rampEndIssues, type AttachAccess } from './ramps';
+import { attachAt, attachedCubic, attachPointFrom, edgeAttachPoint, hostDirection, pickHost, rampEndIssues, type AttachAccess } from './ramps';
+import { crossingShaped, tagNewCrossings } from './highwayCrossing';
+import { alignAt, alignedCubic, endShift } from './laneAlign';
+import { planEdgeMerge } from './edgeMerge';
 import { draftOverlapIssues } from './overlap';
 import { GRADE_CLEARANCE, MAP_HALF_SIZE, MAX_ELEVATION, MIN_ELEVATION } from './terrain';
 
@@ -352,6 +360,7 @@ export class RoadNetwork {
     this.p = project === undefined ? createEmptyProject() : parseProject(project);
     this.reindex();
     this.refreshDerived();
+    this.cleanStackedPaint();
     this.clearEvent();
     this.pendingEdit = false;
     this.buildGraph();
@@ -413,7 +422,8 @@ export class RoadNetwork {
     for (const other of node.segments) {
       if (other === except) continue;
       const s = this.segIndex.get(other);
-      if (!s || !attachAt(s, nodeId)) continue;
+      // A lane-aligned end follows the road it continues the same way (core/laneAlign.ts).
+      if (!s || (!attachAt(s, nodeId) && !alignAt(s, nodeId))) continue;
       this.dirtySegs.add(other);
       this.hashDirtySegs.add(other);
       this.curves.delete(other);
@@ -544,7 +554,9 @@ export class RoadNetwork {
     const s = this.requireSegment(segmentId);
     const raw = { p0: this.requireNode(s.a).pos, p1: s.c1, p2: s.c2, p3: this.requireNode(s.b).pos };
     // A ramp end attached to a lane starts at that lane's edge, not at the node.
-    return s.overrides.attachA || s.overrides.attachB ? attachedCubic(this.attachAccess, s, raw) : raw;
+    const c = s.overrides.attachA || s.overrides.attachB ? attachedCubic(this.attachAccess, s, raw) : raw;
+    // A narrower road lined up with one side of the road it continues (core/laneAlign.ts).
+    return s.overrides.alignA || s.overrides.alignB ? alignedCubic(this.attachAccess, s, c) : c;
   }
 
   /** The cubic between the node positions, ignoring any lane attach. */
@@ -573,6 +585,18 @@ export class RoadNetwork {
   nodeGeom(id: Id): NodeGeom | undefined {
     this.refreshDerived();
     return this.nodeGeoms.get(id);
+  }
+
+  /**
+   * Why a ramp asking for an edge merge at this node got a full junction instead, or
+   * null when it is an edge merge or nothing asks for one (core/edgeMerge.ts).
+   */
+  edgeMergeProblem(id: Id): string | null {
+    this.refreshDerived();
+    const layout = this.layouts.get(id);
+    const plan = layout ? planEdgeMerge(layout.arms) : null;
+    if (layout && layout.arms.length !== 3 && layout.arms.some((a) => a.source.attach?.edge)) return 'Another road joins here too: full junction.';
+    return plan && 'problem' in plan ? plan.problem : null;
   }
 
   /** The current lane graph. A new object whenever the network changes. */
@@ -607,7 +631,10 @@ export class RoadNetwork {
       const laneSig = seg.overrides.laneKinds
         ? effectiveLanes(def, seg.overrides).map((l) => l.kind[0] + (l.kind === 'bus' ? 'u' : '')).join('')
         : '';
-      out.push({ segmentId: id, atStart: seg.a === node.id, curve: this.curveOf(id), def, laneSig });
+      const atStart = seg.a === node.id;
+      const attach = atStart ? seg.overrides.attachA : seg.overrides.attachB;
+      const shift = endShift(this.attachAccess, seg, node.id);
+      out.push({ segmentId: id, atStart, curve: this.curveOf(id), def, laneSig, ...(attach ? { attach } : {}), ...(shift ? { shift } : {}) });
     }
     return out;
   }
@@ -693,6 +720,10 @@ export class RoadNetwork {
           (s, atStart) => {
             const seg = this.segIndex.get(s);
             return atStart ? seg?.overrides.attachA : seg?.overrides.attachB;
+          },
+          (s, atStart) => {
+            const seg = this.segIndex.get(s);
+            return seg ? endShift(this.attachAccess, seg, atStart ? seg.a : seg.b) : 0;
           },
         ),
       );
@@ -794,6 +825,34 @@ export class RoadNetwork {
     this.evtReason = reason;
     this.pendingEdit = true;
     if (this.batchDepth === 0) this.finishEdit();
+    this.cleanStackedPaint();
+  }
+
+  /** Old saves could stack markings in one place: keep the newest of each (core/paintCoherence.ts). */
+  private cleanStackedPaint(): void {
+    const any = this.p.decals.length || this.p.nodes.some((n) => n.control.markings) || this.p.segments.some((s) => s.overrides.handMarkings);
+    if (any) cleanStacked(this, this.p);
+  }
+
+  /**
+   * What the last placed marking replaced, by name ('lane line', 'crosswalk'...),
+   * automatic ones included: one marking per place. Tools read it for a toast.
+   */
+  lastReplaced: string[] = [];
+
+  /** Remove placed markings in the slots `item` takes, inside the caller's batch. */
+  private replaceStacked(item: PaintItem, self: PaintRef): void {
+    const { refs, labels } = stackedWith(this, item, self);
+    this.lastReplaced = labels;
+    for (const r of refs) {
+      if (r.kind === 'decal') {
+        this.p.decals = this.p.decals.filter((d) => d.id !== r.id);
+        this.evtDecals = true;
+      } else if (this.markingsOf(r.host).some((m) => m.id === r.id)) {
+        this.writeHost(r.host, this.markingsOf(r.host).filter((m) => m.id !== r.id));
+      }
+    }
+    if (refs.length) this.markEdit();
   }
 
   /** Empty the project. */
@@ -940,6 +999,9 @@ export class RoadNetwork {
     const rightOverrides = structuredClone(seg.overrides);
     delete rightOverrides.attachA;
     delete seg.overrides.attachB;
+    // So does a lane alignment.
+    delete rightOverrides.alignA;
+    delete seg.overrides.alignB;
     // Markings along the segment carry on along both halves, each with ids of its own.
     if (rightOverrides.handMarkings) rightOverrides.handMarkings = this.freshMarkingIds(rightOverrides.handMarkings);
     const rightId = this.createSegment(nodeId, seg.b, right.p1, right.p2, seg.roadType, rightOverrides);
@@ -1007,6 +1069,7 @@ export class RoadNetwork {
     renameKey(c.signs, from, to);
     renameKey(c.crosswalks, from, to);
     renameShapeSegment(c, from, to);
+    renameRulesSegment(c, from, to);
     if (c.markings) {
       const rename = (a: MarkingAnchor): MarkingAnchor => (a.segmentId === from ? { ...a, segmentId: to } : a);
       c.markings = c.markings.map((m) =>
@@ -1035,6 +1098,7 @@ export class RoadNetwork {
     delete c.signs[id];
     delete c.crosswalks[id];
     stripShapeSegment(c, id);
+    stripRulesSegment(c, id);
     if (c.markings) {
       c.markings = c.markings.filter((m) =>
         (m.kind === 'line' ? [m.from, m.to] : m.anchors).every((a) => a.segmentId !== id),
@@ -1285,7 +1349,9 @@ export class RoadNetwork {
       const lanesNow = effectiveLanes(this.roadTypeOf(id), seg.overrides);
       for (const nodeId of ends) mirrorMarkings(this.requireNode(nodeId), id, count, lanesNow);
       mirrorSegmentMarkings(seg.overrides, id, count);
+      if (seg.overrides.paintOff) seg.overrides.paintOff = mirrorPaintOff(seg.overrides.paintOff, lanesNow.length);
       const links = ends.map((nodeId) => mirrorLaneLinks(this, nodeId, id));
+      for (const nodeId of ends) mirrorRulesOnReverse(this, nodeId, id);
 
       [seg.a, seg.b] = [seg.b, seg.a];
       [seg.c1, seg.c2] = [seg.c2, seg.c1];
@@ -1297,9 +1363,19 @@ export class RoadNetwork {
         if (attachB) seg.overrides.attachA = { ...attachB, hostSide: attachB.hostSide === 1 ? -1 : 1 };
         if (attachA) seg.overrides.attachB = { ...attachA, hostSide: attachA.hostSide === 1 ? -1 : 1 };
       }
+      // A lane alignment stays with its node; left and right swap as the road turns round.
+      const { alignA, alignB } = seg.overrides;
+      if (alignA || alignB) {
+        const flip = (x: LaneAlign): LaneAlign => (x === 'left' ? 'right' : x === 'right' ? 'left' : 'centre');
+        delete seg.overrides.alignA;
+        delete seg.overrides.alignB;
+        if (alignB) seg.overrides.alignA = flip(alignB);
+        if (alignA) seg.overrides.alignB = flip(alignA);
+      }
       // Walls and barriers stay on the same side in the world, so they swap sides of the road.
       if (seg.overrides.structure) seg.overrides.structure = mirrorStructure(seg.overrides.structure);
       if (seg.overrides.barriers) seg.overrides.barriers = mirrorBarriers(seg.overrides.barriers);
+      if (seg.overrides.upgrades) seg.overrides.upgrades = mirrorUpgrades(seg.overrides.upgrades);
       this.touchSeg(id);
       for (const nodeId of ends) this.touchNode(nodeId);
       this.graphTopologyChanged = true;
@@ -1525,6 +1601,8 @@ export class RoadNetwork {
       const id = this.p.nextId++;
       node.control.markings = [...(node.control.markings ?? []), { ...structuredClone(init), id } as NodeMarking];
       this.touchNodePaint(nodeId);
+      const host: MarkingHost = { kind: 'node', id: nodeId };
+      this.replaceStacked({ kind: 'marking', host, marking: { ...init, id } }, { kind: 'marking', host, id });
       return id;
     });
   }
@@ -1685,6 +1763,7 @@ export class RoadNetwork {
     return this.batch(() => {
       const id = this.p.nextId++;
       this.writeHost(host, [...this.markingsOf(host), { ...structuredClone(init), id } as NodeMarking]);
+      this.replaceStacked({ kind: 'marking', host, marking: { ...init, id } }, { kind: 'marking', host, id });
       return id;
     });
   }
@@ -1774,23 +1853,26 @@ export class RoadNetwork {
     }
   }
 
-  private draftCubic(start: RoadAnchor, end: RoadAnchor, c1?: Vec3, c2?: Vec3, startAttach?: RampAttach, endAttach?: RampAttach): Cubic {
+  private draftCubic(start: RoadAnchor, end: RoadAnchor, c1?: Vec3, c2?: Vec3, startAttach?: RampAttach, endAttach?: RampAttach, roadType?: string): Cubic {
     let p0 = this.anchorPosition(start);
     let p3 = this.anchorPosition(end);
+    const lanes = roadType ? this.requireRoadType(roadType).lanes : undefined;
     if (startAttach) {
       const dir = normalizeXZ(sub(c1 && distXZ(c1, p0) > 1e-3 ? c1 : p3, p0));
-      p0 = this.anchorAttachPoint(start, startAttach, dir) ?? p0;
+      p0 = this.anchorAttachPoint(start, startAttach, dir, lanes) ?? p0;
     }
     if (endAttach) {
       const dir = normalizeXZ(sub(p3, c2 && distXZ(c2, p3) > 1e-3 ? c2 : p0));
-      p3 = this.anchorAttachPoint(end, endAttach, dir) ?? p3;
+      p3 = this.anchorAttachPoint(end, endAttach, dir, lanes) ?? p3;
     }
     const fallback = straightCubic(p0, p3);
     return { p0, p1: c1 ?? fallback.p1, p2: c2 ?? fallback.p2, p3 };
   }
 
   /** Where a road end attached to a lane at an anchor lands, or null when there is no host. */
-  anchorAttachPoint(anchor: RoadAnchor, attach: RampAttach, rampDir: Vec3): Vec3 | null {
+  anchorAttachPoint(anchor: RoadAnchor, attach: RampAttach, rampDir: Vec3, rampLanes?: readonly LaneDef[]): Vec3 | null {
+    // An edge merge at an existing node sits beside the narrower host road there.
+    if (anchor.kind === 'node' && attach.edge && !attach.lanes && rampLanes) return edgeAttachPoint(this.attachAccess, null, anchor.id, attach, rampDir, rampLanes);
     let host: Segment | null = null;
     let hostDir: Vec3 | null = null;
     let pos: Vec3;
@@ -1811,7 +1893,7 @@ export class RoadNetwork {
     } else {
       return null;
     }
-    return attachPointFrom(pos, hostDir, effectiveLanes(this.requireRoadType(host.roadType), host.overrides), attach, rampDir);
+    return attachPointFrom(pos, hostDir, effectiveLanes(this.requireRoadType(host.roadType), host.overrides), attach, rampDir, rampLanes);
   }
 
   /**
@@ -1874,9 +1956,18 @@ export class RoadNetwork {
     if (params.c2) assertVec(params.c2, 'Control c2');
     const startAttach = start.kind === 'free' ? undefined : params.startAttach;
     const endAttach = end.kind === 'free' ? undefined : params.endAttach;
-    const draft = this.draftCubic(start, end, params.c1, params.c2, startAttach, endAttach);
+    const draft = this.draftCubic(start, end, params.c1, params.c2, startAttach, endAttach, params.roadType);
     const polygon = dist(draft.p0, draft.p1) + dist(draft.p1, draft.p2) + dist(draft.p2, draft.p3);
     if (polygon < MIN_SEGMENT_LENGTH) throw new NetworkError('A road needs some length');
+    // Crossings of a highway that were there before keep how they work (core/highwayCrossing.ts).
+    const xs = [draft.p0.x, draft.p1.x, draft.p2.x, draft.p3.x];
+    const zs = [draft.p0.z, draft.p1.z, draft.p2.z, draft.p3.z];
+    const reach = NODE_SNAP + 1;
+    const crossingsBefore = new Set(
+      this.nodesInRegion({ minX: Math.min(...xs) - reach, minZ: Math.min(...zs) - reach, maxX: Math.max(...xs) + reach, maxZ: Math.max(...zs) + reach }).filter((id) =>
+        crossingShaped(this, id),
+      ),
+    );
 
     return this.batch(() => {
       const freeNodes = new Set<Id>();
@@ -1948,6 +2039,8 @@ export class RoadNetwork {
         nodes.push(seg.b);
       }
       result.nodes = nodes;
+      // A road drawn across a highway at grade makes a crossing, not a right-in, right-out junction.
+      tagNewCrossings(this, new Set([...nodes, ...result.junctions]), crossingsBefore);
       return result;
     });
   }
@@ -2067,7 +2160,7 @@ export class RoadNetwork {
     const def = this.requireRoadType(draft.roadType);
     const startAttach = draft.start.kind === 'free' ? undefined : draft.startAttach;
     const endAttach = draft.end.kind === 'free' ? undefined : draft.endAttach;
-    const cubic = this.draftCubic(draft.start, draft.end, draft.c1, draft.c2, startAttach, endAttach);
+    const cubic = this.draftCubic(draft.start, draft.end, draft.c1, draft.c2, startAttach, endAttach, draft.roadType);
     const curve = buildSegmentCurve(cubic);
     const L = curve.length;
 
@@ -2172,6 +2265,17 @@ export class RoadNetwork {
           message: `Only ${hit.clearance.toFixed(1)} m clearance ${hit.point.y < cubicPoint(cubic, hit.t).y ? 'over' : 'under'} ${what}, ${hit.required} m is needed.`,
           at: hit.point,
         });
+      } else if (hit.atGrade && !nearEnd && !hit.overRail && def.category !== 'rail' && !issues.some((i) => i.code === 'atGradeHighway')) {
+        // Crossing a highway at grade works (core/highwayCrossing.ts), but it stops the highway.
+        const other = this.roadTypeOf(hit.segmentId).category;
+        if ((other === 'highway') !== (def.category === 'highway')) {
+          issues.push({
+            code: 'atGradeHighway',
+            severity: 'warning',
+            message: `Crosses a highway at grade: traffic lights will stop the highway here. Raise or lower the road ${GRADE_CLEARANCE} m to bridge it instead.`,
+            at: hit.point,
+          });
+        }
       }
     }
 
@@ -2179,15 +2283,16 @@ export class RoadNetwork {
     const overlaps = draftOverlapIssues(this, def, cubic, draft.start, draft.end);
     issues.push(...overlaps);
     if (!overlaps.length) this.checkParallel(def, cubic, samples, draft.start, draft.end, issues);
-    issues.push(...this.rampIssues(def, cubic, draft.start, draft.end));
+    issues.push(...this.rampIssues(def, cubic, draft.start, draft.end, startAttach, endAttach));
     issues.push(...railDraftIssues(this, def, cubic, curve.length, draft.start, draft.end, radius));
     return issues;
   }
 
   /** How each end of a draft meets a highway: against its traffic, or at grade. */
-  private rampIssues(def: RoadTypeDef, cubic: Cubic, start: RoadAnchor, end: RoadAnchor): DraftIssue[] {
+  private rampIssues(def: RoadTypeDef, cubic: Cubic, start: RoadAnchor, end: RoadAnchor, startAttach?: RampAttach, endAttach?: RampAttach): DraftIssue[] {
     const out: DraftIssue[] = [];
     for (const [anchor, leaving] of [[start, true], [end, false]] as const) {
+      const attach = leaving ? startAttach : endAttach;
       let host: Segment | null = null;
       let hostDir: Vec3 | null = null;
       if (anchor.kind === 'segment') {
@@ -2202,7 +2307,7 @@ export class RoadNetwork {
       }
       if (!host || !hostDir) continue;
       const pos = leaving ? cubic.p0 : cubic.p3;
-      for (const issue of rampEndIssues(def, cubic, { hostDef: this.requireRoadType(host.roadType), hostDir, pos, leaving })) {
+      for (const issue of rampEndIssues(def, cubic, { hostDef: this.requireRoadType(host.roadType), hostDir, pos, leaving, attach })) {
         // Both ends joining a highway at grade is one piece of advice, not two.
         if (!out.some((o) => o.message === issue.message)) out.push(issue);
       }
@@ -2525,6 +2630,7 @@ export class RoadNetwork {
       this.p.decals.push({ ...structuredClone(init), id });
       this.evtDecals = true;
       this.markEdit();
+      this.replaceStacked({ kind: 'decal', decal: { ...init, id } }, { kind: 'decal', id });
       return id;
     });
   }

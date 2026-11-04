@@ -1,6 +1,8 @@
 /** Junction panel: control mode, per-arm signs, and the signal editor. */
 import { defaultSignalPlan, effectiveControl, type SignalPreset } from '../core/signals';
-import type { CrosswalkStyle, Id, JunctionMode, SignalPlan, SignKind } from '../core/types';
+import { autoSignalPlan, hasHighwayAccessChoice } from '../core/highwayCrossing';
+import type { CrosswalkStyle, HighwayAccess, Id, JunctionMode, LaneAlign, SignalPlan, SignKind } from '../core/types';
+import { jointAlign, setJointAlign } from '../tools/endAlign';
 import { layoutDiagram, moveAt, type JunctionDiagram } from '../tools/junctionDiagram';
 import { addPhase, cycleLength, cycleMove, movePhase, moveState, removePhase, setPhaseField } from '../tools/signalEdit';
 import { CROSSWALK_STYLES } from '../tools/types';
@@ -14,6 +16,10 @@ const MODES: { value: JunctionMode; label: string }[] = [
   { value: 'priority', label: 'Priority signs' },
   { value: 'allStop', label: 'All-way stop' },
   { value: 'signal', label: 'Traffic lights' },
+];
+const ACCESS: { value: HighwayAccess; label: string }[] = [
+  { value: 'crossing', label: 'Crossing, with turns' },
+  { value: 'rightInOut', label: 'Right-in, right-out only' },
 ];
 const SIGNS: { value: SignKind; label: string }[] = [
   { value: 'none', label: 'None' },
@@ -61,12 +67,52 @@ export class JunctionEditor {
     history.hint('Change junction control');
     net.batch(() => {
       if (mode === 'signal' && !node.control.signal) {
-        net.setJunctionControl(this.id, { mode, signal: defaultSignalPlan(net, this.id, 'opposing') });
+        net.setJunctionControl(this.id, { mode, signal: autoSignalPlan(net, this.id) });
       } else {
         net.setJunctionControl(this.id, { mode });
       }
     });
     this.render();
+  }
+
+  /** Crossing with turns, or right in and right out only, at a junction with a highway. */
+  private setAccess(access: HighwayAccess): void {
+    const { net, history } = this.ui;
+    history.hint('Change highway access');
+    // The movements change, so a plan made for the old ones goes; lights fall back to the automatic plan.
+    net.setJunctionControl(this.id, { highwayAccess: access, signal: null });
+    this.render();
+  }
+
+  /** Two roads of different widths end to end: pick how they line up (tools/endAlign.ts). */
+  private renderLineUp(body: HTMLElement): void {
+    const { net } = this.ui;
+    const info = jointAlign(net, this.id);
+    if (!info) return;
+    const options: { value: LaneAlign; label: string }[] = [
+      { value: 'left', label: 'Left edges together' },
+      { value: 'centre', label: 'Centred' },
+      { value: 'right', label: 'Right edges together' },
+    ];
+    const buttons = el('div', { class: 'btn-row line-up' });
+    for (const o of options) {
+      buttons.append(
+        el('button', {
+          class: `btn${o.value === info.align ? ' active' : ''}`,
+          text: o.label,
+          dataset: { align: o.value },
+          attrs: { type: 'button', 'aria-pressed': String(o.value === info.align) },
+          on: {
+            click: () => {
+              this.ui.history.hint('Line up roads');
+              setJointAlign(net, this.id, o.value, info.wide);
+              this.render();
+            },
+          },
+        }),
+      );
+    }
+    body.append(el('div', { class: 'opt-title', text: 'Lanes line up' }), buttons, el('div', { class: 'small muted', text: 'Left and right looking along the wider road. The lane that ends or begins tapers on the other side.' }));
   }
 
   render(): void {
@@ -81,12 +127,20 @@ export class JunctionEditor {
     this.phaseList = null;
 
     if (geom.kind !== 'junction') {
-      const kind = geom.kind === 'deadEnd' ? 'Dead end' : geom.kind === 'plain' ? 'Plain joint' : 'Node';
+      const kind = geom.kind === 'deadEnd' ? 'Dead end' : geom.kind === 'plain' ? 'Plain joint' : geom.kind === 'merge' ? 'Edge merge' : 'Node';
       this.panel.setTitle(kind);
       const details = el('dl', { class: 'kv' });
       details.append(el('dt', { text: 'Height' }), el('dd', { text: `${node.pos.y.toFixed(1)} m` }));
       details.append(el('dt', { text: 'Roads' }), el('dd', { text: String(node.segments.length) }));
+      if (geom.edge) {
+        // An edge merge (core/edgeMerge.ts): the highway runs on, the ramp blends into its edge lane.
+        const e = geom.edge;
+        const what = e.mode === 'add' ? 'On-ramp, added lane' : e.mode === 'drop' ? 'Off-ramp, edge lane exit only' : e.merge ? 'On-ramp, taper' : 'Off-ramp, taper';
+        details.append(el('dt', { text: 'Ramp' }), el('dd', { text: what }));
+        details.append(el('dt', { text: 'Taper' }), el('dd', { text: `${e.taper.toFixed(0)} m` }));
+      }
       body.append(details);
+      this.renderLineUp(body);
       if (geom.kind === 'deadEnd' && !net.endpoints.some((e) => e.nodeId === this.id)) {
         body.append(
           el('div', { class: 'btn-row', style: { marginTop: '8px' } }, el('button', {
@@ -108,9 +162,17 @@ export class JunctionEditor {
     }
 
     this.panel.setTitle('Junction');
+    // A ramp asked to blend into the edge lane but could not (core/edgeMerge.ts).
+    const why = net.edgeMergeProblem(this.id);
+    if (why) body.append(el('div', { class: 'small muted', text: `Edge merge not possible: ${why}` }));
+    this.renderLineUp(body);
     const effective = effectiveControl(net, this.id);
     const control = node.control;
     body.append(row('Control', selectInput(MODES, control.mode, (v) => this.setMode(v))));
+    if (hasHighwayAccessChoice(net, this.id)) {
+      // Where a road meets a highway at grade (core/highwayCrossing.ts). Absent is right in, right out.
+      body.append(row('Highway', selectInput(ACCESS, control.highwayAccess ?? 'rightInOut', (v) => this.setAccess(v))));
+    }
     if (control.mode === 'auto') {
       const label = effective.kind === 'none' ? 'Free flow' : effective.kind === 'signal' ? 'Traffic lights' : effective.kind === 'allStop' ? 'All-way stop' : 'Priority signs';
       body.append(el('div', { class: 'small muted', text: `Auto is using: ${label}.` }));
@@ -126,7 +188,7 @@ export class JunctionEditor {
         attrs: { type: 'button' },
         on: {
           click: () => {
-            this.ui.tools.setTool('nodeMarkings');
+            this.ui.tools.setTool('paint');
             this.ui.tools.nodeMarkings.open(this.id);
           },
         },
@@ -403,6 +465,10 @@ export class JunctionEditor {
     const s = this.ui.sim.signalStatus(this.id);
     if (!s) {
       this.status.textContent = 'Signal not running';
+      return;
+    }
+    if (s.phaseIndex < 0) {
+      this.status.textContent = 'Now: hand control (Junction > Rules > Manual lights)';
       return;
     }
     const plan = this.plan;

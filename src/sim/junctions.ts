@@ -15,9 +15,9 @@
  * waits only for earlier ones, so the wait graph has no cycles, which rules out the
  * pinwheel of four left turners each blocking the next.
  */
-import { effectiveControl, type Id, type RoadNetwork, type SignalPlan } from '../core';
+import { effectiveControl, isOneWay, type Id, type RoadNetwork, type SignalPlan } from '../core';
 import { ENTRY_GHOST, ENTRY_REAL, ENTRY_REQUEST } from './buckets';
-import { KIND_DIVERGE, KIND_MERGE, KIND_NEAR, KIND_SWEEP, TURN_LEFT, TURN_UTURN, type CompiledGraph } from './compiled';
+import { isSweep, KIND_DIVERGE, KIND_MERGE, KIND_NEAR, sweepApplies, TURN_LEFT, TURN_RIGHT, TURN_UTURN, type CompiledGraph } from './compiled';
 import {
   COURTESY_QUEUE_LENGTH,
   COURTESY_WAIT_QUEUED_SEC,
@@ -59,9 +59,13 @@ export const DENY_CLAIMED = 5;
 export const DENY_ARRIVAL = 6;
 export const DENY_QUEUE_ORDER = 7;
 export const DENY_BLOCKED = 8;
+/** A long vehicle's turn would swing over someone standing at another arm's line. */
+export const DENY_SWEPT = 9;
 
 /** Braking a driver considers reasonable when deciding to stop for something. */
 const COMFORT_STOP = 3.5;
+/** How hard the last vehicle on an exit is assumed to brake, judging the room it leaves. */
+const EXIT_STOP_DECEL = 3;
 
 /** Time to cover x from speed v, accelerating at a up to cap. */
 export function timeToCover(x: number, v: number, a: number, cap: number): number {
@@ -82,6 +86,10 @@ export class JunctionSystem {
   delay: Float64Array;
   /** Head of the list of vehicles holding a permit for each connector. */
   claimHead: Int32Array;
+  /** 1 where the arm allows turning on red after a stop (core/trafficRules.ts). */
+  redTurn: Uint8Array;
+  /** 1 where the arm allows entering a blocked junction: no wait for room on the exit. */
+  boxFree: Uint8Array;
 
   constructor(g: CompiledGraph) {
     const n = g.n;
@@ -90,19 +98,31 @@ export class JunctionSystem {
     this.needPermit = new Uint8Array(n);
     this.delay = new Float64Array(n);
     this.claimHead = new Int32Array(n).fill(-1);
+    this.redTurn = new Uint8Array(n);
+    this.boxFree = new Uint8Array(n);
   }
 
   /** Read every node's control into per-connector arrays. */
   compile(net: RoadNetwork, g: CompiledGraph, sig: SignalSystem, previous: SignalSystem | null): void {
-    const { ctl, sign, needPermit, delay } = this;
+    const { ctl, sign, needPermit, delay, redTurn, boxFree } = this;
     for (const [nodeId, conns] of g.graph.connectorsAt) {
       if (!conns.length) continue;
       const ec = effectiveControl(net, nodeId);
+      const armRules = net.getNode(nodeId)?.control.rules?.arms;
       const kind =
         ec.kind === 'signal' ? CTL_SIGNAL : ec.kind === 'allStop' ? CTL_ALLSTOP : ec.kind === 'priority' ? CTL_PRIORITY : CTL_NONE;
       for (const c of conns) {
         ctl[c] = kind;
         const fromSeg = g.graph.lanes[g.fromLane[c]].segmentId;
+        const rules = armRules?.[fromSeg];
+        if (rules) {
+          boxFree[c] = rules.enterBlocked ? 1 : 0;
+          if (kind === CTL_SIGNAL) {
+            const toSeg = g.graph.lanes[g.toLane[c]].segmentId;
+            const oneWays = isOneWay(net.roadTypeOf(fromSeg)) && isOneWay(net.roadTypeOf(toSeg));
+            redTurn[c] = (rules.nearTurnOnRed && g.turn[c] === TURN_RIGHT) || (rules.farTurnOnRed && g.turn[c] === TURN_LEFT && oneWays) ? 1 : 0;
+          }
+        }
         const s = ec.signs[fromSeg] ?? 'none';
         sign[c] = s === 'stop' ? SIGN_STOP : s === 'yield' ? SIGN_YIELD : s === 'priority' ? SIGN_PRIORITY : SIGN_NONE;
         // Free-flowing merges and splits run on following and the guard; a line to wait
@@ -198,6 +218,8 @@ function relation(w: World, c: number, d: number): number {
   if (jn.ctl[c] === CTL_SIGNAL) {
     const a = sig.state[c];
     const b = sig.state[d];
+    // Turning on red: give way to everyone with a green.
+    if (a === LIGHT_RED) return b >= LIGHT_PERMISSIVE ? -1 : 0;
     if (b <= LIGHT_YELLOW) return 1;
     if (a === LIGHT_PROTECTED && b === LIGHT_PERMISSIVE) return 1;
     if (a === LIGHT_PERMISSIVE && b === LIGHT_PROTECTED) return -1;
@@ -239,10 +261,18 @@ function roomOnExit(w: World, v: number, c: number): boolean {
   // Space past the last crossing point counts: queueing there blocks nothing.
   const slack = g.lastCross[c] >= 0 ? g.len[c] - g.lastCross[c] - CROSS_MARGIN : g.len[c];
   if (tail === Infinity && reserved <= 0.01 && owed === 0) return true;
-  const need = Math.min(veh.len[v] + 1 + owed, g.len[x] + Math.max(slack, 0));
+  // Queued, a body stands its minimum gap behind the one ahead: given less room than that,
+  // its tail stays in the junction, across the paths of everyone else.
+  const need = Math.min(veh.len[v] + veh.minGap[v] + 0.5 + owed, g.len[x] + Math.max(slack, 0));
   const open = (tail === Infinity ? g.len[x] : Math.min(tail, g.len[x])) + Math.max(slack, 0) - reserved;
   if (open >= need) return true;
-  return owed === 0 && tail !== Infinity && tail > 0 && bk.tailV[x] > EXIT_MOVING_SPEED && reserved <= veh.len[v] + 2;
+  // A moving exit makes room as it goes, but only as much as its last vehicle covers if it
+  // brakes now. Counting on more leaves a tail across the junction when the queue stops,
+  // and at a pair of junctions close together (a diamond's ramp terminals) each one's
+  // stranded tails then block the other's exit.
+  const tv = bk.tailV[x];
+  if (owed !== 0 || tail === Infinity || tail <= 0 || tv <= EXIT_MOVING_SPEED || reserved > veh.len[v] + 2) return false;
+  return open + (tv * tv) / (2 * EXIT_STOP_DECEL) >= need;
 }
 
 /** Does a vehicle arriving through [tin, tout] clear my window, in either order? */
@@ -319,8 +349,11 @@ export function evaluate(w: World, v: number, c: number, d: number): boolean {
   } else if (ctl === CTL_SIGNAL) {
     const light = sig.state[c];
     if (light === LIGHT_RED) {
-      ok = false;
-      veh.denied[v] = DENY_LIGHT;
+      // Turn on red: stop at the line first, then go as at a stop sign, giving way to the greens.
+      if (!jn.redTurn[c] || veh.stopHold[v] < STOP_SIGN_HOLD_SEC) {
+        ok = false;
+        veh.denied[v] = DENY_LIGHT;
+      }
     } else if (light === LIGHT_YELLOW) {
       const left = sig.yellowLeft(g.nodeId[c]);
       const eta = timeToCover(d, speed, veh.accel[v], g.speed[c]);
@@ -338,7 +371,7 @@ export function evaluate(w: World, v: number, c: number, d: number): boolean {
     }
   }
 
-  if (ok && !roomOnExit(w, v, c)) {
+  if (ok && !jn.boxFree[c] && !roomOnExit(w, v, c)) {
     ok = false;
     veh.denied[v] = DENY_EXIT_FULL;
     // Waited long for room: be the one the next big enough gap is kept for.
@@ -355,7 +388,7 @@ export function evaluate(w: World, v: number, c: number, d: number): boolean {
   if (ok) ok = conflictsClear(w, v, c, d);
 
   // A holder that can no longer stop keeps its permit, unless the light is red.
-  if (!ok && held && brakeNeeded > COMFORT_STOP && !w.blocked[c] && !(ctl === CTL_SIGNAL && sig.state[c] === LIGHT_RED)) {
+  if (!ok && held && brakeNeeded > COMFORT_STOP && !w.blocked[c] && !(ctl === CTL_SIGNAL && sig.state[c] === LIGHT_RED && !jn.redTurn[c])) {
     veh.permitDist[v] = d;
     return true;
   }
@@ -370,7 +403,8 @@ export function evaluate(w: World, v: number, c: number, d: number): boolean {
   // go than this driver: say so with a claim others must respect, without entering
   // until it is really clear. This is how a steady stream is made to leave a gap.
   const reason = veh.denied[v];
-  if (near && isBoosted(w, v, c) && (reason === DENY_OCCUPIED || reason === DENY_CLAIMED || reason === DENY_ARRIVAL)) {
+  const redTurning = ctl === CTL_SIGNAL && sig.state[c] === LIGHT_RED;
+  if (near && !redTurning && isBoosted(w, v, c) && (reason === DENY_OCCUPIED || reason === DENY_CLAIMED || reason === DENY_ARRIVAL)) {
     if (!held) addClaim(w, v, c, d);
     else veh.permitDist[v] = d;
     setWaiting(w, v, true);
@@ -380,10 +414,34 @@ export function evaluate(w: World, v: number, c: number, d: number): boolean {
   return false;
 }
 
+/**
+ * Is anyone standing in the stretch before another arm's line that a long body taking c
+ * swings over (sweep.ts)? Drivers refused entry wait short of it, but one that got there
+ * with a permit and then lost it, or is held by its exit, cannot back out of the way,
+ * and a long body let in beside it could then neither pass it nor back off.
+ */
+function sweptStopOccupied(w: World, c: number): boolean {
+  const { g, bk } = w;
+  for (let k = g.sweptStart[c]; k < g.sweptStart[c + 1]; k++) {
+    const lane = g.sweptLane[k];
+    const e = bk.start[lane];
+    if (e === bk.start[lane + 1]) continue;
+    // Lists are front first: only the first body can be that close to the line.
+    if (g.len[lane] - bk.eS[e] < g.sweptDepth[k]) return true;
+  }
+  return false;
+}
+
 function conflictsClear(w: World, v: number, c: number, d: number): boolean {
   const { g, veh, jn, sig, bk } = w;
   const { confStart, confLane, confSelf, confOther, confKind, speed: laneSpeed, len: laneLen } = g;
   const { eV, eS, eT, start } = bk;
+  // Not one of the reasons a long wait turns into a waiting claim: the one in the way is
+  // stopped at its own line and may be waiting for this very driver to go.
+  if (veh.len[v] >= LONG_BODY && sweptStopOccupied(w, c)) {
+    veh.denied[v] = DENY_SWEPT;
+    return false;
+  }
   const k0 = confStart[c];
   const k1 = confStart[c + 1];
   if (k0 === k1) return true;
@@ -394,6 +452,7 @@ function conflictsClear(w: World, v: number, c: number, d: number): boolean {
   const cap = laneSpeed[c];
   const boosted = isBoosted(w, v, c);
   const allStop = jn.ctl[c] === CTL_ALLSTOP;
+  const redTurning = jn.ctl[c] === CTL_SIGNAL && sig.state[c] === LIGHT_RED;
 
   for (let k = k0; k < k1; k++) {
     const kind = confKind[k];
@@ -402,12 +461,13 @@ function conflictsClear(w: World, v: number, c: number, d: number): boolean {
     const selfS = confSelf[k];
     const otherS = confOther[k];
     const merge = kind === KIND_MERGE;
-    const sweep = kind === KIND_SWEEP;
+    const sweep = isSweep(kind);
     // Into the same lane, merge ordering keeps bodies apart, as in the guard.
     if (sweep && g.toLane[other] === g.toLane[c]) continue;
     // A swept or near conflict is about bodies, so there is no right of way in it: first in.
     let rel = sweep || kind === KIND_NEAR ? 0 : relation(w, c, other);
-    if (boosted && rel < 0) rel = 1;
+    // Waiting long earns a turn, but never against a green while turning on red.
+    if (boosted && rel < 0 && !redTurning) rel = 1;
     if (merge && rel >= 0 && jn.ctl[c] === CTL_NONE) continue;
 
     // Nobody on it, nobody cleared for it, nobody to give way to: nothing to check.
@@ -425,7 +485,7 @@ function conflictsClear(w: World, v: number, c: number, d: number): boolean {
       const rear = eS[e] - veh.len[u];
       if (rear > otherS + CROSS_MARGIN) continue;
       if (merge && rel >= 0) continue;
-      if (sweep && myLen < LONG_BODY && veh.len[u] < LONG_BODY) continue;
+      if (sweep && !sweepApplies(kind, myLen, veh.len[u], LONG_BODY)) continue;
       // Whoever is already inside goes first, even if it has yet to reach this point.
       // Entry order is what makes a deadlock impossible, so nobody may jump it. A
       // stopped vehicle gives no clue when it will clear, so it simply blocks.
@@ -439,6 +499,9 @@ function conflictsClear(w: World, v: number, c: number, d: number): boolean {
     // Vehicles holding a permit for it.
     for (let u = jn.claimHead[other]; u >= 0; u = veh.claimNext[u]) {
       const du = veh.permitDist[u];
+      // Queued behind this driver in the same lane, it cannot get there first. Without
+      // this a follower's claim on a turn holds up the leader going straight on, for ever.
+      if (veh.lane[u] === veh.lane[v] && g.fromLane[other] === g.fromLane[c] && du > d) continue;
       const vu = veh.v[u];
       const committed = (vu * vu) / (2 * Math.max(du, 0.1)) > COMFORT_STOP;
       // Outranking someone only counts if they have not been waiting too long.
@@ -450,7 +513,7 @@ function conflictsClear(w: World, v: number, c: number, d: number): boolean {
       // counted up between one driver's turn and the other's.
       if (veh.claimWait[u] && waitedLess(w, u, v)) continue;
       if (merge && rel >= 0) continue;
-      if (sweep && myLen < LONG_BODY && veh.len[u] < LONG_BODY) continue;
+      if (sweep && !sweepApplies(kind, myLen, veh.len[u], LONG_BODY)) continue;
       const aU = veh.accel[u];
       const capU = laneSpeed[other];
       const tin = timeToCover(du + otherS - CROSS_MARGIN, vu, aU, capU);

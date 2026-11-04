@@ -9,6 +9,8 @@
  * edges, an area's corners between anchors. Everything is stored by arm and
  * boundary, never by position, so it follows the roads.
  */
+import { stackedWith } from '../core/paintCoherence';
+import { isRampJunction } from '../render/gore';
 import { distXZ } from '../core/math';
 import { lineStyleInfo, isPathStyle, LINE_STYLE_INFO, fillPatch, stylePatch, styleOf, fillOf } from '../core/markingStyle';
 import { applyTemplate, captureTemplate, fitTemplate, type TemplateFit } from '../core/markingTemplates';
@@ -165,6 +167,38 @@ export class NodeMarkingTool extends Tool {
 
   private get drawing(): boolean {
     return this.first !== null || this.corners.length > 0;
+  }
+
+  /** Mid-gesture: a drag, a line's first anchor, or an area's corners. */
+  get busy(): boolean {
+    return this.drag !== null || this.drawing;
+  }
+
+  /**
+   * Whether junction design should take this pointer (the merged Markings tool asks):
+   * mid-gesture, over the open host's anchors, handles or markings, over a junction
+   * or transition surface, or over the open road while drawing crossings, stop lines
+   * or areas on it.
+   */
+  wantsPointer(e: ToolPointer): boolean {
+    if (this.busy) return true;
+    const raw = this.updateHover(e);
+    const host = this.hostRef;
+    if (host) {
+      if (this.hover || this.hoverUser !== null || this.hoverAuto) return true;
+      // A crossing or stop line laid across one of the open host's arms.
+      if ((this.draw === 'crosswalk' || this.draw === 'stop') && this.acrossAnchors(this.draw)) return true;
+      if (this.handleAt(raw)) return true;
+      if (host.kind === 'node') {
+        const node = this.ctx.net.getNode(host.id);
+        if (node && raw && (pickNode(this.ctx, e, (n) => n === node.id) !== null || distXZ(raw, node.pos) <= nodeReach(this.ctx.net, node.id) * 1.4)) return true;
+      } else if (this.draw !== 'line' && this.draw !== 'stamp' && pickRoad(this.ctx, e)?.segmentId === host.id) return true;
+    }
+    if (this.draw === 'stamp') return false;
+    // A junction, transition, merge or joint; not a dead end's cap.
+    const id = pickNode(this.ctx, e);
+    const g = id === null ? null : this.ctx.net.nodeGeom(id);
+    return !!g && g.arms.length >= 2 && g.kind !== 'deadEnd' && g.kind !== 'empty';
   }
 
   private get anchorDraw(): boolean {
@@ -463,7 +497,7 @@ export class NodeMarkingTool extends Tool {
   }
 
   private hudTitle(): string {
-    const names: Record<MarkingDraw, string> = { select: 'Pick', line: 'Line', crosswalk: 'Crosswalk', stop: 'Stop line', filler: 'Area', erase: 'Eraser' };
+    const names: Record<MarkingDraw, string> = { select: 'Pick', line: 'Line', crosswalk: 'Crosswalk', stop: 'Stop line', filler: 'Area', stamp: 'Stamp', erase: 'Eraser' };
     return this.hostRef ? `Markings: ${names[this.draw]}` : 'Markings';
   }
 
@@ -478,13 +512,25 @@ export class NodeMarkingTool extends Tool {
       case 'erase':
         return 'Click a marking to remove it';
       case 'crosswalk':
-        return 'Click on an arm to lay a crosswalk across it';
-      case 'stop':
-        return 'Click on an arm to lay a stop line across its incoming lanes';
+      case 'stop': {
+        // One marking per place: a taken slot says what the click replaces.
+        const kind = this.draw;
+        const across = this.acrossAnchors(kind);
+        const spec = kind === 'crosswalk' ? this.ctx.settings.nodeMarking.crosswalk : this.ctx.settings.nodeMarking.stop;
+        const taken = across ? this.replaces({ kind: 'line', ...cleanSpec(spec), from: across.from, to: across.to, straight: true } as Omit<NodeLineMarking, 'id'>) : '';
+        if (taken) return `Click to replace the ${taken}`;
+        return kind === 'crosswalk' ? 'Click on an arm to lay a crosswalk across it' : 'Click on an arm to lay a stop line across its incoming lanes';
+      }
       case 'filler':
         return this.corners.length >= 3 ? 'Click the first anchor or press Enter to close' : 'Click anchors around the area';
-      default:
+      default: {
+        if (this.first && this.hover && !sameAnchor(this.first, this.hover.anchor)) {
+          const spec = this.lineSpec();
+          const taken = this.replaces({ kind: 'line', ...cleanSpec(spec), from: this.first, to: this.hover.anchor, ...this.pathFor(this.first, this.hover.anchor, spec.style) } as Omit<NodeLineMarking, 'id'>);
+          if (taken) return `Click to replace the ${taken}`;
+        }
         return this.first ? 'Click the second anchor, on any arm' : 'Click an anchor to start a line, or a marking to pick it';
+      }
     }
   }
 
@@ -661,13 +707,23 @@ export class NodeMarkingTool extends Tool {
   // Placing
   // -------------------------------------------------------------------------
 
+  /** Free-flow junctions (highway ramps, slip merges) take no crosswalks or stop lines. */
+  get freeFlow(): boolean {
+    return this.hostRef?.kind === 'node' && isRampJunction(this.ctx.net, this.hostRef.id);
+  }
+
   private placeAcross(kind: 'crosswalk' | 'stop'): boolean {
+    if (this.freeFlow) {
+      this.ctx.toast('No crosswalks or stop lines at a free-flowing junction.', 'warning');
+      return true;
+    }
     const across = this.acrossAnchors(kind);
     if (!across || !this.hostRef) return false;
     const s = this.ctx.settings.nodeMarking;
     const spec = kind === 'crosswalk' ? s.crosswalk : s.stop;
     this.ctx.history.hint(kind === 'crosswalk' ? 'Add crosswalk' : 'Add stop line');
     const id = this.ctx.net.addMarking(this.hostRef, { kind: 'line', ...stylePatch(spec), style: spec.style, color: spec.color, width: spec.width, from: across.from, to: across.to, straight: true } as Omit<NodeLineMarking, 'id'>);
+    this.noteReplaced();
     this.selectedIds = [id];
     this.autoKey = null;
     this.show(this.pointer);
@@ -696,8 +752,25 @@ export class NodeMarkingTool extends Tool {
         ...this.pathFor(this.first, anchor, spec.style),
       } as Omit<NodeLineMarking, 'id'>),
     ];
+    this.noteReplaced();
     this.autoKey = null;
     this.first = null;
+  }
+
+  /** One marking per place: say what the one just placed replaced. */
+  private noteReplaced(): void {
+    const what = this.ctx.net.lastReplaced[0];
+    if (what) this.ctx.toast(`Replaced the ${what}.`, 'info');
+  }
+
+  /** What placing this would replace, named, or '' when the place is free. */
+  private replaces(init: Omit<NodeLineMarking, 'id'> | Omit<NodeFillerMarking, 'id'>): string {
+    if (!this.hostRef) return '';
+    try {
+      return stackedWith(this.ctx.net, { kind: 'marking', host: this.hostRef, marking: init })["labels"][0] ?? '';
+    } catch {
+      return '';
+    }
   }
 
   private clickCorner(anchor: MarkingAnchor): void {
@@ -717,6 +790,7 @@ export class NodeMarkingTool extends Tool {
     history.hint('Add filler');
     const init = { kind: 'filler' as const, anchors: this.corners, fill, color, width: fillWidth, ...dropEmpty(fillExtra) };
     this.selectedIds = [net.addMarking(this.hostRef, init)];
+    this.noteReplaced();
     this.autoKey = null;
     this.corners = [];
     this.show(this.pointer);
@@ -1099,7 +1173,9 @@ export class NodeMarkingTool extends Tool {
       this.ctx.history.abort();
     } else if (this.first) this.first = null;
     else if (this.corners.length) this.corners.pop();
-    else if (this.selectedIds.length || this.autoKey) {
+    else if (this.pointer && this.rightClickRemoves()) {
+      // Right-click on a selected marking removes it (Remove), one undo step.
+    } else if (this.selectedIds.length || this.autoKey) {
       this.selectedIds = [];
       this.autoKey = null;
     } else if (this.hostRef) {
@@ -1110,6 +1186,26 @@ export class NodeMarkingTool extends Tool {
     this.show(this.pointer);
     this.ctx.changed();
     return true;
+  }
+
+  /** A right-click over a selected marking: remove it. True when something went. */
+  private rightClickRemoves(): boolean {
+    if (!this.pointer || !this.hostRef) return false;
+    // What is under the pointer, whether or not an anchor is there too.
+    const raw = this.ground(this.pointer);
+    if (!raw) return false;
+    const user = userMarkingAt(this.ctx.net, this.hostRef, raw);
+    if (user !== null && this.selectedIds.includes(user)) {
+      this.remove(user);
+      return true;
+    }
+    const auto = user === null && this.hostRef.kind === 'node' ? autoItemAt(cachedAutoItems(this.ctx.net, this.hostRef.id), raw) : null;
+    if (auto && this.autoKey === auto.key) {
+      this.removeAuto(auto);
+      this.autoKey = null;
+      return true;
+    }
+    return false;
   }
 
   activate(): void {

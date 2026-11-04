@@ -6,14 +6,21 @@
  *   ring at each corner's kerb    kerb radius, from a tight corner to a wide sweep
  *   square on each corner's walk  the kerb line pushed out (kerb extension) or back
  *   square at each arm-end kerb   sidewalk widened (bulb-out) or narrowed there
- *   arrow on each cut line        the arm's trim, a tighter or larger junction box
+ *   big ring on each cut line     the arm's length from the node, 0.5 m steps, from
+ *                                 where its lanes would overlap the next road to most of the road
+ *   square at the node's centre   move the node, Q and E for height; the shape goes with it
  *   dots on island ends           how far an island runs back and forward
+ *
+ * [ and ] scale every arm's length together, X makes the node as short as it can be.
+ * A dead end takes the length handle too: its road can stop short of the node.
  *
  * Islands are added by clicking two lane boundaries on one arm, the same anchors
  * Node Markings uses. A drag is one undo step. A shape that would put a kerb in
  * the way of traffic is refused: the handle turns red and says why.
  */
-import { distXZ } from '../core/math';
+import { clamp, distXZ } from '../core/math';
+import { segmentOverlapIssues } from '../core/overlap';
+import { ELEVATION_STEP, MAP_HALF_SIZE, MAX_ELEVATION, MIN_ELEVATION } from '../core/terrain';
 import { nodeAnchors, type AnchorPoint } from '../core/nodeMarkings';
 import {
   EDGE_STEP,
@@ -25,7 +32,9 @@ import {
   RADIUS_STEP,
   TRIM_STEP,
   applyJunctionShape,
+  applyShortestShape,
   armInfos,
+  armTrimLimits,
   cornerInfos,
   cornerTakesRadius,
   editableShape,
@@ -34,8 +43,10 @@ import {
   radiusFromApexDistance,
   snapTo,
   withArm,
+  withArmLength,
   withCorner,
   withIsland,
+  withScale,
   type ArmInfo,
   type CornerInfo,
   type ShapeProblem,
@@ -49,7 +60,10 @@ import { COLORS, type ToolId, type ToolKey, type ToolPointer } from './types';
 
 const HANDLE_REACH = 1.3;
 
-export type ShapeHandleKind = 'radius' | 'kerb' | 'trim' | 'edgeLeft' | 'edgeRight' | 'islandBack' | 'islandReach';
+export type ShapeHandleKind = 'radius' | 'kerb' | 'trim' | 'edgeLeft' | 'edgeRight' | 'islandBack' | 'islandReach' | 'node' | 'scale';
+
+/** Scale step for [ and ]. */
+const SCALE_STEP = 0.1;
 
 export interface ShapeHandle {
   kind: ShapeHandleKind;
@@ -82,6 +96,8 @@ export class JunctionShapeTool extends Tool {
   private nodeId: Id | null = null;
   private hover: ShapeHandle | null = null;
   private drag: { handle: ShapeHandle; start: Vec3; startShape: JunctionShape; startValue: number; last: string } | null = null;
+  /** Moving the node: its segments' overlap problems before the move. */
+  private moving: { before: number } | null = null;
   /** Problems from the last refused change, and which handle they belong to. */
   private refusal: { handleKey: string; kind: ShapeHandleKind | 'island'; problems: ShapeProblem[] } | null = null;
   /** Adding an island: the first boundary clicked. */
@@ -157,8 +173,12 @@ export class JunctionShapeTool extends Tool {
         out.push({ kind: 'kerb', key: c.key, pos, axis: c.inward, label: `Sidewalk ${(c.setting.kerb ?? 0) >= 0 ? '+' : ''}${(c.setting.kerb ?? 0).toFixed(2)} m` });
       }
     }
+    const junction = net.nodeGeom(nodeId)?.kind === 'junction';
     for (const a of armInfos(net, nodeId)) {
-      out.push({ kind: 'trim', key: String(a.segmentId), pos: add(a.centre, a.out, 0.8), axis: a.out, label: `Trim ${(a.setting.trim ?? 0) >= 0 ? '+' : ''}${(a.setting.trim ?? 0).toFixed(1)} m` });
+      const lim = armTrimLimits(net, nodeId, a.segmentId);
+      const len = lim ? `${lim.now.toFixed(1)} m` : '';
+      out.push({ kind: 'trim', key: String(a.segmentId), pos: add(a.centre, a.out, 1.6), axis: a.out, label: junction ? `Arm length ${len}` : `End ${len} short of the node` });
+      if (!junction) continue;
       if (a.walkLeft > 0) {
         out.push({ kind: 'edgeLeft', key: String(a.segmentId), pos: add(add(a.kerbLeft, a.left, a.walkLeft / 2), a.out, 1.2), axis: neg(a.left), label: `Kerb ${(a.setting.edgeLeft ?? 0).toFixed(2)} m` });
       }
@@ -173,7 +193,15 @@ export class JunctionShapeTool extends Tool {
       out.push({ kind: 'islandBack', key: String(island.id), pos: islandEndPos(arm, island, 'back'), axis: arm.out, label: `Island back ${island.back.toFixed(1)} m` });
       out.push({ kind: 'islandReach', key: String(island.id), pos: islandEndPos(arm, island, 'reach'), axis: neg(arm.out), label: `Island nose ${island.reach.toFixed(1)} m` });
     }
+    const node = net.getNode(nodeId);
+    if (node) out.push({ kind: 'node', key: String(nodeId), pos: node.pos, axis: { x: 1, y: 0, z: 0 }, label: `Move node, height ${node.pos.y.toFixed(0)} m (Q, E)` });
     return out;
+  }
+
+  /** Whether a node can be opened: a junction, or a dead end for its end length. */
+  private openable(id: Id): boolean {
+    const kind = this.ctx.net.nodeGeom(id)?.kind;
+    return kind === 'junction' || kind === 'deadEnd';
   }
 
   private bisector(c: CornerInfo): Vec3 {
@@ -241,7 +269,11 @@ export class JunctionShapeTool extends Tool {
       case 'kerb':
         return shape.corners?.[h.key]?.kerb ?? 0;
       case 'trim':
-        return shape.arms?.[Number(h.key)]?.trim ?? 0;
+        return armTrimLimits(net, this.nodeId!, Number(h.key))?.now ?? 0;
+      case 'scale':
+        return shape.scale ?? 1;
+      case 'node':
+        return 0;
       case 'edgeLeft':
         return shape.arms?.[Number(h.key)]?.edgeLeft ?? 0;
       case 'edgeRight':
@@ -262,7 +294,12 @@ export class JunctionShapeTool extends Tool {
       case 'kerb':
         return withCorner(base, h.key, { kerb: snapTo(value, KERB_STEP) || undefined });
       case 'trim':
-        return withArm(base, seg, { trim: snapTo(value, TRIM_STEP) || undefined });
+        // The value is the arm's length from the node, snapped there rather than the change.
+        return withArmLength(this.ctx.net, this.nodeId!, base, seg, Math.max(0, value));
+      case 'scale':
+        return withScale(base, value);
+      case 'node':
+        return base;
       case 'edgeLeft':
         return withArm(base, seg, { edgeLeft: snapTo(value, EDGE_STEP) || undefined });
       case 'edgeRight':
@@ -334,6 +371,44 @@ export class JunctionShapeTool extends Tool {
     this.ctx.changed();
   }
 
+  /** Scale every arm's automatic length together, as from [ and ] or the panel. */
+  setScale(scale: number): boolean {
+    return this.setValue('scale', 'node', scale);
+  }
+
+  get scale(): number {
+    return this.nodeId === null ? 1 : (this.ctx.net.getNode(this.nodeId)?.control.shape?.scale ?? 1);
+  }
+
+  /** Make every arm as short as it can be while traffic still fits. */
+  shortest(): boolean {
+    if (this.nodeId === null) return false;
+    this.ctx.history.begin('Shortest junction');
+    const res = applyShortestShape(this.ctx.net, this.nodeId);
+    this.ctx.history.end();
+    this.refusal = res.ok ? null : { handleKey: 'node', kind: 'scale', problems: res.problems };
+    this.show(this.pointer);
+    this.ctx.changed();
+    return res.ok;
+  }
+
+  /** Raise or lower the open node by one elevation step. */
+  stepHeight(dir: 1 | -1): void {
+    const node = this.nodeId === null ? undefined : this.ctx.net.getNode(this.nodeId);
+    if (!node) return;
+    this.ctx.history.hint(dir > 0 ? 'Raise node' : 'Lower node', `shape-height-${node.id}`);
+    this.ctx.net.moveNode(node.id, { ...node.pos, y: clamp(node.pos.y + dir * ELEVATION_STEP, MIN_ELEVATION, MAX_ELEVATION) });
+    this.show(this.pointer);
+    this.ctx.changed();
+  }
+
+  /** How many overlap problems the node's roads have, to refuse a move that adds one. */
+  private overlapCount(): number {
+    const node = this.nodeId === null ? undefined : this.ctx.net.getNode(this.nodeId);
+    if (!node) return 0;
+    return node.segments.reduce((n, s) => n + segmentOverlapIssues(this.ctx.net, s).length, 0);
+  }
+
   resetAll(): void {
     if (this.nodeId === null) return;
     this.ctx.history.hint('Reset junction shape');
@@ -400,14 +475,40 @@ export class JunctionShapeTool extends Tool {
           const active = this.drag?.handle.kind === h.kind && this.drag.handle.key === h.key;
           const hot = active || (this.hover?.kind === h.kind && this.hover.key === h.key);
           const refused = bad && bad.handleKey === h.key && (bad.kind === h.kind || (active && !!bad));
-          const color = refused ? COLORS.bad : hot ? COLORS.ok : h.kind === 'radius' ? COLORS.snap : h.kind === 'trim' ? COLORS.warn : COLORS.neutral;
-          marks.push({ kind: h.kind === 'radius' ? 'ring' : 'point', pos: h.pos, color, radius: hot ? 0.75 : 0.5 });
-          if (h.kind === 'trim') marks.push({ kind: 'line', points: [h.pos, add(h.pos, h.axis, 2)], color, width: 0.2 });
-          if (hot) marks.push({ kind: 'label', pos: add(h.pos, h.axis, -1.5), text: h.label, color });
+          const color = refused ? COLORS.bad : hot ? COLORS.ok : h.kind === 'radius' || h.kind === 'node' ? COLORS.snap : h.kind === 'trim' ? COLORS.warn : COLORS.neutral;
+          if (h.kind === 'trim') {
+            // Big and obvious: a ring on the arm with arrows both ways along the road.
+            marks.push({ kind: 'ring', pos: h.pos, color, radius: hot ? 1.4 : 1.1 });
+            marks.push({ kind: 'point', pos: h.pos, color, radius: 0.45 });
+            for (const k of [1, -1]) {
+              const tip = add(h.pos, h.axis, 2.6 * k);
+              const side = { x: -h.axis.z, y: 0, z: h.axis.x };
+              marks.push({ kind: 'line', points: [add(h.pos, h.axis, 1.3 * k), tip], color, width: 0.22 });
+              marks.push({ kind: 'line', points: [add(add(tip, h.axis, -0.7 * k), side, 0.5), tip, add(add(tip, h.axis, -0.7 * k), side, -0.5)], color, width: 0.22 });
+            }
+            const arm = armInfos(net, nodeId).find((a) => String(a.segmentId) === h.key);
+            if (arm) {
+              const half = Math.max(arm.walkLeft, 0) + net.roadTypeOf(arm.segmentId).halfWidth;
+              marks.push({ kind: 'line', points: [add(arm.centre, arm.left, half), add(arm.centre, arm.left, -half)], color, width: hot ? 0.3 : 0.18, dashed: !hot });
+            }
+            marks.push({ kind: 'label', pos: add(h.pos, h.axis, 3.4), text: h.label.replace(/^Arm length /, ''), color });
+          } else if (h.kind === 'node') {
+            marks.push({ kind: 'point', pos: h.pos, color, radius: hot ? 0.9 : 0.7 });
+            marks.push({ kind: 'ring', pos: h.pos, color, radius: hot ? 1.3 : 1.1 });
+          } else {
+            marks.push({ kind: h.kind === 'radius' ? 'ring' : 'point', pos: h.pos, color, radius: hot ? 0.75 : 0.5 });
+          }
+          if (hot && h.kind !== 'trim') marks.push({ kind: 'label', pos: add(h.pos, h.axis, -1.5), text: h.label, color });
+          // A refused handle says why right below it.
+          if (refused && bad) marks.push({ kind: 'label', pos: { ...h.pos, z: h.pos.z + 2.4 }, text: bad.problems[0].message, color: COLORS.bad });
         }
         const h = this.drag?.handle ?? this.hover;
         if (h) lines.push(h.label);
-        note = this.drag ? 'Drag to reshape. Double-click a handle to reset it' : this.hover ? 'Drag to reshape, double-click to reset' : 'Drag a handle. Right click to leave this junction';
+        if (h?.kind === 'trim') {
+          const lim = armTrimLimits(net, nodeId, Number(h.key));
+          if (lim) lines.push(`Automatic ${lim.auto.toFixed(1)} m, range ${lim.min.toFixed(1)} to ${lim.max.toFixed(1)} m`);
+        }
+        note = this.drag ? 'Drag to reshape. Double-click a handle to reset it' : this.hover ? 'Drag to reshape, double-click to reset' : 'Drag a handle. [ ] size, X shortest, right click to leave';
         if (bad) {
           note = bad.problems[0].message;
           tone = 'error';
@@ -424,6 +525,16 @@ export class JunctionShapeTool extends Tool {
 
   pointerMove(e: ToolPointer): void {
     this.pointer = e;
+    if (this.drag && this.nodeId !== null && this.drag.handle.kind === 'node') {
+      const node = this.ctx.net.getNode(this.nodeId);
+      const raw = node ? this.ctx.view.pickPlane(e.x, e.y, node.pos.y) : null;
+      if (node && raw) {
+        this.ctx.net.moveNode(node.id, { x: clamp(raw.x, -MAP_HALF_SIZE, MAP_HALF_SIZE), y: node.pos.y, z: clamp(raw.z, -MAP_HALF_SIZE, MAP_HALF_SIZE) });
+        this.refreshDragHandle();
+      }
+      this.show(e);
+      return;
+    }
     if (this.drag && this.nodeId !== null) {
       const { handle, start, startShape, startValue } = this.drag;
       const raw = this.ctx.view.pickPlane(e.x, e.y, handle.pos.y);
@@ -440,7 +551,7 @@ export class JunctionShapeTool extends Tool {
         const sig = JSON.stringify(next);
         if (sig !== this.drag.last) {
           this.drag.last = sig;
-          this.attempt(next, handle.key, handle.kind);
+          if (!this.attempt(next, handle.key, handle.kind) && handle.kind === 'trim') this.clampLength(handle, value, startShape);
           this.refreshDragHandle();
         }
       }
@@ -448,7 +559,7 @@ export class JunctionShapeTool extends Tool {
       return;
     }
     if (this.nodeId === null) {
-      const hover = pickNode(this.ctx, e, (id) => this.ctx.net.nodeGeom(id)?.kind === 'junction');
+      const hover = pickNode(this.ctx, e, (id) => this.openable(id));
       this.ctx.view.setHighlight(hover === null ? null : { nodes: [hover], color: COLORS.snap });
     } else if (this.addingIsland) {
       this.hoverAnchor = this.anchorAt(e);
@@ -456,6 +567,24 @@ export class JunctionShapeTool extends Tool {
       this.hover = this.handleAt(e);
     }
     this.show(e);
+  }
+
+  /**
+   * A length past its limit stops at the limit, still red with the reason, so a fast
+   * drag ends at the shortest (or longest) the arm can be rather than where it was.
+   */
+  private clampLength(handle: ShapeHandle, value: number, base: JunctionShape): void {
+    const refusal = this.refusal;
+    const lim = armTrimLimits(this.ctx.net, this.nodeId!, Number(handle.key));
+    if (!lim || !refusal) return;
+    const step = 0.5;
+    const target = value < lim.min ? Math.ceil(lim.min / step) * step : value > lim.max ? Math.floor(lim.max / step) * step : null;
+    if (target === null) return;
+    for (let k = 0; k < 6; k++) {
+      const len = target + (value < lim.min ? k : -k) * step;
+      if (applyJunctionShape(this.ctx.net, this.nodeId!, withArmLength(this.ctx.net, this.nodeId!, base, Number(handle.key), len)).ok) break;
+    }
+    this.refusal = refusal;
   }
 
   /** Keep the dragged handle's label in step with the network. */
@@ -492,7 +621,8 @@ export class JunctionShapeTool extends Tool {
       if (h) {
         const raw = this.ctx.view.pickPlane(e.x, e.y, h.pos.y) ?? h.pos;
         const startShape = editableShape(net, this.nodeId);
-        this.ctx.history.begin('Shape junction');
+        this.ctx.history.begin(h.kind === 'node' ? 'Move node' : 'Shape junction');
+        if (h.kind === 'node') this.moving = { before: this.overlapCount() };
         this.drag = { handle: h, start: raw, startShape, startValue: this.valueOf(h, startShape), last: JSON.stringify(startShape) };
         if (h.kind === 'islandBack' || h.kind === 'islandReach') this.selectedIsland = Number(h.key);
         this.refusal = null;
@@ -514,14 +644,20 @@ export class JunctionShapeTool extends Tool {
     const near = this.nodeId === null ? null : net.getNode(this.nodeId);
     const raw = near ? this.ctx.view.pickPlane(e.x, e.y, near.pos.y) : null;
     if (near && raw && distXZ(raw, near.pos) <= nodeReach(net, near.id) * 2.5) return;
-    const id = pickNode(this.ctx, e, (n) => net.nodeGeom(n)?.kind === 'junction');
+    const id = pickNode(this.ctx, e, (n) => this.openable(n));
     if (id !== null && id !== this.nodeId) this.open(id);
   }
 
   pointerUp(_e: ToolPointer): void {
     if (!this.drag) return;
+    const moved = this.drag.handle.kind === 'node' ? this.moving : null;
     this.drag = null;
-    this.ctx.history.end();
+    this.moving = null;
+    if (moved && this.overlapCount() > moved.before) {
+      // A move that lays a road over another is put back, as the Move tool does.
+      this.ctx.history.abort();
+      this.ctx.toast('That would lay a road over another one, so the node went back.', 'warning');
+    } else this.ctx.history.end();
     this.show(this.pointer);
     this.ctx.changed();
   }
@@ -549,6 +685,9 @@ export class JunctionShapeTool extends Tool {
       case 'edgeRight':
         next = withArm(shape, Number(h.key), { edgeRight: undefined });
         break;
+      case 'node':
+      case 'scale':
+        return;
       default: {
         const island = shape.islands?.find((i) => i.id === Number(h.key));
         next = island ? withIsland(shape, h.kind === 'islandBack' ? { ...island, back: ISLAND_DEFAULT_BACK } : { ...island, reach: 0 }) : shape;
@@ -559,7 +698,25 @@ export class JunctionShapeTool extends Tool {
     this.ctx.changed();
   }
 
+  usesElevationKeys(): boolean {
+    return this.nodeId !== null;
+  }
+
   keyDown(e: ToolKey): boolean {
+    if (this.nodeId !== null && !e.ctrl && !e.alt) {
+      if (e.key === 'PageUp' || e.key === 'PageDown') {
+        this.stepHeight(e.key === 'PageUp' ? 1 : -1);
+        return true;
+      }
+      if (e.key === '[' || e.key === ']') {
+        this.setScale(this.scale + (e.key === ']' ? SCALE_STEP : -SCALE_STEP));
+        return true;
+      }
+      if (e.key === 'x' || e.key === 'X') {
+        this.shortest();
+        return true;
+      }
+    }
     if ((e.key === 'Delete' || e.key === 'Backspace') && this.selectedIsland !== null) {
       this.removeIsland(this.selectedIsland);
       return true;
@@ -575,6 +732,7 @@ export class JunctionShapeTool extends Tool {
   back(): boolean {
     if (this.drag) {
       this.drag = null;
+      this.moving = null;
       this.ctx.history.abort();
     } else if (this.firstAnchor) this.firstAnchor = null;
     else if (this.addingIsland) this.addingIsland = false;
@@ -594,7 +752,7 @@ export class JunctionShapeTool extends Tool {
   }
 
   networkChanged(_change: NetworkChange): void {
-    if (this.nodeId !== null && this.ctx.net.nodeGeom(this.nodeId)?.kind !== 'junction') {
+    if (this.nodeId !== null && !this.openable(this.nodeId)) {
       this.nodeId = null;
       this.drag = null;
       this.ctx.inspect(null);
@@ -608,6 +766,7 @@ export class JunctionShapeTool extends Tool {
   deactivate(): void {
     if (this.drag) this.ctx.history.end();
     this.drag = null;
+    this.moving = null;
     this.nodeId = null;
     this.hover = null;
     this.addingIsland = false;

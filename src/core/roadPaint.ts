@@ -92,6 +92,22 @@ function sharedNode(net: RoadNetwork, a: RoadPaintPiece, b: RoadPaintPiece): Id 
 }
 
 /**
+ * The stretch joining the end of one piece (`last`, after `beforeLast`) to the
+ * start of the next (`first`, before `second`) through the node they share: along
+ * the lane path there, or a smooth curve tangent to both roads. Empty where the two
+ * meet at a plain joint or are not neighbours. Both ends left out.
+ */
+export function bridgeBetween(net: RoadNetwork, prev: RoadPaintPiece, next: RoadPaintPiece, beforeLast: Vec3 | undefined, last: Vec3, first: Vec3, second: Vec3 | undefined): Vec3[] {
+  const gap = Math.hypot(last.x - first.x, last.z - first.z);
+  const node = gap > 0.5 ? sharedNode(net, prev, next) : null;
+  if (node === null) return [];
+  const guide = connectorGuide(net, node, last, first, prev.segmentId, next.segmentId);
+  if (guide) return alongGuide(guide, last, first).slice(1, -1);
+  if (beforeLast && second) return smoothBridge(last, unitXZ(beforeLast, last), first, unitXZ(first, second));
+  return [];
+}
+
+/**
  * A line along every piece at one lateral offset, or moving evenly from `lateral`
  * to `lateralEnd`. Where it passes through a junction it follows the lane path
  * there, or a smooth curve tangent to both roads where no lane joins them.
@@ -102,21 +118,15 @@ export function pathPoints(net: RoadNetwork, pieces: readonly RoadPaintPiece[], 
   const total = lengths.reduce((a, b) => a + b, 0) || 1;
   let walked = 0;
   pieces.forEach((piece, i) => {
-    const l0 = lateral + (lateralEnd - lateral) * (walked / total);
+    let l0 = lateral + (lateralEnd - lateral) * (walked / total);
     walked += lengths[i];
-    const l1 = lateral + (lateralEnd - lateral) * (walked / total);
+    let l1 = lateral + (lateralEnd - lateral) * (walked / total);
+    // A piece with its own offset keeps it all along; the bridge to the next one crosses over.
+    if (piece.offset !== undefined) l0 = l1 = piece.offset;
     const pts = piecePoints(net, piece, l0, l1);
     const last = out[out.length - 1];
     const first = pts[0];
-    if (last && first) {
-      const gap = Math.hypot(last.x - first.x, last.z - first.z);
-      const node = gap > 0.5 ? sharedNode(net, pieces[i - 1], piece) : null;
-      const guide = node === null ? null : connectorGuide(net, node, last, first, pieces[i - 1].segmentId, piece.segmentId);
-      if (guide) out.push(...alongGuide(guide, last, first).slice(1, -1));
-      else if (node !== null && out.length >= 2 && pts.length >= 2) {
-        out.push(...smoothBridge(last, unitXZ(out[out.length - 2], last), first, unitXZ(first, pts[1])));
-      }
-    }
+    if (last && first) out.push(...bridgeBetween(net, pieces[i - 1], piece, out.length >= 2 ? out[out.length - 2] : undefined, last, pts[0], pts[1]));
     // Pieces meeting at a plain joint share a point.
     const joined = last && first && Math.hypot(last.x - first.x, last.z - first.z) < 0.01;
     out.push(...(joined ? pts.slice(1) : pts));
@@ -296,12 +306,13 @@ export function splitPaintPieces(pieces: readonly RoadPaintPiece[], id: Id, ts: 
     }
     const lo = Math.min(p.t0, p.t1);
     const hi = Math.max(p.t0, p.t1);
-    if (hi <= ts) out.push({ segmentId: id, t0: left(p.t0), t1: left(p.t1) });
-    else if (lo >= ts) out.push({ segmentId: rightId, t0: right(p.t0), t1: right(p.t1) });
+    const own = p.offset === undefined ? {} : { offset: p.offset };
+    if (hi <= ts) out.push({ segmentId: id, t0: left(p.t0), t1: left(p.t1), ...own });
+    else if (lo >= ts) out.push({ segmentId: rightId, t0: right(p.t0), t1: right(p.t1), ...own });
     else if (p.t0 < p.t1) {
-      out.push({ segmentId: id, t0: left(p.t0), t1: 1 }, { segmentId: rightId, t0: 0, t1: right(p.t1) });
+      out.push({ segmentId: id, t0: left(p.t0), t1: 1, ...own }, { segmentId: rightId, t0: 0, t1: right(p.t1), ...own });
     } else {
-      out.push({ segmentId: rightId, t0: right(p.t0), t1: 0 }, { segmentId: id, t0: 1, t1: left(p.t1) });
+      out.push({ segmentId: rightId, t0: right(p.t0), t1: 0, ...own }, { segmentId: id, t0: 1, t1: left(p.t1), ...own });
     }
   }
   return out;

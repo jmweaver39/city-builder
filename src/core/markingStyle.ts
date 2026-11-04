@@ -3,7 +3,7 @@
  * is called, its default measures, which settings apply to it, the built-in
  * presets, and colour helpers. Pure data, shared by the renderer, tools and panels.
  */
-import { CROSSWALK, DOT, DOUBLE_SPACING, FILL_STANDARDS, HATCH, GORE, LINE_STANDARDS, LINE_W, PAINT_HEX, STOP, dashFor, lineStandard } from './paintStandard';
+import { CROSSWALK, DOT, DOUBLE_SPACING, FILL_STANDARDS, HATCH, GORE, LINE_STANDARDS, LINE_W, PAINT_HEX, STOP, dashFor, lineStandard, standardWidth } from './paintStandard';
 import type { LineStyleSpec, MarkingPreset, NodeFillStyle, NodeFillerMarking, NodeLineMarking, NodeLineStyle, PaintColor } from './types';
 
 export { PAINT_HEX };
@@ -34,11 +34,15 @@ export const LINE_STYLE_INFO: readonly LineStyleInfo[] = [
   { value: 'zigzag', label: 'Zigzag', family: 'line', defaults: { width: LINE_W.lane, dash: 1, gap: 0.5 }, uses: ['dash', 'gap'] },
   { value: 'sharkTeeth', label: "Shark's teeth (yield)", family: 'teeth', defaults: { width: STD('giveWay').width, dash: STD('giveWay').dash, space: STD('giveWay').space }, uses: ['dash'] },
   { value: 'stopLine', label: 'Stop line', family: 'stop', defaults: { width: STOP.width }, uses: [] },
+  { value: 'stopLineDashed', label: 'Stop line, dashed (give way)', family: 'stop', defaults: { width: STOP.width, dash: 0.6, space: 0.3 }, uses: ['dash'] },
+  { value: 'stopLineDouble', label: 'Stop line, double', family: 'stop', defaults: { width: 0.3, gap: 0.3 }, uses: ['gap'] },
+  { value: 'stopLineSolidDashed', label: 'Stop line, solid and dashed', family: 'stop', defaults: { width: 0.3, gap: 0.3, dash: 0.6, space: 0.3 }, uses: ['dash', 'gap'] },
   { value: 'lane', label: 'Lane (painted area)', family: 'lane', defaults: { width: 3 }, uses: [] },
   { value: 'crosswalkZebra', label: 'Crosswalk, zebra', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.stripe, space: CROSSWALK.gap }, uses: ['dash', 'border'] },
   { value: 'crosswalkDoubleZebra', label: 'Crosswalk, double zebra', family: 'crosswalk', defaults: { width: 5, dash: CROSSWALK.stripe, space: CROSSWALK.gap, gap: 0.4 }, uses: ['dash', 'gap', 'border'] },
   { value: 'crosswalkLadder', label: 'Crosswalk, ladder', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.stripe, space: CROSSWALK.gap }, uses: ['dash'] },
   { value: 'crosswalkLines', label: 'Crosswalk, parallel lines', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.rail }, uses: ['dash'] },
+  { value: 'crosswalkDashedLines', label: 'Crosswalk, parallel dashed lines', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.rail, space: 0.6, gap: 0.6 }, uses: ['dash', 'gap'] },
   { value: 'crosswalkSolid', label: 'Crosswalk, solid', family: 'crosswalk', defaults: { width: CROSSWALK.depth }, uses: ['border'] },
   { value: 'crosswalkChessboard', label: 'Crosswalk, chessboard', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.stripe }, uses: ['dash', 'border'] },
   { value: 'empty', label: 'No paint', family: 'empty', defaults: { width: LINE_W.lane }, uses: [] },
@@ -83,12 +87,14 @@ const SPEED_DASHED = new Set<NodeLineStyle>(['dashed', 'solidDashed', 'dashedSol
 export function resolvedStyle(spec: LineStyleSpec, speedKmh = 50): Required<Pick<LineStyleSpec, 'width' | 'dash' | 'space' | 'gap' | 'offset'>> & LineStyleSpec {
   const d = lineStyleInfo(spec.style).defaults;
   const speed = SPEED_DASHED.has(spec.style) ? dashFor(speedKmh) : null;
+  const width = standardWidth(spec.width, speedKmh);
   return {
     ...spec,
-    width: spec.width,
+    width,
     dash: spec.dash ?? speed?.dash ?? d.dash ?? 3,
     space: spec.space ?? speed?.gap ?? d.space ?? 6,
-    gap: spec.gap ?? d.gap ?? DOUBLE_SPACING - spec.width,
+    // A standard double keeps its lines 0.32 m apart, centre to centre, whatever width the road draws them.
+    gap: spec.gap === undefined || Math.abs(spec.gap - (DOUBLE_SPACING - spec.width)) < 1e-9 ? (spec.gap === undefined && d.gap !== undefined && Math.abs(d.gap - (DOUBLE_SPACING - (d.width ?? 0))) > 1e-9 ? d.gap : DOUBLE_SPACING - width) : spec.gap,
     offset: spec.offset ?? 0,
   };
 }
@@ -96,7 +102,7 @@ export function resolvedStyle(spec: LineStyleSpec, speedKmh = 50): Required<Pick
 /** The look of a line, without its anchors and parts. */
 export function styleOf(m: LineStyleSpec): LineStyleSpec {
   const out: LineStyleSpec = { style: m.style, color: m.color, width: m.width };
-  for (const k of ['hex', 'dash', 'space', 'gap', 'offset', 'align', 'border'] as const) {
+  for (const k of ['hex', 'dash', 'space', 'gap', 'offset', 'align', 'border', 'color2', 'hex2'] as const) {
     if (m[k] !== undefined) (out as unknown as Record<string, unknown>)[k] = m[k];
   }
   return out;
@@ -118,21 +124,23 @@ export function stylePatch(spec: LineStyleSpec): Partial<NodeLineMarking> {
     offset: spec.offset,
     align: spec.align,
     border: spec.border,
+    color2: spec.color2,
+    hex2: spec.hex2,
   };
 }
 
-export type FillStyleSpec = Pick<NodeFillerMarking, 'fill' | 'color' | 'hex' | 'width' | 'angle' | 'step' | 'offset' | 'noOutline'>;
+export type FillStyleSpec = Pick<NodeFillerMarking, 'fill' | 'color' | 'hex' | 'width' | 'angle' | 'step' | 'offset' | 'noOutline' | 'invert'>;
 
 export function fillOf(m: FillStyleSpec): FillStyleSpec {
   const out: FillStyleSpec = { fill: m.fill, color: m.color, width: m.width };
-  for (const k of ['hex', 'angle', 'step', 'offset', 'noOutline'] as const) {
+  for (const k of ['hex', 'angle', 'step', 'offset', 'noOutline', 'invert'] as const) {
     if (m[k] !== undefined) (out as unknown as Record<string, unknown>)[k] = m[k];
   }
   return out;
 }
 
 export function fillPatch(spec: FillStyleSpec): Partial<NodeFillerMarking> {
-  return { fill: spec.fill, color: spec.color, width: spec.width, hex: spec.hex, angle: spec.angle, step: spec.step, offset: spec.offset, noOutline: spec.noOutline };
+  return { fill: spec.fill, color: spec.color, width: spec.width, hex: spec.hex, angle: spec.angle, step: spec.step, offset: spec.offset, noOutline: spec.noOutline, invert: spec.invert };
 }
 
 /** The same look seen in a mirror: sides swap. */
@@ -140,6 +148,13 @@ export function mirroredStyle(spec: LineStyleSpec): LineStyleSpec {
   const out = { ...spec };
   if (spec.style === 'solidDashed') out.style = 'dashedSolid';
   else if (spec.style === 'dashedSolid') out.style = 'solidDashed';
+  // The second line's own colour moves to the other side with it.
+  if (spec.color2 || spec.hex2) {
+    out.color = spec.color2 ?? spec.color;
+    out.hex = spec.hex2;
+    out.color2 = spec.color;
+    out.hex2 = spec.hex;
+  }
   if (spec.align) out.align = spec.align === 'left' ? 'right' : 'left';
   if (spec.offset) out.offset = -spec.offset;
   return out;

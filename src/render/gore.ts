@@ -14,25 +14,35 @@
 import type { GLane, Id, LineStyle, MarkingStyle, Vec3 } from '../core/types';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { closestPointOnCubic } from '../core/bezier';
-import { isControlledAccess } from '../core/ramps';
+import { isControlledAccess, isStreetMerge } from '../core/ramps';
 import { effectiveLanes, effectiveMarkings } from '../core/roadTypes';
 import { PaintBuf, type LinePoint } from './batch';
 import { LINE_WIDTH, PAINT_COL, ROAD_LIFT, strokesOf } from './constants';
-import { clipToPolygon } from './nodeMarkings';
+import { clipToPolygon } from './paint';
+import { EDGE_INSET as STD_EDGE_INSET, GORE, LINE_W, speedClassOf, standardWidth } from '../core/paintStandard';
+import { roadSpeed } from '../core/paintCoherence';
 import { isAutoOff } from '../core/autoMarkings';
+import { edgeMergeClip } from './edgeMerge';
 
-const EDGE_INSET = 0.18;
+const EDGE_INSET = STD_EDGE_INSET;
 /** Edges of two branches closer than this are painted as one line. */
 const MERGE_GAP = 0.9;
-const HATCH_STEP = 2.6;
-const HATCH_WIDTH = 0.4;
+const HATCH_STEP = GORE.step;
+const HATCH_WIDTH = GORE.stripe;
 
 /** True for a junction painted as a free-flowing highway junction. */
 export function isRampJunction(net: RoadNetwork, nodeId: Id): boolean {
   const g = net.nodeGeom(nodeId);
   if (!g || g.kind !== 'junction') return false;
   const cats = g.arms.map((a) => ({ category: net.roadTypeOf(a.segmentId).category }));
-  if (isControlledAccess(cats)) return true;
+  if (isControlledAccess(cats, net.getNode(nodeId)?.control.highwayAccess)) return true;
+  // A ramp slipping onto the side of a street by lane is a free-flow merge or diverge too.
+  const arms = g.arms.map((a) => {
+    const seg = net.getSegment(a.segmentId);
+    const attach = seg ? (seg.a === nodeId ? seg.overrides.attachA : seg.b === nodeId ? seg.overrides.attachB : undefined) : undefined;
+    return { category: net.roadTypeOf(a.segmentId).category, ...(attach ? { attach } : {}) };
+  });
+  if (isStreetMerge(arms)) return true;
   // Tapers between highway and ramp types, as at a lane add or drop.
   return cats.every((c) => c.category === 'highway' || c.category === 'ramp');
 }
@@ -44,6 +54,7 @@ interface Strip {
   width: number;
   group: string;
   markings: MarkingStyle;
+  speed: number;
 }
 
 function pointsOf(l: GLane): Vec3[] {
@@ -97,12 +108,15 @@ function toLinePoints(pts: Vec3[]): LinePoint[] {
   });
 }
 
-function stroke(buf: PaintBuf, pts: Vec3[], style: LineStyle, color: keyof typeof PAINT_COL, width = LINE_WIDTH): void {
+function stroke(buf: PaintBuf, pts: Vec3[], style: LineStyle, color: keyof typeof PAINT_COL, width = LINE_WIDTH, speedKmh = 100): void {
   if (pts.length < 2 || style === 'none') return;
-  for (const k of strokesOf(style)) {
-    const line = k.shift ? offsetLine(pts, k.shift) : pts;
-    buf.ribbon(toLinePoints(line), width, PAINT_COL[color], k.period, k.duty);
-  }
+  const w = standardWidth(width, speedKmh);
+  buf.inLayer('line', () => {
+    for (const k of strokesOf(style, speedKmh)) {
+      const line = k.shift ? offsetLine(pts, k.shift) : pts;
+      buf.ribbon(toLinePoints(line), w, PAINT_COL[color], k.period, k.duty);
+    }
+  });
 }
 
 /** Runs of consecutive true flags, as index ranges. */
@@ -175,6 +189,7 @@ function stripsAt(net: RoadNetwork, nodeId: Id): Strip[] {
       width: c.width,
       group: `${from.segmentId}>${to.segmentId}`,
       markings: effectiveMarkings(net.roadTypeOf(seg.id), seg.overrides),
+      speed: roadSpeed(net, seg.id),
     };
   });
 }
@@ -225,7 +240,7 @@ export function buildRampJunctionPaint(net: RoadNetwork, nodeId: Id, buf: PaintB
       // Two lanes that pull apart are separate branches, not one road.
       const spread = Math.max(...a.pts.map((p, k) => Math.hypot(p.x - b.pts[k].x, p.z - b.pts[k].z)));
       if (spread > (a.width + b.width) / 2 + 1.5) continue;
-      stroke(buf, mid, a.markings.laneLine === 'none' ? 'dashed' : a.markings.laneLine, a.markings.laneColor);
+      stroke(buf, mid, a.markings.laneLine === 'none' ? 'dashed' : a.markings.laneLine, a.markings.laneColor, LINE_W.lane, a.speed);
     }
   }
 
@@ -237,13 +252,14 @@ export function buildRampJunctionPaint(net: RoadNetwork, nodeId: Id, buf: PaintB
     side: -1 | 1;
     visible: boolean[];
     markings: MarkingStyle;
+    speed: number;
   }
   const edges: Edge[] = [];
   branches.forEach((list, bi) => {
     for (const side of [-1, 1] as const) {
       const s = side < 0 ? list[0] : list[list.length - 1];
       const pts = offsetLine(s.pts, side * (s.width / 2 - EDGE_INSET));
-      edges.push({ pts, branch: bi, side, visible: pts.map(() => true), markings: s.markings });
+      edges.push({ pts, branch: bi, side, visible: pts.map(() => true), markings: s.markings, speed: s.speed });
     }
   });
   for (const e of edges) {
@@ -278,7 +294,9 @@ export function buildRampJunctionPaint(net: RoadNetwork, nodeId: Id, buf: PaintB
   for (const e of edges) {
     for (const [i, j] of runs(e.visible)) {
       if (j - i < 1) continue;
-      stroke(buf, e.pts.slice(i, j + 1), e.markings.edgeLine === 'none' ? 'solid' : e.markings.edgeLine, e.markings.edgeColor, LINE_WIDTH * 1.2);
+      // As along the roads: the drivers' left edge is yellow on fast roads (paintStandard.ts).
+      const colour = e.side < 0 && speedClassOf(e.speed) === 'fast' && e.markings.edgeColor === 'white' ? 'yellow' : e.markings.edgeColor;
+      stroke(buf, e.pts.slice(i, j + 1), e.markings.edgeLine === 'none' ? 'solid' : e.markings.edgeLine, colour, LINE_W.edge, e.speed);
     }
   }
 
@@ -347,7 +365,7 @@ function paintGore(buf: PaintBuf, edges: { pts: Vec3[]; branch: number; side: -1
   const cx = (first.x + last.x) / 2;
   const cz = (first.z + last.z) / 2;
   const reach = ul / 2 + 20;
-  const lift = y + ROAD_LIFT + 0.004;
+  const lift = y + ROAD_LIFT;
   // Stripes lean back from the nose, like chevrons seen from the mainline.
   const lean = diverge ? -1 : 1;
   for (let k = -reach * 2; k <= reach * 2; k += HATCH_STEP) {
@@ -357,7 +375,7 @@ function paintGore(buf: PaintBuf, edges: { pts: Vec3[]; branch: number; side: -1
     const bz = cz + uz * k + vz * reach - uz * reach * lean;
     for (const [t0, t1] of clipToPolygon(ax, az, bx, bz, poly)) {
       const sy = lerpY(poly, ax + (bx - ax) * t0, az + (bz - az) * t0) ?? lift;
-      buf.bar(ax + (bx - ax) * t0, sy, az + (bz - az) * t0, ax + (bx - ax) * t1, sy, az + (bz - az) * t1, HATCH_WIDTH, color);
+      buf.inLayer('fill', () => buf.bar(ax + (bx - ax) * t0, sy, az + (bz - az) * t0, ax + (bx - ax) * t1, sy, az + (bz - az) * t1, HATCH_WIDTH, color));
     }
   }
   return poly;
@@ -374,7 +392,7 @@ function lerpY(poly: Vec3[], x: number, z: number): number | null {
       best = p;
     }
   }
-  return best ? best.y + ROAD_LIFT + 0.004 : null;
+  return best ? best.y + ROAD_LIFT : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +432,9 @@ export function overlapClip(net: RoadNetwork, segId: Id): ((offset: number, s0: 
   };
   const atA = othersAt(seg.a);
   const atB = othersAt(seg.b);
-  if (!atA.length && !atB.length) return null;
+  // Beside an edge merge's taper the highway's edge line gives way to the merge's paint.
+  const edge = edgeMergeClip(net, segId);
+  if (!atA.length && !atB.length) return edge;
   const st = geom.stations;
   const pointAt = (s: number, offset: number): Vec3 => {
     let i = 0;
@@ -446,7 +466,7 @@ export function overlapClip(net: RoadNetwork, segId: Id): ((offset: number, s0: 
     if (atB.length) {
       for (let s = s1; s > Math.max(a, s1 - CLIP_REACH) && onOther(pointAt(s, offset), atB); s -= CLIP_STEP) b = s - CLIP_STEP;
     }
-    const out: [number, number] = [a, Math.max(a, b)];
+    const out: [number, number] = edge ? edge(offset, a, Math.max(a, b)) : [a, Math.max(a, b)];
     cache.set(key, out);
     return out;
   };

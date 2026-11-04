@@ -17,7 +17,8 @@ import type {
 import type { RoadNetwork } from './RoadNetwork';
 import { headingOf, wrapAngle } from './math';
 import { RANK_AVENUE, isOneWay } from './roadTypes';
-import { isControlledAccess } from './ramps';
+import { attachAt, isControlledAccess, isStreetMerge } from './ramps';
+import { autoSignalPlan, isHighwayCrossing } from './highwayCrossing';
 
 export type SignalPreset = 'opposing' | 'protectedLefts' | 'split';
 
@@ -267,7 +268,7 @@ export function effectiveControl(net: RoadNetwork, nodeId: Id, control?: Junctio
   const arms = geom.arms.filter((a) => net.roadTypeOf(a.segmentId).category !== 'rail');
   const mode = ctl.mode;
   const auto = mode === 'auto';
-  const plan = (): SignalPlan => ctl.signal ?? defaultSignalPlan(net, nodeId, 'opposing');
+  const plan = (): SignalPlan => ctl.signal ?? autoSignalPlan(net, nodeId);
   const ring = arms.some((a) => isRing(net, a));
 
   if (mode === 'signal') return { kind: 'signal', signs: {}, signal: plan(), auto };
@@ -280,10 +281,18 @@ export function effectiveControl(net: RoadNetwork, nodeId: Id, control?: Junctio
     if (mode === 'auto') return { kind: 'none', signs: {}, signal: null, auto };
   } else if (mode === 'auto' && !ring) {
     if (isFreeFlow(net, arms)) return { kind: 'none', signs: {}, signal: null, auto };
+    // A road crossing a highway at grade: lights, so nobody turns or crosses in a gap (core/highwayCrossing.ts).
+    if (isHighwayCrossing(net, nodeId)) return { kind: 'signal', signs: {}, signal: plan(), auto };
     // Controlled access: every move off or onto a highway is a merge or diverge.
-    if (isControlledAccess(arms.map((a) => ({ category: net.roadTypeOf(a.segmentId).category })))) {
+    if (isControlledAccess(arms.map((a) => ({ category: net.roadTypeOf(a.segmentId).category })), ctl.highwayAccess)) {
       return { kind: 'none', signs: {}, signal: null, auto };
     }
+    // A slip road merging into or leaving along a street's kerb flows freely too.
+    const sides = arms.map((a) => {
+      const seg = net.getSegment(a.segmentId);
+      return { category: net.roadTypeOf(a.segmentId).category, attach: seg ? attachAt(seg, nodeId) : undefined };
+    });
+    if (isStreetMerge(sides)) return { kind: 'none', signs: {}, signal: null, auto };
     if (autoPicksSignal(net, arms)) return { kind: 'signal', signs: {}, signal: plan(), auto };
   }
 

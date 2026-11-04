@@ -71,6 +71,10 @@ export interface KeyApp {
   openPalette(): void;
   toggleShortcuts(): void;
   setControlCard(kind: string): void;
+  /** Road surface detail, or 'auto' to follow graphics quality. Optional: absent where there is no renderer. */
+  setRoadDetail?(pref: 'auto' | 'low' | 'medium' | 'high' | 'ultra'): void;
+  /** The graphics settings dialog. */
+  openGraphics?(): void;
 }
 
 export interface KeyBinding {
@@ -326,10 +330,11 @@ const TOOL_TITLES: Record<string, string> = {
   bulldoze: 'Bulldoze',
   move: 'Move',
   junction: 'Traffic control',
+  trafficRules: 'Traffic rules',
   roundabout: 'Roundabout',
   lanes: 'Lane connector',
-  paint: 'Paint',
-  nodeMarkings: 'Junction markings',
+  paint: 'Markings',
+  nodeMarkings: 'Markings',
   traffic: 'Traffic endpoints',
   template: 'Stamp',
   reverse: 'Reverse',
@@ -433,6 +438,24 @@ export const DEFAULT_BINDINGS: KeyBinding[] = [
   // File and edit
   { id: 'edit.undo', label: 'Undo', group: 'Edit', keys: ['Mod+Z'], scope: 'global', essential: true, repeat: true, run: (a) => a.undo() },
   { id: 'edit.redo', label: 'Redo', group: 'Edit', keys: ['Mod+Shift+Z', 'Mod+Y'], scope: 'global', repeat: true, run: (a) => a.redo() },
+  {
+    id: 'edit.copyHover',
+    label: "Copy what's under the cursor",
+    group: 'Edit',
+    keys: ['Mod+C'],
+    scope: 'global',
+    essential: true,
+    desc: 'Or middle-click, or Option+click: a road (type, lanes, upgrades), a marking (its style) or a junction (control and shape). Run by app/clipboard.ts',
+  },
+  {
+    id: 'edit.pasteHover',
+    label: "Paste onto what's under the cursor",
+    group: 'Edit',
+    keys: ['Mod+V'],
+    scope: 'global',
+    desc: 'A copied road style onto a road, a marking style onto a marking, a junction onto a junction. Also reads a copy from another tab',
+    noPalette: true,
+  },
   { id: 'edit.delete', label: 'Delete selected', group: 'Edit', keys: ['Delete', 'Backspace'], scope: 'global', desc: 'Remove the selected road, endpoint or roundabout', run: (a) => void a.deleteSelection() },
   { id: 'file.save', label: 'Save', group: 'File', keys: ['Mod+S'], scope: 'global', run: (a) => a.save() },
   { id: 'file.open', label: 'Open a save', group: 'File', keys: ['Mod+O'], scope: 'global', run: (a) => a.open() },
@@ -452,9 +475,10 @@ export const DEFAULT_BINDINGS: KeyBinding[] = [
   tool('junction', 'J', 'Traffic control', 'One click sets lights, signs or priority'),
   tool('roundabout', 'O', 'Roundabout', 'Build, resize or remove roundabouts'),
   tool('lanes', 'L', 'Lane connector', 'Link lanes through a junction by hand'),
-  tool('paint', 'P', 'Paint', 'Lines, areas, arrows and text on the road'),
-  tool('nodeMarkings', 'K', 'Junction markings', 'Paint lines and fillers inside a junction'),
+  tool('paint', 'P', 'Markings', 'Every mark on the road: along roads, at junctions, arrows and text'),
+  tool('nodeMarkings', 'K', 'Markings', 'The same Markings tool, as P'),
   tool('junctionShape', 'Shift+K', 'Junction shape', 'Drag kerb radii, sidewalks, arm trims and islands of a junction'),
+  tool('trafficRules', 'Shift+J', 'Traffic rules', 'Lane arrows, speed limits, vehicle bans, junction rules, priority roads, manual and timed lights'),
   tool('traffic', 'T', 'Traffic endpoints', 'Gateways and zones that make traffic'),
   tool('reverse', 'H', 'Reverse', 'Turn one-way roads round'),
   tool('parallel', 'I', 'Parallel road', 'Draw a road alongside an existing one'),
@@ -499,11 +523,18 @@ export const DEFAULT_BINDINGS: KeyBinding[] = [
   { id: 'roundabout.bigger', label: 'Radius larger', group: 'Roundabout', keys: [']'], scope: 'tool:roundabout', repeat: true, desc: 'The mouse wheel does it too; Cmd+wheel zooms' },
   { id: 'roundabout.delete', label: 'Delete roundabout', group: 'Roundabout', keys: ['Delete', 'Backspace'], scope: 'tool:roundabout', shadows: ['edit.delete', 'select.delete', 'select.deleteEndpoint'] },
 
+  // Junction shape: the tool takes these itself (JunctionShapeTool.keyDown).
+  { id: 'shape.lower', label: 'Lower node 4 m', group: 'Junction shape', keys: ['Q', 'PageDown'], scope: 'tool:junctionShape', shadows: ['camera.rotateLeft'], repeat: true, desc: 'With a node open; Option+Q/E still turns the camera' },
+  { id: 'shape.raise', label: 'Raise node 4 m', group: 'Junction shape', keys: ['E', 'PageUp'], scope: 'tool:junctionShape', shadows: ['camera.rotateRight'], repeat: true },
+  { id: 'shape.smaller', label: 'Whole junction smaller', group: 'Junction shape', keys: ['['], scope: 'tool:junctionShape', repeat: true },
+  { id: 'shape.bigger', label: 'Whole junction bigger', group: 'Junction shape', keys: [']'], scope: 'tool:junctionShape', repeat: true },
+  { id: 'shape.shortest', label: 'Shortest possible', group: 'Junction shape', keys: ['X'], scope: 'tool:junctionShape', desc: 'Every arm as short as it can be with the lanes still meeting' },
+  { id: 'shape.island', label: 'Add island', group: 'Junction shape', keys: ['I'], scope: 'tool:junctionShape', shadows: ['tool.parallel'], desc: 'With a node open; elsewhere I is the parallel road tool' },
+  { id: 'shape.deleteIsland', label: 'Remove island', group: 'Junction shape', keys: ['Delete', 'Backspace'], scope: 'tool:junctionShape', shadows: ['edit.delete', 'select.delete', 'select.deleteEndpoint'] },
+
   // Stamps and paint
   { id: 'template.rotate', label: 'Rotate stamp', group: 'Draw', keys: ['[', ']'], scope: 'tool:template' },
   { id: 'template.height', label: 'Stamp height', group: 'Draw', keys: ['PageUp', 'PageDown'], scope: 'tool:template' },
-  { id: 'paint.rotate', label: 'Rotate stamp', group: 'Draw', keys: ['[', ']'], scope: 'tool:paint' },
-  { id: 'paint.finish', label: 'Finish line', group: 'Draw', keys: ['Enter'], scope: 'tool:paint' },
   { id: 'bulldoze.whole', label: 'Hold: whole road', group: 'Draw', keys: ['Shift'], scope: 'tool:bulldoze', desc: 'Shift+click removes the whole connected road or track', noPalette: true },
 
   // The open tray
@@ -532,6 +563,13 @@ export const DEFAULT_BINDINGS: KeyBinding[] = [
   { id: 'view.lanes', label: 'Lanes', group: 'View', keys: ['Alt+3'], scope: 'global', run: (a) => a.toggleOverlay('lanes') },
   { id: 'view.types', label: 'Road types', group: 'View', keys: ['Alt+4'], scope: 'global', run: (a) => a.toggleOverlay('roadType') },
   { id: 'view.shadows', label: 'Shadows', group: 'View', keys: ['Alt+S'], scope: 'global', run: (a) => a.toggleShadows() },
+  // Road detail: palette only, no keys.
+  { id: 'view.graphics', label: 'Graphics settings', group: 'View', keys: [], scope: 'global', desc: 'Road detail and other graphics options', run: (a) => a.openGraphics?.() },
+  { id: 'view.roadDetail.auto', label: 'Road detail: Auto', group: 'View', keys: [], scope: 'global', desc: 'Road surface detail follows the graphics quality', run: (a) => a.setRoadDetail?.('auto') },
+  { id: 'view.roadDetail.low', label: 'Road detail: Low', group: 'View', keys: [], scope: 'global', desc: 'Flat road surfaces with one small texture, for weak GPUs', run: (a) => a.setRoadDetail?.('low') },
+  { id: 'view.roadDetail.medium', label: 'Road detail: Medium', group: 'View', keys: [], scope: 'global', desc: 'Textured asphalt and concrete with wheel paths and joints', run: (a) => a.setRoadDetail?.('medium') },
+  { id: 'view.roadDetail.high', label: 'Road detail: High', group: 'View', keys: [], scope: 'global', desc: 'Full road detail at 2048: cracks, patches, oil, tyre marks', run: (a) => a.setRoadDetail?.('high') },
+  { id: 'view.roadDetail.ultra', label: 'Road detail: Ultra', group: 'View', keys: [], scope: 'global', desc: 'Full road detail with 4096 textures', run: (a) => a.setRoadDetail?.('ultra') },
 
   // Camera, handled by the camera
   { id: 'camera.pan', label: 'Pan', group: 'Camera', keys: ['W', 'A', 'S', 'D'], scope: 'camera', desc: 'Or two-finger scroll on a trackpad', noPalette: true },
@@ -549,5 +587,6 @@ export const GESTURES: [string, string][] = [
   ['Wheel or pinch', 'Zoom'],
   ['Two-finger scroll', 'Pan'],
   ['Right drag or Option-drag', 'Orbit'],
+  ['Middle-click or Option+click', "Copy what's under the cursor"],
   ['Shift+wheel', 'Rotate a stamp'],
 ];

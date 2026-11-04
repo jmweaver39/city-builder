@@ -173,7 +173,7 @@ function rampJunction(net: RoadNetwork, nodeId: Id): boolean {
   const g = net.nodeGeom(nodeId);
   if (!g || g.kind !== 'junction') return false;
   const cats = g.arms.map((a) => ({ category: net.roadTypeOf(a.segmentId).category }));
-  if (isControlledAccess(cats)) return true;
+  if (isControlledAccess(cats, net.getNode(nodeId)?.control.highwayAccess)) return true;
   return cats.every((c) => c.category === 'highway' || c.category === 'ramp');
 }
 

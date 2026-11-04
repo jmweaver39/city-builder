@@ -23,13 +23,17 @@ import { PostPipeline } from './post';
 import { GpuTimer, type FrameProfiler, type GpuPhase } from './profile';
 import { QUALITY, QUALITY_ORDER, QualityGovernor, guessQuality, type QualityName } from './quality';
 import { RoadLayer } from './RoadLayer';
+import { loadRoadDetailPref, saveRoadDetailPref, type RoadDetailName, type RoadDetailPref } from './roadDetail';
+import type { RoadSurfaceStats } from './roadSurface';
 import { SceneRig } from './scene';
 import { Terrain } from './terrain';
 import { makeGlowTexture } from './textures';
 import { TreeLayer } from './trees';
 import { VehicleLayer } from './vehicles';
 import { WallLayer } from './walls';
+import { RoadUpgradeLayer } from './roadUpgrades';
 import { TerrainEditLayer } from './terrainEdits';
+import { SwatchRenderer, type SwatchSubject } from './swatch';
 
 const FURNITURE_INTERVAL = 0.25;
 
@@ -67,6 +71,10 @@ export class Renderer implements RendererApi, RendererExtras {
   private gpuTimer: GpuTimer;
   private lastGpuMs: number | null = null;
   private qualityListeners = new Set<(level: QualityName) => void>();
+  /** The player's road detail choice, saved in localStorage. */
+  private roadDetailPref: RoadDetailPref = 'auto';
+  private roadDetailNow: RoadDetailName | null = null;
+  private roadDetailListeners = new Set<(level: RoadDetailName, pref: RoadDetailPref) => void>();
   private failedLayers = new WeakSet<object>();
   /** One query over the whole frame's GPU work, for the governor. */
   private governorPhase = (p: GpuPhase | null) => this.gpuTimer.switchTo(p === 'shadow' ? 'scene' : p === null ? null : undefined);
@@ -119,6 +127,7 @@ export class Renderer implements RendererApi, RendererExtras {
     // and noise are data textures, so they need flagging again.
     this.shared.slotTex.needsUpdate = true;
     this.shared.uNoise.value.needsUpdate = true;
+    this.shared.roadTex.restore();
     for (const fn of this.contextListeners) fn(false);
   };
 
@@ -157,7 +166,9 @@ export class Renderer implements RendererApi, RendererExtras {
     this.canvas.addEventListener('webglcontextrestored', this.onRestored);
 
     const aniso = Math.min(8, gl.capabilities.getMaxAnisotropy());
-    this.shared = new Shared(aniso);
+    this.shared = new Shared(aniso, gl.capabilities.getMaxAnisotropy());
+    this.shared.roadTex.onUpdate = () => this.rig?.invalidateShadows();
+    this.roadDetailPref = loadRoadDetailPref(roadDetailStorage());
     this.glow = makeGlowTexture();
     const w = container.clientWidth || 800;
     const h = container.clientHeight || 600;
@@ -199,6 +210,7 @@ export class Renderer implements RendererApi, RendererExtras {
     this.context.addLayer(this.grid);
     // Retaining walls, embankments, sound barriers and quays (walls.ts).
     WallLayer.install(this.context);
+    RoadUpgradeLayer.install(this.context);
     // Landscaping: edit texture, edited tiles, flooded ground; trees follow the land.
     TerrainEditLayer.install(this.context, this.terrain, (b) => (b ? this.trees.markRegion(b.minX, b.minZ, b.maxX, b.maxZ) : this.trees.markAll()));
     this.roads.onSlotsChanged = () => this.overlay.refresh();
@@ -308,6 +320,7 @@ export class Renderer implements RendererApi, RendererExtras {
     const prof = this.profiler;
     prof?.lap('r.setup');
     this.vehicles.update(this.sim, camera, dist);
+    this.shared.roadTex.update();
     prof?.lap('r.vehicles');
     for (const layer of this.context.layers) {
       // One failing layer must not stop the frame loop and freeze the game; its error is
@@ -328,6 +341,7 @@ export class Renderer implements RendererApi, RendererExtras {
     this.trees.setShadowReach(this.cam.target.x, this.cam.target.z, this.rig.shadowReach);
     if (this.trees.update(dt, camera.position.x, camera.position.y, camera.position.z)) this.rig.invalidateShadows();
     if (this.endpoints.update(camera.position)) this.rig.invalidateShadows();
+    if (this.roads.updateDetail(camera.position)) this.rig.invalidateShadows();
     prof?.lap('r.trees');
     this.terrain.update(this.cam.target.x, this.cam.target.z, camera.position.y - this.cam.target.y);
     this.laneDebug.refresh();
@@ -350,6 +364,7 @@ export class Renderer implements RendererApi, RendererExtras {
     if (next) {
       const up = QUALITY_ORDER.indexOf(next) > QUALITY_ORDER.indexOf(this.context.quality.name);
       console.info(up ? `Cloverleaf: the GPU has headroom, raising quality to ${next}.` : `Cloverleaf: frame time is long, dropping quality to ${next}.`);
+      this.governor.stepRoadDetail(this.roadDetailPref, this.context.quality.name, !up);
       this.applyQuality(next);
       this.qualityListeners.forEach((fn) => fn(next));
     }
@@ -385,17 +400,52 @@ export class Renderer implements RendererApi, RendererExtras {
     this.trees.setQuality(q);
     // Rooftop plant and other small building parts are drawn this far out.
     this.endpoints.detailRange = { low: 350, medium: 650, high: 1000, ultra: 1500 }[q.name];
+    // Pier bearings and railing posts: off at Low, then out to a quality-set distance.
+    this.roads.detailRange = q.detail ? { low: 0, medium: 450, high: 800, ultra: 1300 }[q.name] : 0;
     this.grass.setQuality(q);
     this.terrain.setPatch(q.groundPatch, q.groundStep);
     this.vehicles?.setQuality(q);
     for (const layer of this.context.layers) layer.setQuality?.(q, this.context);
     this.governor.reset();
     this.lastGpuMs = null;
+    this.applyRoadDetail();
+  }
+
+  /** Bind road textures and the surface shader level for the current choice and quality. */
+  private applyRoadDetail(): void {
+    const level = this.governor.roadDetail(this.roadDetailPref, this.context.quality.name);
+    if (level === this.roadDetailNow) return;
+    this.roadDetailNow = level;
+    this.shared.roadTex.setLevel(level);
+    this.roads.setRoadDetail(level);
+    this.rig.invalidateShadows();
+    this.roadDetailListeners.forEach((fn) => fn(level, this.roadDetailPref));
+  }
+
+  /** Pick road detail, or 'auto' to follow the graphics quality. Applies at once and is remembered. */
+  setRoadDetail(pref: RoadDetailPref): void {
+    this.roadDetailPref = pref;
+    this.governor.roadDetailCap = null;
+    saveRoadDetailPref(roadDetailStorage(), pref);
+    this.applyRoadDetail();
+    this.roadDetailListeners.forEach((fn) => fn(this.roadDetailNow ?? 'low', pref));
+  }
+
+  /** The choice, the level drawn now, and the road textures' state. */
+  getRoadDetail(): { pref: RoadDetailPref; level: RoadDetailName; textures: RoadSurfaceStats } {
+    return { pref: this.roadDetailPref, level: this.roadDetailNow ?? 'low', textures: this.shared.roadTex.stats() };
+  }
+
+  /** Told when the road detail drawn or chosen changes. Returns an unsubscribe. */
+  onRoadDetailChange(fn: (level: RoadDetailName, pref: RoadDetailPref) => void): () => void {
+    this.roadDetailListeners.add(fn);
+    return () => this.roadDetailListeners.delete(fn);
   }
 
   /** Pick a level. This turns off the automatic step-down. */
   setQuality(level: QualityName): void {
     this.governor.enabled = false;
+    this.governor.roadDetailCap = null;
     this.applyQuality(level);
   }
 
@@ -418,6 +468,7 @@ export class Renderer implements RendererApi, RendererExtras {
   }
 
   dispose(): void {
+    this.swatches?.dispose();
     if (this.disposed) return;
     this.disposed = true;
     this.resizeObserver?.disconnect();
@@ -463,6 +514,14 @@ export class Renderer implements RendererApi, RendererExtras {
 
   getUnderground(): boolean {
     return this.underground;
+  }
+
+  private swatches: SwatchRenderer | null = null;
+
+  /** A marking preview drawn by this renderer (swatch.ts), as an image URL. */
+  paintSwatch(subject: SwatchSubject, w: number, h: number): string | null {
+    if (!this.swatches) this.swatches = new SwatchRenderer(this.gl, this.shared, () => ({ sun: this.rig.sun, hemi: this.rig.hemi }));
+    return this.swatches.render(subject, w, h);
   }
 
   pickVehicle(clientX: number, clientY: number): number | null {
@@ -592,6 +651,10 @@ export class Renderer implements RendererApi, RendererExtras {
     return this.cam.onRightClick(fn);
   }
 
+  onMiddleClick(fn: (clientX: number, clientY: number, event: PointerEvent) => void): () => void {
+    return this.cam.onMiddleClick(fn);
+  }
+
   /** Told when the WebGL context is lost (true) and restored (false). */
   onContextChange(fn: (lost: boolean) => void): () => void {
     this.contextListeners.add(fn);
@@ -605,5 +668,14 @@ export class Renderer implements RendererApi, RendererExtras {
   /** Instanced tree count, for debugging. */
   treeCount(): number {
     return this.trees.total;
+  }
+}
+
+/** localStorage, or null where it is blocked. */
+function roadDetailStorage(): Storage | null {
+  try {
+    return typeof window !== 'undefined' ? window.localStorage : null;
+  } catch {
+    return null;
   }
 }

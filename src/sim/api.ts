@@ -169,4 +169,15 @@ export interface SimApi {
    * 0 clears. Survives graph rebuilds, tracked by lane key. Used by src/peds.
    */
   setStopBack?(lane: number, metres: number): void;
+  /** True while no new vehicles are sent out. */
+  readonly spawnPaused?: boolean;
+  setSpawnPaused?(paused: boolean): void;
+  /** Remove every vehicle, or only stuck ones. Returns how many went. */
+  clearTraffic?(opts?: { stuckOnly?: boolean; stuckSec?: number }): number;
+  /** Movement keys (`${from}>${to}`) at a signalled junction and whether each shows green. */
+  signalMovements?(nodeId: Id): Record<string, boolean> | null;
+  isManualSignal?(nodeId: Id): boolean;
+  /** Hand control of a junction's lights; false gives them back to the plan. */
+  setManualSignal?(nodeId: Id, on: boolean): boolean;
+  setManualMovement?(nodeId: Id, key: string, green: boolean): void;
 }

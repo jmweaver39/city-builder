@@ -23,6 +23,7 @@ export * from './spatial';
 export * from './invariants';
 export * from './RoadNetwork';
 export * from './ramps';
+export * from './highwayCrossing';
 export * from './overlap';
 export * from './wallTypes';
 export * from './walls';

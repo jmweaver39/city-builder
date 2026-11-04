@@ -20,12 +20,17 @@ import { groundPixelSize, snapGridAt, type GridSettings } from './grid';
 import { parallelDistanceInfo, type GuideContext } from './guides';
 import { formatSpacing } from '../render/gridLevels';
 import { continuationAt, NODE_CATCH, referenceDirection, snapRoadPoint, type SnapHit } from './snap';
-import { attachFor, flipAttach, laneChoiceAt, reverseCubic, travelChevrons, type LaneChoice } from './laneSnap';
+import { attachFor, flipAttach, laneChoiceAt, reverseCubic, streetEndFor, travelChevrons, type LaneChoice, type StreetEnd } from './laneSnap';
+import { applyRampLaneChange } from './edgeMergeOps';
+import { alignChoiceAt, setJointAlign, type AlignChoice } from './endAlign';
+import { edgeMergePreview } from './edgeMergePreview';
 import { drawChain } from '../core/curveChain';
 import type { FitResult } from '../core/curveFit';
-import { chainLines, chainReadout, checkChain, fitDraft, reverseChain } from './curveDraft';
+import { chainLines, chainReadout, checkChain, fitDraft, jointsOffRoads, reverseChain } from './curveDraft';
 import { Tool } from './Tool';
+import { UpgradeCardTool } from './UpgradeCardTool';
 import { MOD_KEY } from './platform';
+import { drawStyleFor, pasteRoadInStroke } from './clipboard';
 import { applyBarriers, applyStructure, barriersFromSettings, drawOverrides, structureFromSettings } from './wallOps';
 import { isEarthwork, mirrorStructure, structureFootprint } from '../core/walls';
 import { BARRIER_KINDS, STRUCTURE_MODES } from '../core/wallTypes';
@@ -41,6 +46,8 @@ interface StartPoint {
   ref: Vec3 | null;
   /** The highway lane a ramp leaves or joins here. */
   lane?: LaneChoice | null;
+  /** How the road lines up with a road of another width whose end it starts from (endAlign.ts). */
+  align?: AlignChoice | null;
 }
 
 export interface DraftState {
@@ -60,8 +67,12 @@ export interface DraftState {
   endAttach?: RampAttach;
   /** Drawn against the traffic it joins, so it will be built the other way round. */
   flipped?: boolean;
+  /** How each end meets a street's lanes, for the preview (as drawn, before any flip). */
+  streets?: { start?: StreetEnd; end?: StreetEnd };
   /** Outer edge of an embankment or cut on each side, for the preview. */
   footprint?: { left: Vec3[]; right: Vec3[] };
+  /** Line-ups picked at road ends of another width (endAlign.ts). */
+  aligns?: AlignChoice[];
 }
 
 export function formatElevation(y: number): string {
@@ -75,9 +86,13 @@ export class RoadTool extends Tool {
   private control: Vec3 | null = null;
   private hit: SnapHit | null = null;
   private draft: DraftState | null = null;
+  /** Street lanes picked with Shift-click for the next end, by lateral offset on that host. */
+  private lanePicks: { host: Id; laterals: number[] } | null = null;
   // Upgrade drag.
   private painting = false;
   private painted = new Set<Id>();
+  /** Upgrade with a card picked: lights, barriers, trees and so on. */
+  private readonly cards = new UpgradeCardTool(this.ctx);
 
   /** Stage of the placement, for the UI. */
   get stage(): 'start' | 'control' | 'end' {
@@ -102,12 +117,17 @@ export class RoadTool extends Tool {
     this.control = null;
     this.hit = null;
     this.draft = null;
+    this.lanePicks = null;
     this.painting = false;
     this.painted.clear();
+    this.cards.cancel();
   }
 
   settingsChanged(): void {
     const mode = this.ctx.settings.drawMode;
+    // Paste style sweeps the copied road's type; picking another road card means a road-type upgrade.
+    const s = this.ctx.settings;
+    if (s.walls.upgrade === 'style' && s.roadStyle && s.roadType !== s.roadStyle.roadType) s.walls.upgrade = 'road';
     if (mode === 'upgrade') {
       this.start = null;
       this.control = null;
@@ -126,6 +146,10 @@ export class RoadTool extends Tool {
 
   pointerMove(e: ToolPointer): void {
     this.pointer = e;
+    if (this.ctx.settings.drawMode === 'upgrade' && this.cards.active) {
+      this.cards.move(e);
+      return;
+    }
     if (this.ctx.settings.drawMode === 'upgrade' && this.painting) this.paintAt(e);
     this.refresh();
   }
@@ -133,6 +157,10 @@ export class RoadTool extends Tool {
   pointerDown(e: ToolPointer): void {
     if (e.button !== 0) return;
     this.pointer = e;
+    if (this.ctx.settings.drawMode === 'upgrade' && this.cards.active) {
+      this.cards.down(e);
+      return;
+    }
     if (this.ctx.settings.drawMode === 'upgrade') {
       this.painting = true;
       this.painted.clear();
@@ -140,13 +168,19 @@ export class RoadTool extends Tool {
       this.sweepDir = null;
       this.sweepPending = null;
       const what = this.ctx.settings.walls.upgrade;
-      this.ctx.history.begin(what === 'barriers' ? 'Add sound barriers' : what === 'structure' ? 'Change road structure' : 'Upgrade road');
+      this.ctx.history.begin(what === 'barriers' ? 'Add sound barriers' : what === 'structure' ? 'Change road structure' : what === 'style' ? 'Paste road style' : 'Upgrade road');
       this.paintAt(e);
       this.refresh();
       return;
     }
     this.refresh();
     if (!this.hit) return;
+    // Shift-click on a street lane picks it (or drops it) for the end being placed.
+    if (e.shift && this.toggleLanePick(this.hit)) {
+      this.refresh();
+      this.ctx.changed();
+      return;
+    }
     if (!this.start) {
       this.placeStart(this.hit);
     } else if (this.stage === 'control') {
@@ -159,6 +193,7 @@ export class RoadTool extends Tool {
   }
 
   pointerUp(e: ToolPointer): void {
+    this.cards.up();
     if (this.painting) {
       this.painting = false;
       // A click with no sweep paints what it pressed, the road's own way round.
@@ -172,7 +207,8 @@ export class RoadTool extends Tool {
 
   back(): boolean {
     let used = true;
-    if (this.control) this.control = null;
+    if (this.lanePicks) this.lanePicks = null;
+    else if (this.control) this.control = null;
     else if (this.start) this.start = null;
     else used = false;
     this.refresh();
@@ -194,6 +230,12 @@ export class RoadTool extends Tool {
       this.refresh();
       return false;
     }
+    if (e.key === 'Alt') {
+      // Alt swaps an edge merge for a full junction while held (core/edgeMerge.ts).
+      if (this.pointer) this.pointer = { ...this.pointer, alt: true };
+      this.refresh();
+      return false;
+    }
     if (e.key === 'Shift') {
       // Shift locks the current guide direction while held.
       if (this.pointer) this.pointer = { ...this.pointer, shift: true };
@@ -210,6 +252,10 @@ export class RoadTool extends Tool {
     }
     if (e.key === 'Shift') {
       if (this.pointer) this.pointer = { ...this.pointer, shift: false };
+      this.refresh();
+    }
+    if (e.key === 'Alt') {
+      if (this.pointer) this.pointer = { ...this.pointer, alt: false };
       this.refresh();
     }
     return false;
@@ -272,30 +318,82 @@ export class RoadTool extends Tool {
     const { net } = this.ctx;
     const cont = hit.anchor.kind === 'node' ? continuationAt(net, hit.anchor.id) : null;
     const lane = this.laneChoiceFor(hit);
+    const align = lane ? null : this.alignChoiceFor(hit);
     return {
+      align,
       anchor: hit.anchor,
-      // A ramp leaves from the outer edge of the chosen lane's carriageway.
-      pos: lane ? { ...lane.chosen.edge } : { ...hit.pos },
+      // A ramp leaves from the outer edge of the chosen lane's carriageway. On a street
+      // that depends on which way the road goes, so it is worked out with the draft.
+      pos: lane && !lane.street ? { ...lane.chosen.edge } : align ? { ...align.endPos } : { ...hit.pos },
       dir: cont?.dir ?? null,
       slope: cont?.slope ?? null,
-      ref: lane ? lane.chosen.travel : (cont?.dir ?? referenceDirection(net, hit.anchor, null)),
+      ref: lane && !lane.street ? lane.chosen.travel : (cont?.dir ?? referenceDirection(net, hit.anchor, null)),
       lane,
     };
   }
 
-  /** Lane snap points when a one-way road meets a highway here, unless Ctrl is held. */
+  /**
+   * Lane snap points, unless Ctrl is held: when a one-way road meets a highway, when
+   * a ramp meets a street or avenue, and for any other road on a street while Shift is
+   * held or once lanes have been picked there with Shift-click.
+   */
   private laneChoiceFor(hit: SnapHit): LaneChoice | null {
     const { net, settings, view } = this.ctx;
     const def = net.roadType(settings.roadType);
-    if (!def || !isOneWay(def) || def.category === 'rail' || this.pointer?.ctrl) return null;
+    if (!def || def.category === 'rail' || this.pointer?.ctrl) return null;
     if (hit.anchor.kind !== 'segment' && hit.anchor.kind !== 'node') return null;
     const e = this.pointer;
     const cursor = (e && view.pickPlane(e.x, e.y, hit.pos.y)) ?? hit.pos;
-    return laneChoiceAt(net, hit.anchor, cursor);
+    const choice = laneChoiceAt(net, hit.anchor, cursor);
+    if (!choice) return null;
+    if (!choice.street) return isOneWay(def) ? choice : null;
+    const picks = this.lanePicks?.host === choice.host ? this.lanePicks.laterals : [];
+    if (def.category !== 'ramp' && !e?.shift && !picks.length) return null;
+    if (picks.length) {
+      choice.picked = choice.lanes.filter((s) => picks.some((x) => Math.abs(x - s.lateral) < 1e-3));
+      // The hovered lane joins the picked ones, except while Shift is held to drop one.
+      if (!e?.shift && !choice.picked.includes(choice.chosen)) choice.picked.push(choice.chosen);
+    }
+    return choice;
+  }
+
+  /** Line-up points at the end of a road of another width, unless Ctrl is held (endAlign.ts). */
+  private alignChoiceFor(hit: SnapHit): AlignChoice | null {
+    const { net, settings, view } = this.ctx;
+    if (hit.anchor.kind !== 'node' || this.pointer?.ctrl) return null;
+    const e = this.pointer;
+    const cursor = (e && view.pickPlane(e.x, e.y, hit.pos.y)) ?? null;
+    return alignChoiceAt(net, hit.anchor.id, settings.roadType, cursor);
+  }
+
+  /** Points across a road end for each line-up, the chosen one ringed. */
+  private alignMarks(a: AlignChoice): ToolMark[] {
+    const marks: ToolMark[] = [];
+    for (const o of a.options) {
+      const on = o === a.chosen;
+      marks.push({ kind: 'point', pos: o.pos, color: on ? COLORS.ok : COLORS.guide, radius: on ? 1.1 : 0.8 });
+      marks.push({ kind: 'ring', pos: o.pos, color: on ? COLORS.ok : COLORS.snap, radius: on ? 1.8 : 1.3 });
+    }
+    return marks;
+  }
+
+  /** Shift-click: add the hovered street lane to the picked ones, or take it out. */
+  private toggleLanePick(hit: SnapHit): boolean {
+    const choice = this.laneChoiceFor(hit);
+    if (!choice?.street) return false;
+    const lateral = choice.chosen.lateral;
+    if (this.lanePicks?.host !== choice.host) this.lanePicks = { host: choice.host, laterals: [] };
+    const list = this.lanePicks.laterals;
+    const at = list.findIndex((x) => Math.abs(x - lateral) < 1e-3);
+    if (at >= 0) list.splice(at, 1);
+    else list.push(lateral);
+    if (!list.length) this.lanePicks = null;
+    return true;
   }
 
   private placeStart(hit: SnapHit): void {
     this.start = this.startFrom(hit);
+    this.lanePicks = null;
     this.control = null;
     // Picking up an elevated road carries on at its height until told otherwise.
     const above = hasTerrainEdits() ? hit.pos.y - surfaceLevel(hit.pos.x, hit.pos.z) : hit.pos.y;
@@ -332,24 +430,65 @@ export class RoadTool extends Tool {
       }
     }
     let startDir = ctrl ? null : start.dir;
+    let startPos = start.pos;
     let endPos = hit.pos;
     // A ramp on a highway lane leaves and joins aligned with its traffic. Heading
     // back against it draws the other kind of ramp, which is flipped below.
     const startLane = ctrl ? null : (start.lane ?? null);
     const endLane = this.laneChoiceFor(hit);
-    if (startLane) {
+    // On a street, a one-way road along the kerb merges there; anything else is a terminal.
+    const drawnDef = net.roadType(settings.roadType);
+    const oneWay = !!drawnDef && isOneWay(drawnDef);
+    const endStreet = endLane?.street ? streetEndFor(endLane, start.pos, oneWay) : undefined;
+    const startStreet = startLane?.street ? streetEndFor(startLane, endStreet?.pos ?? hit.pos, oneWay) : undefined;
+    const against = (d: Vec3): Vec3 => ({ x: -d.x, y: 0, z: -d.z });
+    let startAttach: RampAttach | undefined;
+    let endAttach: RampAttach | undefined;
+    if (startStreet) {
+      startPos = startStreet.pos;
+      startAttach = startStreet.attach;
+      if (startStreet.travel) {
+        const ahead = dotXZ(sub(endStreet?.pos ?? hit.pos, startPos), startStreet.travel) >= 0;
+        startDir = ahead ? startStreet.travel : against(startStreet.travel);
+        if (!ahead) startAttach = flipAttach(startAttach);
+      }
+    } else if (startLane) {
       const ahead = dotXZ(sub(hit.pos, start.pos), startLane.chosen.travel) >= 0;
-      startDir = ahead ? startLane.chosen.travel : { x: -startLane.chosen.travel.x, y: 0, z: -startLane.chosen.travel.z };
+      startDir = ahead ? startLane.chosen.travel : against(startLane.chosen.travel);
+      startAttach = attachFor(startLane, startDir);
+      // Blend into the edge lane rather than making a full junction (core/edgeMerge.ts).
+      if (this.edgeMergeWanted(startAttach)) {
+        startAttach = { ...startAttach, edge: {} };
+        startPos = net.anchorAttachPoint(start.anchor, startAttach, startDir, drawnDef?.lanes) ?? startPos;
+      }
     }
-    if (endLane) {
+    if (endStreet) {
+      endPos = endStreet.pos;
+      endAttach = endStreet.attach;
+      if (endStreet.travel) {
+        const along = dotXZ(sub(endPos, startPos), endStreet.travel) >= 0;
+        endDir = along ? endStreet.travel : against(endStreet.travel);
+        if (!along) endAttach = flipAttach(endAttach);
+      }
+    } else if (endLane) {
       endPos = endLane.chosen.edge;
       const travel = endLane.chosen.travel;
-      endDir = dotXZ(sub(endPos, start.pos), travel) >= 0 ? travel : { x: -travel.x, y: 0, z: -travel.z };
+      endDir = dotXZ(sub(endPos, startPos), travel) >= 0 ? travel : against(travel);
+      endAttach = attachFor(endLane, endDir);
+      if (this.edgeMergeWanted(endAttach)) {
+        endAttach = { ...endAttach, edge: {} };
+        endPos = net.anchorAttachPoint(hit.anchor, endAttach, endDir, drawnDef?.lanes) ?? endPos;
+      }
     }
+    // A road carrying on from the end of one of another width lines up as picked (endAlign.ts).
+    const endAlign = endLane ? null : this.alignChoiceFor(hit);
+    if (endAlign) endPos = endAlign.endPos;
+    const aligns = [start.align, endAlign].filter((x): x is AlignChoice => !!x);
+    const streets = startStreet || endStreet ? { start: startStreet, end: endStreet } : undefined;
     const cubic = buildCubic(
       mode,
       {
-        start: start.pos,
+        start: startPos,
         end: endPos,
         startDir: mode === 'curved' ? null : startDir,
         endDir,
@@ -358,8 +497,6 @@ export class RoadTool extends Tool {
       },
       this.control,
     );
-    const startAttach = startLane ? attachFor(startLane, startDir ?? startLane.chosen.travel) : undefined;
-    const endAttach = endLane && endDir ? attachFor(endLane, endDir) : undefined;
     // Curved and Freeform fit tangents, spirals and an arc, as a chain of pieces.
     // A parallel guide gives the exact offset shape (guides.ts).
     const follow = !ctrl && mode !== 'curved' && !startLane && !endLane ? (hit.guides?.cubic ?? null) : null;
@@ -369,17 +506,18 @@ export class RoadTool extends Tool {
         : fitDraft(
             net,
             {
-              start: start.pos,
+              start: startPos,
               end: endPos,
               startDir: mode === 'curved' ? null : startDir,
-              endDir: usableEndDir(start.pos, endPos, endDir) ? endDir : null,
+              endDir: usableEndDir(startPos, endPos, endDir) ? endDir : null,
               startSlope: ctrl ? null : start.slope,
               endSlope,
               control: mode === 'curved' ? this.control : null,
             },
             settings.roadType,
           );
-    const plan = follow ? [follow] : fit && fit.cubics.length ? fit.cubics : [cubic];
+    // A joint on another road would end the road there: merge it away so the stroke crosses (curveDraft.ts).
+    const plan = follow ? [follow] : fit && fit.cubics.length ? jointsOffRoads(net, fit.cubics, settings.roadType) : [cubic];
     // On landscaped land the road follows the ground within its grade, bridging what it cannot follow.
     const category = net.roadType(settings.roadType)?.category;
     const chain = followTerrain(plan, { elevation: settings.elevation, grade: category === 'highway' || category === 'rail' ? 0.06 : 0.09 });
@@ -387,24 +525,33 @@ export class RoadTool extends Tool {
       const c = cs[0];
       if (cs.length > 1 || fit) {
         const check = checkChain(net, cs, a, b, settings.roadType, sa, ea, fit);
-        return { cubic: c, cubics: cs, fit, start: a, end: b, ...check, startAttach: sa, endAttach: ea, flipped };
+        return { cubic: c, cubics: cs, fit, start: a, end: b, ...check, startAttach: sa, endAttach: ea, flipped, streets };
       }
       const params = { start: a, end: b, c1: c.p1, c2: c.p2, roadType: settings.roadType, startAttach: sa, endAttach: ea };
       const issues = net.validateDraft(params);
       const ignore = [a, b].flatMap((x) => (x.kind === 'node' ? [x.id] : []));
       const crossings = net.findCrossings(c, ignore, settings.roadType).filter((x) => !this.isEndHit(x, c, a, b));
       const state: Tone = issues.some((i) => i.severity === 'error') ? 'error' : issues.length ? 'warning' : 'ok';
-      return { cubic: c, cubics: cs, start: a, end: b, issues, crossings, state, startAttach: sa, endAttach: ea, flipped };
+      return { cubic: c, cubics: cs, start: a, end: b, issues, crossings, state, startAttach: sa, endAttach: ea, flipped, streets };
     };
-    const drawn = evaluate(chain, start.anchor, hit.anchor, startAttach, endAttach, false);
+    const drawn = { ...evaluate(chain, start.anchor, hit.anchor, startAttach, endAttach, false), aligns };
     const def = net.roadType(settings.roadType);
     if (def && isOneWay(def) && drawn.issues.some((i) => i.code === 'wrongWay')) {
       // Drawn against the traffic it meets: the same road the other way round may work.
       const back = chain.length > 1 ? reverseChain(chain) : [reverseCubic(chain[0])];
       const flipped = evaluate(back, hit.anchor, start.anchor, flipAttach(endAttach), flipAttach(startAttach), true);
-      if (!flipped.issues.some((i) => i.code === 'wrongWay')) return flipped;
+      if (!flipped.issues.some((i) => i.code === 'wrongWay')) return { ...flipped, aligns };
     }
     return drawn;
+  }
+
+  /**
+   * Whether a ramp end on a highway lane blends into the edge lane: the panel's choice,
+   * swapped while Alt is held. Inner lanes picked to feed the ramp need a full junction.
+   */
+  private edgeMergeWanted(attach: RampAttach): boolean {
+    const on = this.ctx.settings.rampJoin.edge !== !!this.pointer?.alt;
+    return on && Math.round(attach.lane) === 0 && !attach.lanes;
   }
 
   /** Embankments and cuts take ground beside the road: check it and outline it. */
@@ -443,19 +590,25 @@ export class RoadTool extends Tool {
       return;
     }
     this.ctx.history.hint('Draw road');
+    this.lanePicks = null;
     // A fitted curve is several pieces joined by plain joints, drawn as one step.
     // One step: the road, and a sloped cut where it runs down into landscaped ground (terrainFollow.ts).
     const result = net.batch(() => {
       const r = drawChain(net, {
         start: draft.start,
         end: draft.end,
-        cubics: draft.cubics,
+        cubics: this.unshifted(draft),
         roadType: settings.roadType,
         startAttach: draft.startAttach,
         endAttach: draft.endAttach,
         overrides: this.drawnOverrides(draft),
       });
       autoCut(net, r.segments, settings.elevation);
+      // Lane adds and drops, and line-ups at road ends, are part of the same undo step.
+      this.applyRampLaneChange(draft, r.nodes);
+      for (const a of draft.aligns ?? []) {
+        if (net.getNode(a.node)?.segments.length === 2) setJointAlign(net, a.node, a.chosen.align, a.existing);
+      }
       return r;
     });
     if (draft.flipped) {
@@ -483,10 +636,63 @@ export class RoadTool extends Tool {
     this.control = null;
   }
 
-  /** The structure the road panel asks for, sides swapped when the road is built the other way. */
+  /**
+   * The draft drawn to its nodes: an end lined up with a wider road is moved back onto
+   * the node, handle with it, since the line-up moves both again once it is set.
+   */
+  private unshifted(draft: DraftState): Cubic[] {
+    const cubics = draft.cubics.map((c) => ({ ...c }));
+    const { net } = this.ctx;
+    for (const a of draft.aligns ?? []) {
+      const node = net.getNode(a.node);
+      if (!node || Math.abs(a.newShift) < 1e-6) continue;
+      const d = sub(node.pos, a.endPos);
+      const first = cubics[0];
+      const last = cubics[cubics.length - 1];
+      if (distXZ(first.p0, a.endPos) < 0.05) {
+        first.p0 = { ...node.pos };
+        first.p1 = { x: first.p1.x + d.x, y: first.p1.y, z: first.p1.z + d.z };
+      } else if (distXZ(last.p3, a.endPos) < 0.05) {
+        last.p3 = { ...node.pos };
+        last.p2 = { x: last.p2.x + d.x, y: last.p2.y, z: last.p2.z + d.z };
+      }
+    }
+    return cubics;
+  }
+
+  /** A lane add or exit-only drop at an edge merge just built, as the panel asks (edgeMergeOps.ts). */
+  private applyRampLaneChange(draft: DraftState, nodes: readonly Id[]): void {
+    const { net, settings, toast } = this.ctx;
+    const join = settings.rampJoin;
+    for (const [attach, node] of [
+      [draft.startAttach, nodes[0]],
+      [draft.endAttach, nodes[nodes.length - 1]],
+    ] as const) {
+      if (!attach?.edge || node === undefined) continue;
+      const e = net.nodeGeom(node)?.edge;
+      if (!e) continue;
+      const mode = e.merge ? (join.onRamp === 'taper' ? null : join.onRamp) : join.offRamp === 'drop' ? 'drop' : null;
+      if (!mode) continue;
+      const problem = applyRampLaneChange(net, node, mode, join.addLength);
+      if (problem) toast(`${problem} Built as a taper.`, 'warning');
+    }
+  }
+
+  /**
+   * The structure the road panel asks for, sides swapped when the road is built the
+   * other way, on top of the settings of a road copied in this type (clipboard.ts).
+   */
   private drawnOverrides(draft: DraftState) {
-    const o = drawOverrides(this.ctx.settings.walls);
-    if (o?.structure && draft.flipped) o.structure = mirrorStructure(o.structure);
+    const { settings } = this.ctx;
+    const copied = drawStyleFor(settings.roadStyle, settings.roadType);
+    const walls = drawOverrides(settings.walls);
+    if (!copied) {
+      if (walls?.structure && draft.flipped) walls.structure = mirrorStructure(walls.structure);
+      return walls;
+    }
+    // The copy's left and right are along its own a to b, as the new road's are once built, so they stay.
+    const o = { ...copied, ...(walls ?? {}) };
+    if (walls?.structure && draft.flipped) o.structure = mirrorStructure(walls.structure);
     return o;
   }
 
@@ -539,6 +745,10 @@ export class RoadTool extends Tool {
 
   private paintAt(e: ToolPointer): void {
     const { net, settings } = this.ctx;
+    if (settings.walls.upgrade === 'style') {
+      this.pasteStyleAt(e);
+      return;
+    }
     if (settings.walls.upgrade !== 'road') {
       this.paintWalls(e);
       return;
@@ -551,6 +761,20 @@ export class RoadTool extends Tool {
     const id = upgradeSegment(net, hit.segmentId, settings.roadType, false);
     this.painted.add(hit.segmentId);
     this.painted.add(id);
+  }
+
+  /** Upgrade's Paste style: the copied road's type and settings onto each road swept. */
+  private pasteStyleAt(e: ToolPointer): void {
+    const clip = this.ctx.settings.roadStyle;
+    const hit = pickRoad(this.ctx, e);
+    if (!hit || this.painted.has(hit.segmentId)) return;
+    this.painted.add(hit.segmentId);
+    if (!clip) {
+      this.ctx.toast('Middle-click a road first to copy its style.', 'warning');
+      return;
+    }
+    const problem = pasteRoadInStroke(this.ctx.net, clip, hit.segmentId);
+    if (problem) this.ctx.toast(problem, 'warning');
   }
 
   // -------------------------------------------------------------------------
@@ -685,20 +909,29 @@ export class RoadTool extends Tool {
       return;
     }
     const lane = this.laneChoiceFor(hit);
+    const align = lane ? null : this.alignChoiceFor(hit);
     const marks = lane ? this.laneMarks(lane) : this.snapMarks(hit);
+    if (align) marks.push(...this.alignMarks(align));
     this.ctx.setMarks(marks);
     const e = this.pointer!;
     this.ctx.setHud({
       x: e.x,
       y: e.y,
-      lines: [this.elevationLine(hit), lane ? this.laneLabel(lane) : this.snapLabel(hit)],
-      notes: [lane ? `Click to start a ramp from this lane. ${MOD_KEY} snaps to the centreline` : 'Click to start the road'],
+      lines: [this.elevationLine(hit), lane ? this.laneLabel(lane) : this.snapLabel(hit), ...(align ? [align.chosen.label] : [])],
+      notes: [
+        lane?.street
+          ? `Click to start from this lane. Shift-click picks more lanes. ${MOD_KEY} snaps to the centreline`
+          : lane
+            ? `Click to start a ramp from this lane. ${MOD_KEY} snaps to the centreline`
+            : 'Click to start the road',
+      ],
       tone: 'ok',
     });
   }
 
   /** Snap points on every lane, the outermost ones larger, and the chosen lane's ramp start. */
   private laneMarks(lane: LaneChoice): ToolMark[] {
+    if (lane.street) return this.streetLaneMarks(lane);
     const marks: ToolMark[] = [];
     for (const s of lane.lanes) {
       const outer = s.fromEdge === 0;
@@ -721,7 +954,66 @@ export class RoadTool extends Tool {
     return marks;
   }
 
+  /** Street lanes: a snap point on each, the picked ones ringed, each with its traffic's direction. */
+  private streetLaneMarks(lane: LaneChoice): ToolMark[] {
+    const marks: ToolMark[] = [];
+    for (const s of lane.lanes) marks.push({ kind: 'point', pos: s.centre, color: s.fromEdge === 0 ? COLORS.snap : COLORS.guide, radius: s.fromEdge === 0 ? 1 : 0.7 });
+    const used = lane.picked.length ? lane.picked : [lane.chosen];
+    for (const s of used) {
+      marks.push({ kind: 'ring', pos: s.centre, color: COLORS.ok, radius: 2 });
+      marks.push(...this.arrowMarks(addScaled(s.centre, s.travel, -5), addScaled(s.centre, s.travel, 7), COLORS.ok));
+    }
+    // The lane under the cursor, when Shift-click would take it out or add it.
+    if (!used.includes(lane.chosen)) marks.push({ kind: 'ring', pos: lane.chosen.centre, color: COLORS.guide, radius: 2.4 });
+    return marks;
+  }
+
+  /** A straight arrow from `a` to `b`, lifted a little off the road. */
+  private arrowMarks(a: Vec3, b: Vec3, color: string, via?: Vec3): ToolMark[] {
+    const lift = (p: Vec3) => ({ ...p, y: p.y + 0.4 });
+    const last = via ?? a;
+    const d = normalizeXZ(sub(b, last));
+    const r = { x: -d.z, y: 0, z: d.x };
+    const back = addScaled(b, d, -2.5);
+    return [
+      { kind: 'line', points: (via ? [a, via, b] : [a, b]).map(lift), color, width: 0.45 },
+      { kind: 'line', points: [addScaled(back, r, 1.6), b, addScaled(back, r, -1.6)].map(lift), color, width: 0.45 },
+    ];
+  }
+
+  /** Where a road meets a street: an arrow for each lane it turns into or out of. */
+  private streetEndMarks(end: StreetEnd, arriving: boolean): ToolMark[] {
+    const marks: ToolMark[] = [];
+    for (const { spot } of end.lanes) {
+      marks.push({ kind: 'ring', pos: spot.centre, color: COLORS.ok, radius: 2 });
+      if (arriving) marks.push(...this.arrowMarks(end.pos, addScaled(spot.centre, spot.travel, 8), COLORS.ok, spot.centre));
+      else marks.push(...this.arrowMarks(addScaled(spot.centre, spot.travel, -8), end.pos, COLORS.ok, spot.centre));
+    }
+    return marks;
+  }
+
+  /** "turns right into the near kerb lane" and so on, for the HUD. */
+  private streetEndLine(end: StreetEnd, arriving: boolean): string {
+    const n = end.lanes.length;
+    if (end.side) {
+      return `Slip lane: ${arriving ? 'merges into' : 'leaves from'} ${n === 1 ? 'the kerb lane' : `the ${n} outer lanes`}, free flow`;
+    }
+    const parts = end.lanes.map(({ spot, turn }) => {
+      const side = turn === 'right' ? 'near' : 'far';
+      const k = spot.fromEdge;
+      const which = k === 0 ? 'kerb lane' : k === spot.count - 1 ? 'inside lane' : `lane ${k + 1} from the kerb`;
+      return `${turn} ${arriving ? 'into' : 'from'} ${side} ${which}`;
+    });
+    return `Terminal: ${parts.join(', ')}`;
+  }
+
   private laneLabel(lane: LaneChoice): string {
+    if (lane.street) {
+      const c = lane.chosen;
+      const name = c.fromEdge === 0 ? 'kerb lane' : `lane ${c.fromEdge + 1} from the kerb`;
+      const more = lane.picked.length > 1 ? `, ${lane.picked.length} lanes picked` : '';
+      return `Snap: ${name}${more}`;
+    }
     const c = lane.chosen;
     const name = c.fromEdge === 0 ? 'outside lane' : `lane ${c.fromEdge + 1} in from the edge`;
     const feeds = c.fromEdge === 0 ? 'it feeds the ramp' : `it and the ${c.fromEdge === 1 ? 'lane' : `${c.fromEdge} lanes`} outside it feed the ramp`;
@@ -789,6 +1081,12 @@ export class RoadTool extends Tool {
     }
     const endLane = this.laneChoiceFor(hit);
     if (endLane) marks.push(...this.laneMarks(endLane));
+    // The taper and gore an edge merge will have, along the draft's end on the highway.
+    marks.push(...edgeMergePreview(net, draft, settings.roadType));
+    for (const a of draft.aligns ?? []) if (a.node === (hit.anchor.kind === 'node' ? hit.anchor.id : -1) || a === start.align) marks.push(...this.alignMarks(a));
+    // Which street lanes each end turns into or out of, the way traffic will run.
+    if (draft.streets?.start) marks.push(...this.streetEndMarks(draft.streets.start, !!draft.flipped));
+    if (draft.streets?.end) marks.push(...this.streetEndMarks(draft.streets.end, !draft.flipped));
     const def = net.roadType(settings.roadType);
     if (def && isOneWay(def)) {
       // Travel arrows, the way the road will be built.
@@ -816,9 +1114,28 @@ export class RoadTool extends Tool {
     if (over) lines.push(`Grade separated: ${over}`);
     const notes = draft.issues.map((i) => i.message);
     if (draft.flipped) notes.unshift('Drawn against the traffic: it will be built the other way round.');
-    if (draft.startAttach || draft.endAttach) {
+    if (draft.streets) {
+      // As drawn: a flipped road swaps which end arrives.
+      const { start, end } = draft.streets;
+      if (start) lines.push(this.streetEndLine(start, !!draft.flipped));
+      if (end) lines.push(this.streetEndLine(end, !draft.flipped));
+      notes.push('Shift-click a lane to pick more lanes or drop one');
+    } else if (draft.startAttach || draft.endAttach) {
       const a = draft.startAttach ?? draft.endAttach!;
       lines.push(`Ramp lane: ${a.lane === 0 ? 'outside lane' : `${a.lane + 1} outer lanes`}`);
+      if (a.edge) {
+        const join = settings.rampJoin;
+        const on = !!draft.endAttach?.edge !== !!draft.flipped;
+        const variant = on ? (join.onRamp === 'taper' ? 'taper into the edge lane' : join.onRamp === 'add' ? `added lane for ${join.addLength} m` : 'added lane for good') : join.offRamp === 'drop' ? 'edge lane exit only' : 'taper out of the edge lane';
+        lines.push(`Edge merge: ${variant}`);
+        notes.push('Hold Alt for a full junction across the highway');
+      } else {
+        notes.push(a.lane > 0 ? 'Inner lanes picked: full junction across the highway' : settings.rampJoin.edge ? 'Release Alt to blend into the edge lane' : 'Full junction. Hold Alt to blend into the edge lane');
+      }
+    }
+    for (const a of draft.aligns ?? []) {
+      lines.push(a.chosen.label);
+      if (a.node === (hit.anchor.kind === 'node' ? hit.anchor.id : -1)) notes.push('Click a point across the road end to line up there');
     }
     const oneWayNote = this.oneWayClash(draft);
     if (oneWayNote) notes.push(oneWayNote);
@@ -840,6 +1157,12 @@ export class RoadTool extends Tool {
   private refreshUpgrade(): void {
     const { view, settings, net } = this.ctx;
     const e = this.pointer;
+    if (this.cards.active) {
+      this.hit = null;
+      this.draft = null;
+      this.cards.refresh(e);
+      return;
+    }
     this.hit = null;
     this.draft = null;
     view.setPreview([]);
@@ -857,6 +1180,12 @@ export class RoadTool extends Tool {
     }
     view.setHighlight({ segments: [hit.segmentId], color: COLORS.snap });
     const what = settings.walls.upgrade;
+    if (what === 'style') {
+      const clip = settings.roadStyle;
+      const now = net.roadTypeOf(hit.segmentId).name;
+      this.ctx.setHud({ x: e.x, y: e.y, lines: ['Paste style', clip ? `${now} to ${clip.name}` : 'Nothing copied yet'], notes: [clip ? 'Click or drag over roads' : 'Middle-click or Option+click a road to copy it'], tone: clip ? 'ok' : 'warning' });
+      return;
+    }
     if (what !== 'road') {
       const label = (list: readonly { value: string; label: string }[], v: string) => list.find((o) => o.value === v)?.label ?? v;
       const seg = net.getSegment(hit.segmentId)!;

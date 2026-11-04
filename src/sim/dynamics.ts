@@ -1,6 +1,6 @@
 /** Car following and motion: the per-vehicle hot path. No allocation in here. */
 import { ENTRY_GHOST, ENTRY_REAL, ENTRY_REQUEST } from './buckets';
-import { KIND_DIVERGE, KIND_MERGE, KIND_SWEEP } from './compiled';
+import { isSweep, KIND_DIVERGE, KIND_MERGE, sweepApplies } from './compiled';
 import {
   CLEAR_MARGIN,
   DT,
@@ -186,14 +186,17 @@ function guard(w: World, v: number, c: number, pos: number): void {
       const a = start[other];
       const b = start[other + 1];
       const mine = veh.enterTick[v];
-      const sweep = kind === KIND_SWEEP;
+      const sweep = isSweep(kind);
       const sameExit = g.toLane[other] === g.toLane[c];
       const myLen = veh.len[v];
       for (let e = a; e < b; e++) {
         if (eT[e] === ENTRY_REQUEST || eT[e] === ENTRY_GHOST) continue;
         const u = eV[e];
         if (u === v || eS[e] - veh.len[u] > otherS + GUARD_MARGIN) continue;
-        if (sweep && myLen < LONG_BODY && veh.len[u] < LONG_BODY) continue;
+        // A swept path is a conflict only for the long body that sweeps it. Holding a
+        // car for a zone that only a truck on its own path would reach can leave two
+        // vehicles, each in a zone of the other, waiting for each other.
+        if (sweep && !sweepApplies(kind, myLen, veh.len[u], LONG_BODY)) continue;
         // Into the same lane, merge ordering keeps bodies apart; a second order here
         // could disagree with it and leave each waiting for the other.
         if (sweep && sameExit) continue;
@@ -368,6 +371,12 @@ export function accelPass(w: World): void {
           const x = idm(free, sp, outStop + STOP_GAP_BONUS, sp, ai, bi, T, s0);
           if (x < out) out = x;
         }
+      } else if (veh.permit[v] >= 0) {
+        // Someone got in front, by changing lanes: a permit is only re-checked at the head
+        // of the queue, so this one would be held for ever. Others would respect it, and
+        // merge ordering would line them up behind a driver who cannot move until the one
+        // ahead does, which can be waiting for one of them: a cycle with an empty junction.
+        dropClaim(w, v);
       }
 
       if (conn) {
@@ -400,7 +409,8 @@ export function accelPass(w: World): void {
   }
 }
 
-function remove(w: World, v: number): void {
+/** Take a vehicle off the road, releasing its permit. */
+export function remove(w: World, v: number): void {
   const { veh } = w;
   if (veh.permit[v] >= 0) dropClaim(w, v);
   freeVehicle(veh, v);
@@ -470,7 +480,7 @@ function crossLanes(w: World, v: number, sink: ArrivalSink): boolean {
       return true;
     }
     if (isConn[n]) {
-      if ((jn.needPermit[n] && (veh.permit[v] !== n || veh.claimWait[v])) || (jn.ctl[n] === CTL_SIGNAL && sig.state[n] === LIGHT_RED)) {
+      if ((jn.needPermit[n] && (veh.permit[v] !== n || veh.claimWait[v])) || (jn.ctl[n] === CTL_SIGNAL && sig.state[n] === LIGHT_RED && !(jn.redTurn[n] && veh.permit[v] === n))) {
         if (veh.permit[v] === n) dropClaim(w, v);
         hold(w, v, l);
         return true;

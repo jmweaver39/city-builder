@@ -22,7 +22,8 @@ export class SelectTool extends Tool {
     if (ep !== null) return { kind: 'endpoint', id: ep };
     const node = pickNode(this.ctx, e, (id) => {
       const kind = net.nodeGeom(id)?.kind;
-      return kind === 'junction' || kind === 'deadEnd';
+      // An edge merge (core/edgeMerge.ts) and a joint between roads of different widths can be inspected too.
+      return kind === 'junction' || kind === 'deadEnd' || kind === 'merge';
     });
     if (node !== null) return { kind: 'junction', id: node };
     const road = pickRoad(this.ctx, e);
@@ -44,7 +45,7 @@ export class SelectTool extends Tool {
       const def = net.roadTypeOf(t.id);
       this.ctx.setHud({ x: e.x, y: e.y, lines: [net.getSegment(t.id)?.overrides.name || def.name], notes: [], tone: 'ok' });
     } else if (t?.kind === 'junction') {
-      this.ctx.setHud({ x: e.x, y: e.y, lines: [isJunctionNode(net, t.id) ? 'Junction' : 'Dead end'], notes: [], tone: 'ok' });
+      this.ctx.setHud({ x: e.x, y: e.y, lines: [isJunctionNode(net, t.id) ? 'Junction' : net.nodeGeom(t.id)?.kind === 'merge' ? 'Edge merge' : 'Dead end'], notes: [], tone: 'ok' });
     } else {
       this.ctx.setHud(null);
     }

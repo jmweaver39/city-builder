@@ -8,6 +8,7 @@
  * Endpoints and paint are removed by clicking them, or by sweeping a drag over
  * them that starts off the road. Every click or drag is one undo step.
  */
+import type { Vec3 } from '../core/types';
 import type { Id } from '../core/types';
 import {
   clickSpan,
@@ -26,7 +27,7 @@ import {
   type Span,
 } from './bulldozeSpan';
 import { pickDecal, pickEndpoint, pickNodeHit, pickRoad } from './pick';
-import { hitLabel, hitOutline, markingAt, removeAutoItem, type MarkingHit } from './markingOps';
+import { decalOutline, hitLabel, hitOutline, markingAt, removeAutoItem, removeAutoLine, type MarkingHit } from './markingOps';
 import { pickQuay, quayOutline } from './QuayTool';
 import { connectedRoad } from './roadOps';
 import { pruneZones, syncAllZoneAccess } from './zoneOps';
@@ -84,7 +85,7 @@ export class BulldozeTool extends Tool {
     // A single marking under the cursor goes before the road it is painted on.
     const ground = road?.raw ?? pickNodeHit(this.ctx, e)?.point ?? null;
     if (ground) {
-      const hit = markingAt(this.ctx.net, ground);
+      const hit = markingAt(this.ctx.net, ground, { lineReach: this.lineReach(ground) });
       if (hit) return { kind: 'marking', hit };
     }
     if (road) return { kind: 'segment', id: road.segmentId, t: road.t };
@@ -92,6 +93,20 @@ export class BulldozeTool extends Tool {
     const quay = flat ? pickQuay(this.ctx.net, flat.x, flat.z) : null;
     if (quay !== null) return { kind: 'quay', id: quay };
     return null;
+  }
+
+  /**
+   * How close to an automatic road line the pointer must be to take the line rather
+   * than the road: a few pixels, and only when zoomed in enough to see the line.
+   */
+  private lineReach(p: Vec3): number | undefined {
+    const view = this.ctx.view;
+    const a = view.project(p);
+    const b = view.project({ x: p.x + 1, y: p.y, z: p.z });
+    if (!a || !b) return undefined;
+    const pxPerMetre = Math.hypot(b.x - a.x, b.y - a.y);
+    if (pxPerMetre < 18) return undefined;
+    return 4 / pxPerMetre;
   }
 
   /** What a click with this pointer would remove. */
@@ -190,8 +205,14 @@ export class BulldozeTool extends Tool {
     if (target.kind === 'marking') {
       const outline = hitOutline(net, target.hit);
       if (outline.length > 1) this.ctx.setMarks([{ kind: 'line', points: outline, color: COLORS.bad, width: 0.35 }]);
-      this.ctx.setHud({ x: e.x, y: e.y, lines: [`Remove ${hitLabel(net, target.hit)}`], notes: target.hit.kind === 'auto' ? ['Only this one. Bring it back from the junction inspector'] : [], tone: 'error' });
+      const note = target.hit.kind === 'auto' ? ['Only this one. Bring it back from the junction inspector'] : target.hit.kind === 'autoLine' ? ['Only this road. Bring it back from the road markings'] : [];
+      this.ctx.setHud({ x: e.x, y: e.y, lines: [`Remove ${hitLabel(net, target.hit)}`], notes: note, tone: 'error' });
       return;
+    }
+    if (target.kind === 'decal') {
+      // Just this mark lights up.
+      const outline = decalOutline(net, target.id);
+      if (outline.length > 1) this.ctx.setMarks([{ kind: 'line', points: outline, color: COLORS.bad, width: 0.35 }]);
     }
     if (target.kind === 'quay') {
       const q = net.quays.find((x) => x.id === target.id);
@@ -218,6 +239,9 @@ export class BulldozeTool extends Tool {
       if (hit.kind === 'user') {
         if (!net.markingsOf(hit.host).some((m) => m.id === hit.id)) return;
         net.removeMarking(hit.host, hit.id);
+      } else if (hit.kind === 'autoLine') {
+        if (!net.getSegment(hit.segmentId)) return;
+        removeAutoLine(net, hit.segmentId, hit.key);
       } else removeAutoItem(net, hit.nodeId, hit.item.ref);
     } else return;
     this.removed++;

@@ -267,7 +267,9 @@ export class TrackLayer {
       if (this.deckAbove(f.x + f.rx * side * 3.3, f.z + f.rz * side * 3.3, f.y)) continue;
       const mx = f.x + f.rx * side * 3.3;
       const mz = f.z + f.rz * side * 3.3;
-      const ground = Math.min(f.y, terrainHeight(mx, mz));
+      // On a viaduct the mast is bracketed to the trough's side, never stood on what is below.
+      const land = terrainHeight(mx, mz);
+      const ground = f.y - land > 1.5 ? f.y - 1.2 : Math.min(f.y, land);
       buf.box(mx, (ground + f.y + 7.3) / 2, mz, 0.13, (f.y + 7.3 - ground) / 2, 0.13, f.rx, f.rz, C.galv, M_STEEL);
       // Cantilever tube and brace, out to just past the track.
       const reach = 3.3 + 0.5;
@@ -292,7 +294,8 @@ export class TrackLayer {
     // The mast stands a little past the last piece of wire, off to the side.
     const mx = f.x + dx * 8 + f.rx * side * 3.4;
     const mz = f.z + dz * 8 + f.rz * side * 3.4;
-    const ground = Math.min(f.y, terrainHeight(mx, mz));
+    const land = terrainHeight(mx, mz);
+    const ground = f.y - land > 1.5 ? f.y - 1.2 : Math.min(f.y, land);
     const top = f.y + RAIL_TOP + 7.6;
     buf.box(mx, (ground + top) / 2, mz, 0.2, (top - ground) / 2, 0.2, f.rx, f.rz, C.galv, M_STEEL);
     buf.box(mx, top - 0.9, mz, 0.4, 0.06, 0.06, f.rx, f.rz, C.galv, M_STEEL);

@@ -8,7 +8,10 @@
  */
 import type { NetworkChange } from '../core/RoadNetwork';
 import { pathPoints, roadPathBetween, straightPathBetween } from '../core/roadPaint';
-import type { DecalKind, LineStyle, RoadPaintPiece, Vec3 } from '../core/types';
+import type { Decal, DecalKind, LineStyle, LineStyleSpec, RoadPaintPiece, Vec3 } from '../core/types';
+import { FILL_STANDARDS, LINE_STANDARDS, lineStandard, matchStandard, type LineStandardId } from '../core/paintStandard';
+import { stackedWith } from '../core/paintCoherence';
+import type { DecalInit } from '../core/RoadNetwork';
 import type { ToolMark } from '../render/api';
 import { lateralStops, nearestStop, roadCursor, stopPosition, stopRow, type LateralStop, type RoadCursor, type StopKind } from './roadAnchors';
 import { Tool } from './Tool';
@@ -46,23 +49,82 @@ const ACROSS_LANE: readonly DecalKind[] = ['stopLine', 'yieldTriangles'];
  * where 1 is a 5 m arrow, or text height.
  */
 export function defaultDecalWidth(kind: DecalKind): number {
-  if (LINE_DECALS.includes(kind)) return 0.2;
-  if (AREA_DECALS.includes(kind)) return 0.4;
+  const look = standardLook(kind);
+  if (look) return look.width;
+  if (AREA_DECALS.includes(kind)) return FILL_STANDARDS[0].spec.width;
+  return kind === 'text' ? 2 : 1;
+}
+
+const STOP_COLOR: Record<StopKind, string> = { edge: COLORS.snap, boundary: COLORS.neutral, centre: COLORS.warn, line: COLORS.ok };
+
+/** The line standards offered as Paint cards, in order. */
+export const PAINT_LINE_STANDARDS: readonly LineStandardId[] = ['lane', 'laneSolid', 'edge', 'centre', 'centreDouble', 'dotted'];
+
+/** The standard look a kind is placed with when none was picked. */
+function standardLook(kind: DecalKind): LineStyleSpec | null {
   switch (kind) {
+    case 'line':
+    case 'dashedLine':
+    case 'doubleLine':
+      return lineStandard('lane').spec;
     case 'crosswalk':
-      return 3;
+      return lineStandard('zebra').spec;
     case 'stopLine':
-      return 0.5;
+      return lineStandard('stop').spec;
     case 'yieldTriangles':
-      return 0.8;
-    case 'text':
-      return 2;
+      return lineStandard('giveWay').spec;
     default:
-      return 1;
+      return null;
   }
 }
 
-const STOP_COLOR: Record<StopKind, string> = { edge: COLORS.snap, boundary: COLORS.neutral, centre: COLORS.warn };
+/** Which family of look a kind takes. */
+function lookFamily(kind: DecalKind): 'line' | 'crosswalk' | 'stop' | 'teeth' | null {
+  if (LINE_DECALS.includes(kind)) return 'line';
+  if (kind === 'crosswalk') return 'crosswalk';
+  if (kind === 'stopLine') return 'stop';
+  if (kind === 'yieldTriangles') return 'teeth';
+  return null;
+}
+
+const FAMILY_STYLES: Record<'line' | 'crosswalk' | 'stop' | 'teeth', (s: LineStyleSpec['style']) => boolean> = {
+  line: (s) => ['solid', 'dashed', 'double', 'doubleDashed', 'solidDashed', 'dashedSolid', 'dotted', 'zigzag'].includes(s),
+  crosswalk: (s) => s.startsWith('crosswalk'),
+  stop: (s) => s === 'stopLine',
+  teeth: (s) => s === 'sharkTeeth',
+};
+
+/**
+ * The look a decal of this kind is placed with: the picked look when it suits the
+ * kind, else the kind's standard, with the panel's colour and width written in.
+ */
+export function paintLook(settings: { kind: DecalKind; color: Decal['color']; width: number; look?: LineStyleSpec }): LineStyleSpec | null {
+  const fam = lookFamily(settings.kind);
+  if (!fam) return null;
+  const base = settings.look && FAMILY_STYLES[fam](settings.look.style) ? settings.look : standardLook(settings.kind);
+  if (!base) return null;
+  return { ...base, color: settings.color, width: settings.width > 0 ? settings.width : base.width };
+}
+
+/** A name for what is being painted: the standard's, or the kind's. */
+export function paintName(settings: { kind: DecalKind; color: Decal['color']; width: number; look?: LineStyleSpec }): string {
+  const look = paintLook(settings);
+  const std = look ? matchStandard(look) : null;
+  if (std) return std.name;
+  if (settings.kind === 'hatch') return FILL_STANDARDS[0].name;
+  const stampNames: Partial<Record<DecalKind, string>> = {
+    arrowStraight: 'Arrow ahead',
+    arrowLeft: 'Arrow left',
+    arrowRight: 'Arrow right',
+    arrowStraightLeft: 'Arrow ahead or left',
+    arrowStraightRight: 'Arrow ahead or right',
+    text: 'Text',
+    fill: 'Solid fill',
+  };
+  if (stampNames[settings.kind]) return stampNames[settings.kind]!;
+  if (look) return `${LINE_STANDARDS.find((s) => s.spec.style === look.style)?.name ?? 'Line'} (own look)`;
+  return settings.kind;
+}
 const MIN_RUN = 0.5;
 
 interface Start {
@@ -150,6 +212,17 @@ export class PaintTool extends Tool {
       const end = last.t0 <= last.t1 ? far : -far;
       if (Math.abs(end - offset) > 0.05) offsetEnd = end;
     }
+    // Across a junction or transition into a road of another type, the line keeps its
+    // place on each road: the start's stop on the first, the stop picked on the last.
+    if (this.isLine && offsetEnd === undefined && pieces.length > 1) {
+      const t0 = net.getSegment(first.segmentId)?.roadType;
+      if (pieces.some((p) => net.getSegment(p.segmentId)?.roadType !== t0)) {
+        const far = this.stop?.offset ?? cursor.lateral;
+        const end = last.t0 <= last.t1 ? far : -far;
+        for (const p of pieces) if (net.getSegment(p.segmentId)?.roadType !== t0) p.offset = end;
+        pieces[0].offset = offset;
+      }
+    }
     const line = pathPoints(net, pieces, offset, offsetEnd ?? offset);
     let run = 0;
     for (let i = 1; i < line.length; i++) run += Math.hypot(line[i].x - line[i - 1].x, line[i].z - line[i - 1].z);
@@ -177,6 +250,13 @@ export class PaintTool extends Tool {
       row(1);
     }
     row(cursor.t);
+    // Over a junction or transition: the stops on every arm's cut, both sides of it.
+    if (cursor.nodeId !== undefined && !this.isStamp) {
+      for (const arm of net.nodeGeom(cursor.nodeId)?.arms ?? []) {
+        if (arm.segmentId === cursor.segmentId) continue;
+        for (const { pos, stop } of stopRow(net, arm.segmentId, arm.atStart ? 0 : 1)) marks.push({ kind: 'point', pos, color: STOP_COLOR[stop.kind], radius: 0.45 });
+      }
+    }
     return marks;
   }
 
@@ -193,17 +273,21 @@ export class PaintTool extends Tool {
     }
     if (this.draft) {
       const line = this.isArea ? [...this.draft.points, this.draft.points[0]] : this.draft.points;
-      marks.push({ kind: 'line', points: line, color: settings.paint.color, width: Math.max(0.3, settings.paint.width), dashed: settings.paint.lineStyle === 'dashed' });
+      const look = paintLook(settings.paint);
+      marks.push({ kind: 'line', points: line, color: settings.paint.color, width: Math.max(0.3, settings.paint.width), dashed: !!look && look.style !== 'solid' && look.style !== 'double' });
     }
     this.ctx.setMarks(marks);
     if (!e) return;
-    const name = this.isLine ? (LINE_STYLES.find((l) => l.style === settings.paint.lineStyle)?.name ?? 'Line') : this.kind;
+    const name = paintName(settings.paint);
     const lines = [`Paint ${name}`, `${settings.paint.color}, ${settings.paint.width.toFixed(2)} m`];
     const notes: string[] = [];
+    // One marking per place: a taken place says what the click replaces.
+    const taken = this.draft ? this.replaces(this.pathInit(this.draft)) : this.isStamp && cursor && this.stop ? this.replaces(this.stampInit(cursor, this.stop)) : '';
     if (!cursor) notes.push('Move over a road');
     else if (this.reason) notes.push(this.reason);
-    else if (this.isStamp) notes.push('Click to place on this lane');
-    else if (!this.start) notes.push(cursor.atEnd ? 'Click to start at the junction edge' : 'Click to start here');
+    else if (this.isStamp) notes.push(taken ? `Click to replace the ${taken}` : 'Click to place on this lane');
+    else if (!this.start) notes.push(cursor.atEnd ? 'Click to start at the junction edge' : this.stop?.kind === 'line' ? `Click to start on the ${this.stop.role === 'centre' ? 'centre' : this.stop.role ?? 'lane'} line` : 'Click to start here');
+    else if (taken) notes.push(`Click to replace the ${taken}`);
     else notes.push(cursor.atEnd ? 'Click to finish at the junction edge' : 'Click to finish here');
     this.ctx.setHud({ x: e.x, y: e.y, lines, notes, tone: this.reason ? 'warning' : 'ok' });
   }
@@ -238,10 +322,12 @@ export class PaintTool extends Tool {
     this.ctx.changed();
   }
 
-  private placePath(draft: Draft): void {
+  /** The decal a path draft would place. */
+  private pathInit(draft: Draft): DecalInit {
     const { paint } = this.ctx.settings;
-    this.ctx.history.hint('Paint');
-    this.ctx.net.addDecal({
+    const look = paintLook(paint);
+    const fill = this.kind === 'hatch' ? { ...FILL_STANDARDS[0].spec, color: paint.color } : this.kind === 'fill' ? { ...FILL_STANDARDS[2].spec, color: paint.color } : undefined;
+    return {
       kind: this.kind,
       points: [],
       road: {
@@ -250,21 +336,19 @@ export class PaintTool extends Tool {
         ...(draft.offset2 === undefined ? {} : { offset2: draft.offset2 }),
         ...(draft.offsetEnd === undefined ? {} : { offsetEnd: draft.offsetEnd }),
       },
-      ...(this.isLine ? { lineStyle: paint.lineStyle } : {}),
+      ...(look ? { style: look } : {}),
+      ...(fill ? { fill } : {}),
       color: paint.color,
-      width: paint.width,
+      width: look?.width ?? paint.width,
       rotation: 0,
-    });
-    this.start = null;
+    };
   }
 
-  private placeStamp(cursor: RoadCursor, lane: LateralStop): void {
+  /** The decal a stamp click would place, or null with a reason toast. */
+  private stampInit(cursor: RoadCursor, lane: LateralStop): DecalInit | null {
     const { net, settings } = this.ctx;
     const { paint } = settings;
-    if (this.kind === 'text' && !paint.text.trim()) {
-      this.ctx.toast('Type some text first.', 'warning');
-      return;
-    }
+    if (this.kind === 'text' && !paint.text.trim()) return null;
     const def = net.roadTypeOf(cursor.segmentId);
     const piece = { segmentId: cursor.segmentId, t0: cursor.t, t1: cursor.t };
     const half = (lane.width ?? 3) / 2;
@@ -277,16 +361,47 @@ export class PaintTool extends Tool {
       offset = lane.offset - half;
       offset2 = lane.offset + half;
     }
-    this.ctx.history.hint('Paint');
-    net.addDecal({
+    const look = paintLook(paint);
+    return {
       kind: this.kind,
       points: [],
       road: { pieces: [piece], offset, ...(offset2 === undefined ? {} : { offset2 }), dir: lane.dir ?? 1 },
+      ...(look ? { style: look } : {}),
       color: paint.color,
-      width: paint.width,
+      width: look?.width ?? paint.width,
       rotation: 0,
       ...(this.kind === 'text' ? { text: paint.text } : {}),
-    });
+    };
+  }
+
+  /** What placing this would replace, named, or '' when the place is free. */
+  private replaces(init: DecalInit | null): string {
+    if (!init) return '';
+    const { labels } = stackedWith(this.ctx.net, { kind: 'decal', decal: init });
+    return labels[0] ?? '';
+  }
+
+  private place(init: DecalInit): void {
+    this.ctx.history.hint('Paint');
+    const net = this.ctx.net;
+    net.addDecal(init);
+    // One marking per place: say what the new one took the place of.
+    const what = net.lastReplaced[0];
+    if (what) this.ctx.toast(`Replaced the ${what}.`, 'info');
+  }
+
+  private placePath(draft: Draft): void {
+    this.place(this.pathInit(draft));
+    this.start = null;
+  }
+
+  private placeStamp(cursor: RoadCursor, lane: LateralStop): void {
+    const init = this.stampInit(cursor, lane);
+    if (!init) {
+      this.ctx.toast('Type some text first.', 'warning');
+      return;
+    }
+    this.place(init);
   }
 
   back(): boolean {

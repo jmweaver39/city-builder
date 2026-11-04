@@ -62,6 +62,7 @@ export class CameraRig {
   /** Stays true until the event after the release, so tools can check it on pointerup. */
   private wasDragged = false;
   private rightClick = new Set<(x: number, y: number, e: PointerEvent) => void>();
+  private middleClick = new Set<(x: number, y: number, e: PointerEvent) => void>();
 
   /** World position the camera is locked onto, or null. */
   followPoint: THREE.Vector3 | null = null;
@@ -152,9 +153,12 @@ export class CameraRig {
   private pointerUp(e: PointerEvent): void {
     if (e.button !== this.dragButton) return;
     const wasClick = e.button === 2 && !this.dragged;
+    // A middle press, or an Option press (trackpads), that barely moved is a copy click; a drag stays an orbit.
+    const wasMiddleClick = (e.button === 1 || e.button === 0) && !this.dragged;
     this.dragButton = -1;
     this.dragged = false;
     if (wasClick) for (const fn of this.rightClick) fn(e.clientX, e.clientY, e);
+    if (wasMiddleClick) for (const fn of this.middleClick) fn(e.clientX, e.clientY, e);
     // Cleared after the event finishes, so handlers later in this same dispatch still see it.
     queueMicrotask(() => {
       setTimeout(() => {
@@ -256,6 +260,12 @@ export class CameraRig {
   onRightClick(fn: (x: number, y: number, e: PointerEvent) => void): () => void {
     this.rightClick.add(fn);
     return () => this.rightClick.delete(fn);
+  }
+
+  /** Middle button, or Option with the left button, pressed and released in about the same spot. */
+  onMiddleClick(fn: (x: number, y: number, e: PointerEvent) => void): () => void {
+    this.middleClick.add(fn);
+    return () => this.middleClick.delete(fn);
   }
 
   setKeysEnabled(on: boolean): void {

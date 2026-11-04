@@ -3,6 +3,7 @@
  * down when frames run long. Everything expensive reads its budget from here.
  */
 import type * as THREE from 'three';
+import { nextRoadDetailCap, resolveRoadDetail, type RoadDetailName, type RoadDetailPref } from './roadDetail';
 
 export type QualityName = 'low' | 'medium' | 'high' | 'ultra';
 
@@ -184,6 +185,22 @@ const SETTLE = 4;
 
 export class QualityGovernor {
   enabled = true;
+  /**
+   * Road detail never above this while set: each time the governor changes the level
+   * it moves road detail a step the same way (roadDetail.ts). Cleared when the player
+   * picks a road detail or a quality level by hand.
+   */
+  roadDetailCap: RoadDetailName | null = null;
+
+  /** Road detail to draw for the player's choice at this quality, after the governor's cap. */
+  roadDetail(pref: RoadDetailPref, quality: QualityName): RoadDetailName {
+    return resolveRoadDetail(pref, quality, this.roadDetailCap);
+  }
+
+  /** Move the road detail cap along with a level change the governor made from `from`. */
+  stepRoadDetail(pref: RoadDetailPref, from: QualityName, down: boolean): void {
+    this.roadDetailCap = nextRoadDetailCap(pref, from, this.roadDetailCap, down);
+  }
   /** Highest level it may step up to. Lowered for good when a level proves too slow. */
   ceiling: QualityName = 'ultra';
   private sum = 0;

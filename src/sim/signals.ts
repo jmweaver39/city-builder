@@ -8,6 +8,10 @@ import type { Buckets } from './buckets';
 import { ENTRY_REAL } from './buckets';
 import type { CompiledGraph } from './compiled';
 import { DT } from './constants';
+import { TURN_LEFT, TURN_UTURN } from './compiled';
+
+/** Yellow between a hand-set green and red. */
+const MANUAL_YELLOW_SEC = 3;
 
 export const LIGHT_RED = 0;
 export const LIGHT_YELLOW = 1;
@@ -35,6 +39,12 @@ class Controller {
   states: Uint8Array[];
   /** Connectors no phase mentions. They run permissive rather than never at all. */
   orphans: number[];
+  /** Hand control: movement key to green (true) or red. Null runs the plan. */
+  manual: Map<string, boolean> | null = null;
+  /** Movement key of each connector. */
+  readonly moveKeys: string[];
+  /** Hand control: when each connector's yellow ends, 0 when none. */
+  private yellowUntil: Float64Array;
 
   constructor(
     readonly nodeId: Id,
@@ -42,6 +52,8 @@ class Controller {
     readonly conns: number[],
     g: CompiledGraph,
   ) {
+    this.moveKeys = conns.map((c) => `${g.graph.lanes[g.fromLane[c]].segmentId}>${g.graph.lanes[g.toLane[c]].segmentId}`);
+    this.yellowUntil = new Float64Array(conns.length);
     this.states = plan.phases.map((ph) => {
       const row = new Uint8Array(conns.length);
       conns.forEach((c, i) => {
@@ -155,7 +167,36 @@ class Controller {
     return this.phase;
   }
 
+  /**
+   * Hand control: greens as set, with lefts giving way, and a yellow on the way
+   * from green to red. Every entry is still checked against conflicts.
+   */
+  stepManual(time: number, g: CompiledGraph, state: Uint8Array): void {
+    const { conns, manual } = this;
+    let yellow = 0;
+    for (let i = 0; i < conns.length; i++) {
+      const c = conns[i];
+      if (manual!.get(this.moveKeys[i])) {
+        const turn = g.turn[c];
+        state[c] = turn === TURN_LEFT || turn === TURN_UTURN ? LIGHT_PERMISSIVE : LIGHT_PROTECTED;
+        this.yellowUntil[i] = 0;
+        continue;
+      }
+      if (state[c] >= LIGHT_PERMISSIVE) {
+        state[c] = LIGHT_YELLOW;
+        this.yellowUntil[i] = time + MANUAL_YELLOW_SEC;
+      }
+      if (state[c] === LIGHT_YELLOW) {
+        if (time >= this.yellowUntil[i]) state[c] = LIGHT_RED;
+        else if (this.yellowUntil[i] - time > yellow) yellow = this.yellowUntil[i] - time;
+      }
+    }
+    this.left = yellow;
+  }
+
   status(): SignalPhaseStatus {
+    // Hand control has no phases. People may cross while no light is changing.
+    if (this.manual) return { phaseIndex: -1, stage: this.left > 0 ? 'yellow' : 'green', remainingSec: this.left > 0 ? this.left : 60 };
     return { phaseIndex: this.phase, stage: STAGE_NAMES[this.stage], remainingSec: Math.max(0, this.left) };
   }
 }
@@ -239,9 +280,33 @@ export class SignalSystem {
     const { controllers, state } = this;
     for (let i = 0; i < controllers.length; i++) {
       const c = controllers[i];
+      if (c.manual) {
+        c.stepManual(time, g, state);
+        continue;
+      }
       const changed = c.plan.kind === 'fixed' ? c.setByClock(time) : c.stepActuated(g, bk);
       if (changed) c.write(state);
     }
+  }
+
+  /** Put a node under hand control (a map of movement key to green), or back on its plan (null). */
+  setManual(nodeId: Id, manual: Map<string, boolean> | null, time: number): void {
+    const c = this.byNode.get(nodeId);
+    if (!c) return;
+    c.manual = manual;
+    if (!manual) {
+      if (c.plan.kind === 'fixed') c.setByClock(time);
+      c.write(this.state);
+    }
+  }
+
+  /** Movement keys at a signalled node with whether each shows green now. */
+  movesAt(nodeId: Id): Map<string, boolean> | null {
+    const c = this.byNode.get(nodeId);
+    if (!c) return null;
+    const out = new Map<string, boolean>();
+    c.conns.forEach((conn, i) => out.set(c.moveKeys[i], (out.get(c.moveKeys[i]) ?? false) || this.state[conn] >= LIGHT_PERMISSIVE));
+    return out;
   }
 
   /** Seconds until a yellow at this node turns red. */

@@ -10,7 +10,8 @@
 import { addScaled, rightOf, scale } from '../core/math';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { totalHalfWidth } from '../core/roadTypes';
-import { defaultSignalPlan, effectiveControl, isFreeFlowNode, movementsAt, priorityLayout } from '../core/signals';
+import { effectiveControl, isFreeFlowNode, movementsAt, priorityLayout } from '../core/signals';
+import { autoSignalPlan } from '../core/highwayCrossing';
 import type { Id, JunctionControl, NodeArm, SignalPlan, SignKind, Vec3 } from '../core/types';
 import type { ToolMark } from '../render/api';
 
@@ -72,7 +73,8 @@ function signalPlanFor(net: RoadNetwork, nodeId: Id): SignalPlan {
     const used = current.phases.flatMap((p) => Object.keys(p.moves));
     if (used.length && used.every((k) => keys.has(k))) return current;
   }
-  return defaultSignalPlan(net, nodeId, 'opposing');
+  // Protected or linked phases at a highway crossing (core/highwayCrossing.ts).
+  return autoSignalPlan(net, nodeId);
 }
 
 function sameSigns(a: Record<number, SignKind>, b: Record<number, SignKind>, arms: Id[]): boolean {

@@ -66,6 +66,7 @@ describe('Paint: a line from each arm to every other arm', () => {
     r.tools.settings.paint.kind = 'line';
     r.tools.settingsChanged();
     let made = 0;
+    let lastId = -1;
     for (let i = 0; i < dirs.length; i++) {
       for (let j = 0; j < dirs.length; j++) {
         if (i === j) continue;
@@ -75,8 +76,14 @@ describe('Paint: a line from each arm to every other arm', () => {
         r.click(a.x * out - a.z * 1.75, a.z * out + a.x * 1.75);
         r.click(b.x * out + b.z * 1.75, b.z * out - b.x * 1.75);
         made++;
-        expect(r.net.decals, `arm ${i} to arm ${j}`).toHaveLength(made);
-        const pts = resolveDecal(r.net, r.net.decals[made - 1]).points;
+        // Each line is placed. On a lane boundary (as on the uneven road), lines sharing the
+        // approach hold one place, so a newer one replaces an older one there.
+        const last = r.net.decals[r.net.decals.length - 1];
+        expect(last, `arm ${i} to arm ${j}`).toBeDefined();
+        expect(last.id).toBeGreaterThan(lastId);
+        lastId = last.id;
+        expect(r.net.decals.length).toBeLessThanOrEqual(made);
+        const pts = resolveDecal(r.net, last).points;
         expect(pts.length).toBeGreaterThan(4);
         expect(maxStep(pts)).toBeLessThan(6);
         expect(sharpestTurn(pts)).toBeLessThan(40);
@@ -126,7 +133,8 @@ describe('Junction markings: a line from each arm to every other arm', () => {
     tool.open(node);
     const anchors = nodeAnchors(r.net, node);
     const arms = [...new Set(anchors.map((a) => a.anchor.segmentId))];
-    let made = 0;
+    // One marking per place: a line back the other way between the same two points replaces the first.
+    const made = new Set<string>();
     for (const a of arms) {
       for (const b of arms) {
         if (a === b) continue;
@@ -134,10 +142,10 @@ describe('Junction markings: a line from each arm to every other arm', () => {
         const pb = anchors.filter((x) => x.anchor.segmentId === b)[1];
         r.click(pa.pos.x, pa.pos.z);
         r.click(pb.pos.x, pb.pos.z);
-        made++;
+        made.add(a < b ? `${a}>${b}` : `${b}>${a}`);
         const list = r.net.getNode(node)!.control.markings ?? [];
-        expect(list, `arm ${a} to arm ${b}`).toHaveLength(made);
-        const m = list[made - 1];
+        expect(list, `arm ${a} to arm ${b}`).toHaveLength(made.size);
+        const m = list[list.length - 1];
         expect(m.kind).toBe('line');
         const path = markingPath(r.net, node, m as never)!;
         expect(path.length).toBeGreaterThan(3);

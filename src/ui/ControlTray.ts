@@ -13,6 +13,8 @@ import { CONTROL_ART } from './cardArt';
 import { MarkingsEditor } from './MarkingsEditor';
 import { JunctionShapePanel } from './JunctionShapePanel';
 import type { Panel } from './Panel';
+import { TrafficRulesTray } from './TrafficRulesTray';
+import { RULE_MODE_ART } from '../tools/trafficArt';
 
 const CARD_ICON: Record<ControlKind, IconName> = {
   signal: 'signalLight',
@@ -95,6 +97,9 @@ export class ControlTray {
   private markings: MarkingsEditor | null = null;
   private shape: JunctionShapePanel | null = null;
   private readonly offNet: () => void;
+  /** Control (signs, lights, lanes...) or Rules (the traffic rules tool), which the tray shows. */
+  private view: 'control' | 'rules' = 'control';
+  private readonly rules: TrafficRulesTray;
 
   constructor(
     private readonly ui: UiContext,
@@ -102,6 +107,42 @@ export class ControlTray {
     private readonly options: HTMLElement,
   ) {
     this.offNet = ui.net.onChange(() => this.syncEditors());
+    this.rules = new TrafficRulesTray(ui);
+  }
+
+  private viewKey(): 'control' | 'rules' {
+    return this.tools.active.id === 'trafficRules' ? 'rules' : 'control';
+  }
+
+  /** Control or Rules, at the top of the options strip. */
+  private viewSwitch(): HTMLElement {
+    const make = (view: 'control' | 'rules', label: string, tip: string, desc: string) =>
+      el('button', {
+        class: `rules-switch-btn ${this.view === view ? 'active' : ''}`,
+        text: label,
+        tip,
+        desc,
+        keyHint: view === 'rules' ? 'Shift+J' : 'J',
+        attrs: { type: 'button', role: 'tab', 'aria-selected': String(this.view === view) },
+        on: {
+          click: () => {
+            if (view === this.view) return;
+            if (view === 'rules') this.rules.pick(this.tools.settings.trafficRules.mode);
+            else this.openControl();
+          },
+        },
+      });
+    return el(
+      'div',
+      { class: 'rules-switch', attrs: { role: 'tablist', 'aria-label': 'Junction view' } },
+      make('control', 'Control', 'Control', 'Lights, signs, roundabouts, lanes, shape and markings'),
+      make('rules', 'Rules', 'Traffic rules', 'Lane arrows, speed limits, vehicle bans, junction rules, priority roads, manual and timed lights'),
+    );
+  }
+
+  private openControl(): void {
+    this.tools.setTool('junction');
+    this.tools.settingsChanged();
   }
 
   /** Drop the hosted editors and listeners when the tray goes. */
@@ -128,6 +169,14 @@ export class ControlTray {
 
   render(): void {
     const { tools } = this;
+    clear(this.cards);
+    this.view = this.viewKey();
+    if (this.view === 'rules') {
+      this.rules.renderCards(this.cards);
+      this.mode = '';
+      this.sync();
+      return;
+    }
     for (const c of CONTROL_CARDS) {
       this.cards.append(
         card({
@@ -169,19 +218,27 @@ export class ControlTray {
         onClick: () => tools.setTool('junctionShape'),
       }),
       card({
-        icon: 'intersections',
-        name: 'Markings',
-        meta: 'Lines and fillers by hand',
-        data: { tool: 'nodeMarkings' },
-        onClick: () => tools.setTool('nodeMarkings'),
-      }),
-      card({
         icon: 'advanced',
         name: 'Editor',
         meta: 'Signs, phases, crosswalks',
         data: { control: 'inspect' },
         onClick: () => this.openAdvanced(),
       }),
+      el(
+        'button',
+        {
+          class: 'card card-icon',
+          dataset: { rulesEntry: '1' },
+          tip: 'Traffic rules',
+          desc: 'Lane arrows, speed limits, vehicle bans, junction rules, priority roads, manual and timed lights, clear traffic',
+          keyHint: 'Shift+J',
+          attrs: { type: 'button', 'aria-label': 'Traffic rules' },
+          on: { click: () => this.rules.pick(this.tools.settings.trafficRules.mode) },
+        },
+        el('div', { class: 'art picture rule-art', html: RULE_MODE_ART.arrows }),
+        el('div', { class: 'card-name', text: 'Rules' }),
+        el('div', { class: 'card-meta', text: 'Arrows, speeds, bans' }),
+      ),
     );
     this.mode = '';
     this.sync();
@@ -204,12 +261,26 @@ export class ControlTray {
       return `markings:${h ? `${h.kind}${h.id}` : ''}`;
     }
     if (id === 'junctionShape') return `shape:${tools.junctionShape.node ?? ''}`;
+    if (id === 'trafficRules') return this.rules.layoutKey();
     return id;
   }
 
   /** Reflect tool state: active card, and the options strip. */
   sync(): void {
     const { tools } = this;
+    if (this.viewKey() !== this.view) {
+      this.render();
+      return;
+    }
+    if (this.view === 'rules') {
+      this.rules.syncCards(this.cards);
+      const mode = this.modeKey();
+      if (mode !== this.mode) {
+        this.mode = mode;
+        this.renderOptions();
+      } else this.rules.syncOptions(this.options);
+      return;
+    }
     const active = tools.active.id;
     this.cards.querySelectorAll<HTMLElement>('.card').forEach((c) => {
       const d = c.dataset;
@@ -234,6 +305,11 @@ export class ControlTray {
     clear(o);
     const { tools } = this;
     const id = tools.active.id;
+    o.append(this.viewSwitch());
+    if (id === 'trafficRules') {
+      this.rules.renderOptions(o);
+      return;
+    }
     if (id === 'roundabout') {
       this.renderRoundabout();
       return;

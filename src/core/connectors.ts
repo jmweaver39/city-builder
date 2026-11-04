@@ -4,13 +4,14 @@
  * nothing about the dense lane graph: it works on lane ends and returns protos
  * that laneGraph.ts assembles.
  */
-import type { Id, JunctionControl, LaneKind, NodeGeom, RampAttach, RoadCategory, RoadTypeDef, SegmentGeom, TurnKind, Vec3 } from './types';
+import type { HighwayAccess, Id, JunctionControl, LaneKind, NodeGeom, RampAttach, RoadCategory, RoadTypeDef, SegmentGeom, TurnKind, Vec3 } from './types';
 import type { NodeLayout } from './junction';
 import { cubicPoint, cubicDerivative, type Cubic } from './bezier';
 import { toPolylineData, type PolylineData } from './geometry';
 import { clamp, crossXZ, distXZ, dotXZ, lengthXZ, scale, signedTurn, segmentIntersectXZ } from './math';
 import { isOneWay } from './roadTypes';
-import { isControlledAccess, linkControlledAccess } from './ramps';
+import { isControlledAccess, linkControlledAccess, linkStreetAttaches } from './ramps';
+import { linkHighwayCrossing } from './highwayCrossing';
 
 /** One lane where it meets a node. */
 export interface LaneEnd {
@@ -94,6 +95,8 @@ export function buildArmLanes(
   defOf: (id: Id) => RoadTypeDef,
   lanesOf: (id: Id) => readonly (RoadLaneInfo | null)[],
   attachOf?: (id: Id, atStart: boolean) => RampAttach | undefined,
+  /** How far an end sits right of the node, from a lane alignment (core/laneAlign.ts). */
+  shiftOf?: (id: Id, atStart: boolean) => number,
 ): ArmLanes[] {
   return layout.arms.map((arm, armIndex) => {
     const seg = geomOf(arm.segmentId);
@@ -104,6 +107,8 @@ export function buildArmLanes(
     if (stations.length > 0) {
       const st = arm.atStart ? stations[0] : stations[stations.length - 1];
       const lanes = lanesOf(arm.segmentId);
+      // Lateral positions are measured from the node, so lanes of an aligned road pair by where they really are.
+      const shift = shiftOf?.(arm.segmentId, arm.atStart) ?? 0;
       for (let i = 0; i < lanes.length; i++) {
         const lane = lanes[i];
         if (!lane) continue;
@@ -113,7 +118,7 @@ export function buildArmLanes(
           segmentId: arm.segmentId,
           laneIndex: i,
           kind: lane.kind,
-          lat: lane.dir === 1 ? lane.offset : -lane.offset,
+          lat: lane.dir === 1 ? lane.offset + shift : -(lane.offset + shift),
           width: lane.width,
           speed: lane.speed,
           pos: arriving ? lane.end : lane.start,
@@ -163,7 +168,7 @@ interface Exit {
  * kinds. Clockwise from the arriving arm is left to right. The least-bent exit
  * within limits is 'straight', and everything else is a left or right of it.
  */
-function exitsFrom(arms: ArmLanes[], from: number, accept: (l: LaneEnd) => boolean): Exit[] {
+export function exitsFrom(arms: ArmLanes[], from: number, accept: (l: LaneEnd) => boolean): Exit[] {
   const n = arms.length;
   const heading = scale(arms[from].cutDir, -1);
   const found: { arm: number; lanes: LaneEnd[]; bend: number }[] = [];
@@ -226,7 +231,7 @@ export class LinkSet {
 type Align = 'left' | 'right' | 'lateral';
 
 /** Link lanes I to lanes O of one exit, both sorted left to right. */
-function connect(set: LinkSet, I: LaneEnd[], O: LaneEnd[], align: Align, turn: TurnKind): void {
+export function connect(set: LinkSet, I: LaneEnd[], O: LaneEnd[], align: Align, turn: TurnKind): void {
   if (!I.length || !O.length) return;
   if (I.length === O.length) {
     for (let k = 0; k < I.length; k++) set.add(I[k], O[k], turn);
@@ -482,8 +487,21 @@ export function plainJointLinks(arms: ArmLanes[]): LaneLinkSpec[] {
   return out;
 }
 
-/** The automatic lane links at a junction or dead end. */
-export function autoLaneLinks(arms: ArmLanes[]): LaneLinkSpec[] {
+/**
+ * The automatic lane links at a junction or dead end. `access` is the node's
+ * `JunctionControl.highwayAccess`, which only matters where a highway meets another road.
+ */
+export function autoLaneLinks(arms: ArmLanes[], access?: HighwayAccess): LaneLinkSpec[] {
+  // Roads attached to chosen lanes of a street or avenue (core/ramps.ts).
+  if (arms.some((a) => a.attach)) {
+    const street = linkStreetAttaches(arms, (rest) => autoLaneLinks(rest, access));
+    if (street) {
+      const set = new LinkSet();
+      for (const l of street) set.add(l.from, l.to, l.turn);
+      linkRail(set, arms);
+      return [...set.links.values()];
+    }
+  }
   const set = new LinkSet();
   const drive = (l: LaneEnd) => l.kind === 'drive';
   const bike = (l: LaneEnd) => l.kind === 'bike';
@@ -494,9 +512,15 @@ export function autoLaneLinks(arms: ArmLanes[]): LaneLinkSpec[] {
     if (arm.incoming.some(drive)) inArms.push(i);
     if (arm.outgoing.some(drive)) outArms.push(i);
   });
-  if (isControlledAccess(arms)) {
+  if (isControlledAccess(arms, access)) {
     // Highways: own carriageway only, merge and diverge, no turns across.
     linkControlledAccess(set, arms);
+    linkRail(set, arms);
+    return [...set.links.values()];
+  }
+  if (access === 'crossing' && arms.some((a) => a.category === 'highway') && arms.length >= 3) {
+    // A road crossing a highway at grade: straight across and turning (core/highwayCrossing.ts).
+    linkHighwayCrossing(set, arms);
     linkRail(set, arms);
     return [...set.links.values()];
   }

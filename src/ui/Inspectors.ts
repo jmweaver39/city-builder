@@ -1,9 +1,10 @@
 /** Floating inspectors for segments, junctions, endpoints and vehicles. */
-import type { Id, LaneKind, LineStyle, MarkingStyle, PaintColor, SegmentOverrides, TrafficEndpoint, ZoneRegion } from '../core/types';
-import { BUILTIN_ROAD_TYPES, effectiveLanes, effectiveMarkings, effectiveSpeedKmh, laneSpeedKmh } from '../core/roadTypes';
+import type { Id, LineStyle, MarkingStyle, PaintColor, SegmentOverrides, TrafficEndpoint, ZoneRegion } from '../core/types';
+import { BUILTIN_ROAD_TYPES, effectiveLanes, effectiveMarkings, effectiveSpeedKmh } from '../core/roadTypes';
 import { isStraightCubic } from '../core/bezier';
 import { smoothSegment } from '../core/curveChain';
-import { connectedRoad, connectedRoadOriented, mirroredLane } from '../tools/roadOps';
+import { connectedRoad } from '../tools/roadOps';
+import { attachSummaries } from '../tools/attachInfo';
 import { reverseMessages, reverseRoads, strandedMarks } from '../tools/ReverseTool';
 import { syncZoneAccess, ZONE_NAMES, zoneStats } from '../tools/zoneOps';
 import { ENDPOINT_NAMES } from '../tools/TrafficTool';
@@ -11,7 +12,9 @@ import type { InspectTarget } from '../tools/types';
 import type { UiContext } from './context';
 import { checkbox, clear, el, numberInput, row, selectInput, sliderInput, textInput, visualSelect, type VisualOption } from './dom';
 import { JunctionEditor } from './JunctionEditor';
+import { RoadLaneEditor } from './LaneEditor';
 import { structureSection } from './WallControls';
+import { upgradeSection } from './UpgradeControls';
 import { NodeMarkingPanel } from './NodeMarkingPanel';
 import { JunctionShapePanel } from './JunctionShapePanel';
 import { Panel } from './Panel';
@@ -58,11 +61,6 @@ const SURFACE_OPTIONS: VisualOption<Surface>[] = (Object.keys(SURFACE_LABELS) as
   label: SURFACE_LABELS[v],
   preview: surfaceArt(v),
 }));
-const LANE_KINDS: { value: LaneKind; label: string }[] = [
-  { value: 'drive', label: 'General' },
-  { value: 'bus', label: 'Bus only' },
-  { value: 'bike', label: 'Bike only' },
-];
 
 /** One open inspector. */
 abstract class Inspector {
@@ -98,6 +96,7 @@ abstract class Inspector {
 
 class SegmentInspector extends Inspector {
   private whole = false;
+  private lanes: RoadLaneEditor | null = null;
 
   constructor(ui: UiContext, private readonly id: Id) {
     super(ui, 'Road', true);
@@ -114,24 +113,6 @@ class SegmentInspector extends Inspector {
     history.hint(label, `${key}:${this.id}`);
     net.batch(() => {
       for (const id of this.targets()) net.setSegmentOverrides(id, patch(id));
-    });
-  }
-
-  /**
-   * Patch one lane along the road. Pieces drawn the other way number their lanes
-   * from the other side, so the lane is matched by where it is.
-   */
-  private lanePatch(label: string, key: string, index: number, patch: (id: Id, lane: number) => SegmentOverrides): void {
-    const { net, history } = this.ui;
-    const pieces = this.whole ? connectedRoadOriented(net, this.id) : [{ id: this.id, flipped: false }];
-    history.hint(label, `${key}:${this.id}:${index}`);
-    net.batch(() => {
-      for (const { id, flipped } of pieces) {
-        const seg = net.getSegment(id)!;
-        const lanes = effectiveLanes(net.roadTypeOf(id), seg.overrides);
-        const lane = flipped ? mirroredLane(lanes, index) : index;
-        if (lane >= 0) net.setSegmentOverrides(id, patch(id, lane));
-      }
     });
   }
 
@@ -184,6 +165,12 @@ class SegmentInspector extends Inspector {
       }), 'Apply changes along connected roads of this type'),
     );
 
+    // Ends attached to chosen lanes of another road, and the lanes they use.
+    for (const a of attachSummaries(net, this.id)) {
+      body.append(el('div', { class: 'section-title', text: `${a.kind} at the ${a.end}` }));
+      for (const text of a.links.length ? a.links : ['No lanes connect here']) body.append(el('div', { class: 'field-label', text }));
+    }
+
     const line = (label: string, style: 'centerLine' | 'laneLine' | 'edgeLine', color: 'centerColor' | 'laneColor' | 'edgeColor') =>
       el(
         'div',
@@ -228,55 +215,17 @@ class SegmentInspector extends Inspector {
       body.append(el('div', { class: 'section-title', text: 'Lane boundaries, left to right' }), boundaries);
     }
 
-    const laneRows = el('div', {});
-    lanes.forEach((lane, i) => {
-      const own = seg.overrides.laneSpeeds?.[i];
-      const speedBox = numberInput(laneSpeedKmh(def, seg.overrides, i), { min: 5, max: 160, step: 5 }, (v) => {
-        if (!(v >= 5 && v <= 160)) return;
-        this.lanePatch('Change lane speed', 'lanespeed', i, (id, lane2) => ({
-          laneSpeeds: { ...net.getSegment(id)!.overrides.laneSpeeds, [lane2]: v },
-        }));
-      });
-      laneRows.append(
-        el(
-          'div',
-          { class: 'field', style: { gridTemplateColumns: '58px 1fr 62px 22px' } },
-          el('span', { class: 'field-label', text: `Lane ${i + 1} ${lane.dir === 1 ? '\u2191' : '\u2193'}` }),
-          selectInput(LANE_KINDS, lane.kind === 'rail' ? 'drive' : lane.kind, (v) => {
-            this.lanePatch('Change lane use', 'lanekind', i, (id, lane2) => {
-              const other = net.getSegment(id)!;
-              const next = { ...(other.overrides.laneKinds ?? {}) };
-              if (v === net.roadTypeOf(id).lanes[lane2]?.kind) delete next[lane2];
-              else next[lane2] = v;
-              return { laneKinds: Object.keys(next).length ? next : undefined };
-            });
-            this.render();
-          }),
-          speedBox,
-          own === undefined
-            ? el('span', { class: 'small muted', text: 'km/h', style: { fontSize: '10px' } })
-            : el('button', {
-                class: 'icon-btn',
-                text: 'x',
-                tip: 'Back to the road speed',
-                attrs: { type: 'button' },
-                style: { minWidth: '22px', height: '22px', padding: '0' },
-                on: {
-                  click: () => {
-                    this.lanePatch('Change lane speed', 'lanespeed', i, (id, lane2) => {
-                      const next = { ...(net.getSegment(id)!.overrides.laneSpeeds ?? {}) };
-                      delete next[lane2];
-                      return { laneSpeeds: Object.keys(next).length ? next : undefined };
-                    });
-                    this.render();
-                  },
-                },
-              }),
-        ),
+    if (def.category !== 'rail') {
+      // The cross section, edited by dragging, kept across re-renders so edits wait for Apply.
+      this.lanes ??= new RoadLaneEditor(this.ui, this.id, () => this.whole);
+      this.lanes.sync();
+      body.append(
+        el('div', { class: 'section-title', text: 'Lanes', tip: 'Drag lanes, the median and sidewalks to rearrange the road, then Apply' }),
+        this.lanes.el,
       );
-    });
-    body.append(el('div', { class: 'section-title', text: 'Lanes: use and speed' }), laneRows);
+    }
     body.append(structureSection(this.ui, this.id, () => this.whole, () => this.render()));
+    body.append(upgradeSection(this.ui, this.id, () => this.whole, () => this.render()));
 
     const reverse = el('button', {
       class: 'btn',
@@ -354,7 +303,12 @@ class SegmentInspector extends Inspector {
   refresh(): boolean {
     if (!this.ui.net.getSegment(this.id)) return false;
     if (!this.editing) this.render();
+    else this.lanes?.sync();
     return true;
+  }
+
+  protected dispose(): void {
+    this.lanes?.dispose();
   }
 }
 
@@ -601,7 +555,7 @@ class NodeMarkingInspector extends Inspector {
 
   protected closed(): void {
     this.dispose();
-    if (this.ui.tools.active.id === 'nodeMarkings') this.ui.tools.setTool('select');
+    // Closing the floating markings panel leaves the Markings tool's junction, not the tool.
     super.closed();
   }
 }

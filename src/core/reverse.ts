@@ -107,7 +107,7 @@ export function flipPaintOn(ref: RoadPaintRef, id: Id): boolean {
   if (!ref.pieces.some((p) => p.segmentId === id)) return false;
   // A stamp has no walking direction, so its measures flip with the segment.
   const stamp = ref.pieces.length === 1 && ref.pieces[0].t0 === ref.pieces[0].t1;
-  ref.pieces = ref.pieces.map((p) => (p.segmentId === id ? { segmentId: id, t0: flipT(p.t0), t1: flipT(p.t1) } : p));
+  ref.pieces = ref.pieces.map((p) => (p.segmentId === id ? { ...p, segmentId: id, t0: flipT(p.t0), t1: flipT(p.t1) } : p));
   if (stamp) {
     ref.offset = -ref.offset;
     if (ref.offset2 !== undefined) ref.offset2 = -ref.offset2;

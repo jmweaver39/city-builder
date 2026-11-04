@@ -97,10 +97,13 @@ class Field {
 }
 
 /**
- * Round stones on a jittered grid of c by c cells per tile. Each cell holds at
- * most one stone: centre, radius (in cells), height and tone.
+ * Crushed stones on a jittered grid of c by c cells per tile. Each cell holds at
+ * most one stone, an irregular hexagon (three facet directions, each with its own
+ * reach) blended toward a disc for the rounder ones. Stones may reach into the
+ * next cell, so neighbours overlap and pack like real aggregate.
  */
 class Stones {
+  readonly c: number;
   readonly cx: Float32Array;
   readonly cy: Float32Array;
   /** Radius in cells, 0 for an empty cell. */
@@ -108,7 +111,11 @@ class Stones {
   readonly h: Float32Array;
   readonly tone: Float32Array;
   readonly rough: Float32Array;
-  readonly c: number;
+  /** First facet direction, and the inverse reach of each of the three facets. */
+  private readonly dx: Float32Array;
+  private readonly dy: Float32Array;
+  private readonly f: Float32Array;
+  private readonly round: Float32Array;
   constructor(
     c: number,
     presence: number,
@@ -128,26 +135,38 @@ class Stones {
     this.h = new Float32Array(n);
     this.tone = new Float32Array(n);
     this.rough = new Float32Array(n);
+    this.dx = new Float32Array(n);
+    this.dy = new Float32Array(n);
+    this.f = new Float32Array(n * 3);
+    this.round = new Float32Array(n);
     for (let y = 0; y < c; y++) {
       for (let x = 0; x < c; x++) {
         const i = x + y * c;
         if (hash(x, y, seed) >= presence) continue;
-        const r = rMin + (rMax - rMin) * hash(x, y, seed + 1);
-        // Keep the stone inside a reach of one cell, so a 3 by 3 search finds it.
-        const slack = Math.max(0, 1 - 2 * r);
-        this.cx[i] = 0.5 + (hash(x, y, seed + 2) - 0.5) * slack;
-        this.cy[i] = 0.5 + (hash(x, y, seed + 3) - 0.5) * slack;
+        // Radius under one cell, so the 3 by 3 search always finds the stone.
+        const r = Math.min(0.95, rMin + (rMax - rMin) * hash(x, y, seed + 1));
+        this.cx[i] = hash(x, y, seed + 2);
+        this.cy[i] = hash(x, y, seed + 3);
         this.r[i] = r;
         this.h[i] = hMin + (hMax - hMin) * hash(x, y, seed + 4);
         this.tone[i] = tone(hash(x, y, seed + 5));
         this.rough[i] = rough(hash(x, y, seed + 6));
+        let ax = hash(x, y, seed + 7) - 0.5;
+        let ay = hash(x, y, seed + 8) - 0.5;
+        const al = Math.sqrt(ax * ax + ay * ay) || 1;
+        ax /= al;
+        ay /= al;
+        this.dx[i] = ax;
+        this.dy[i] = ay;
+        for (let k = 0; k < 3; k++) this.f[i * 3 + k] = 1 / (0.72 + 0.4 * hash(x, y, seed + 9 + k));
+        this.round[i] = hash(x, y, seed + 12) * hash(x, y, seed + 13);
       }
     }
   }
 
   /**
-   * The highest stone covering (u, v), as its dome height, or -1 for none.
-   * Writes the stone's index and its normalised distance from the centre into out.
+   * The highest stone covering (u, v), as its height, or -1 for none. Writes the
+   * stone's index and its normalised distance from the centre (1 at the edge) into out.
    */
   sample(u: number, v: number, out: { i: number; d: number }): number {
     const c = this.c;
@@ -156,24 +175,37 @@ class Stones {
     const xi = Math.floor(gx);
     const yi = Math.floor(gy);
     let best = -1;
-    for (let dy = -1; dy <= 1; dy++) {
-      const cyi = yi + dy;
+    // 60 and 120 degree turns of the first facet direction.
+    const C = 0.5;
+    const S = 0.8660254;
+    for (let oy = -1; oy <= 1; oy++) {
+      const cyi = yi + oy;
       const row = (((cyi % c) + c) % c) * c;
-      for (let dx = -1; dx <= 1; dx++) {
-        const cxi = xi + dx;
+      for (let ox = -1; ox <= 1; ox++) {
+        const cxi = xi + ox;
         const i = (((cxi % c) + c) % c) + row;
         const r = this.r[i];
         if (r === 0) continue;
-        const px = gx - (cxi + this.cx[i]);
-        const py = gy - (cyi + this.cy[i]);
-        const d2 = (px * px + py * py) / (r * r);
-        if (d2 >= 1) continue;
-        // Flattened dome: worn tops, steep sides.
+        const px = (gx - (cxi + this.cx[i])) / r;
+        const py = (gy - (cyi + this.cy[i])) / r;
+        const circ = px * px + py * py;
+        if (circ >= 1.8) continue;
+        const ax = this.dx[i];
+        const ay = this.dy[i];
+        const p0 = Math.abs(px * ax + py * ay) * this.f[i * 3];
+        const p1 = Math.abs(px * (ax * C - ay * S) + py * (ax * S + ay * C)) * this.f[i * 3 + 1];
+        const p2 = Math.abs(px * (ax * C + ay * S) + py * (ay * C - ax * S)) * this.f[i * 3 + 2];
+        const poly = Math.max(p0, p1, p2);
+        const rd = this.round[i];
+        const d = poly * (1 - rd) + Math.sqrt(circ) * rd;
+        if (d >= 1) continue;
+        // Worn flat top, steep sides.
+        const d2 = d * d;
         const dome = this.h[i] * Math.sqrt(1 - d2 * d2);
         if (dome > best) {
           best = dome;
           out.i = i;
-          out.d = Math.sqrt(d2);
+          out.d = d;
         }
       }
     }
@@ -201,10 +233,10 @@ interface Recipe {
 function asphaltRecipe(seed: number): Recipe {
   // Coarse aggregate about 12 mm, then 4 mm grit, in a dark bitumen binder.
   const big = new Stones(
-    320,
-    0.66,
-    0.3,
-    0.48,
+    260,
+    0.74,
+    0.32,
+    0.68,
     0.6,
     1,
     (k) => (k < 0.68 ? 0.55 + k * 0.3 : k < 0.9 ? 0.3 + (k - 0.68) * 0.6 : 0.82 + (k - 0.9) * 1.2),
@@ -212,10 +244,10 @@ function asphaltRecipe(seed: number): Recipe {
     seed * 101 + 1,
   );
   const grit = new Stones(
-    900,
-    0.72,
-    0.3,
-    0.5,
+    700,
+    0.78,
+    0.35,
+    0.8,
     0.22,
     0.42,
     (k) => 0.38 + 0.34 * k,
@@ -263,9 +295,9 @@ function concreteRecipe(seed: number): Recipe {
   // Fine sand in pale cement paste, an occasional exposed stone, small air pores.
   const sand = new Stones(
     1400,
-    0.52,
-    0.3,
-    0.46,
+    0.55,
+    0.35,
+    0.7,
     0.25,
     0.4,
     (k) => 0.5 + 0.32 * k,
@@ -275,22 +307,22 @@ function concreteRecipe(seed: number): Recipe {
   const stone = new Stones(
     260,
     0.12,
-    0.3,
-    0.45,
+    0.35,
+    0.7,
     0.35,
     0.55,
-    (k) => 0.42 + 0.3 * k,
+    (k) => 0.5 + 0.2 * k,
     (k) => 0.7 + 0.15 * k,
     seed * 211 + 9,
   );
   const pores = new Stones(
     150,
-    0.22,
+    0.1,
     0.05,
-    0.16,
-    0.6,
-    1,
-    (k) => 0.3 + 0.15 * k,
+    0.14,
+    0.5,
+    0.9,
+    (k) => 0.44 + 0.08 * k,
     () => 0.95,
     seed * 211 + 13,
   );
@@ -324,7 +356,7 @@ function concreteRecipe(seed: number): Recipe {
       const p = pores.sample(u, v, hit);
       if (p > 0) {
         h -= p;
-        albedo = pores.tone[hit.i];
+        albedo = albedo * 0.4 + pores.tone[hit.i] * 0.6;
         rough = 0.95;
       }
       out.h = h;
@@ -338,11 +370,22 @@ function recipeFor(kind: RoadTexKind, seed: number): Recipe {
   return kind === 'asphalt' ? asphaltRecipe(seed) : concreteRecipe(seed);
 }
 
-/**
- * Generate one texture. size must be a power of two. Calls onRows after each band
- * of rows when given, so a caller can spread the work or report progress.
- */
-export function generateRoadTexture(kind: RoadTexKind, size: number, seed = 1, onRows?: (done: number, total: number) => void): Uint8Array {
+/** A texture being generated, a band of rows at a time. */
+export interface RoadTextureJob {
+  readonly kind: RoadTexKind;
+  readonly size: number;
+  readonly seed: number;
+  /** RGBA8, complete once done. */
+  readonly data: Uint8Array;
+  /** Rows finished, 0 to size. */
+  readonly rows: number;
+  readonly done: boolean;
+  /** Work for about this many milliseconds (at least one row). Returns done. */
+  step(budgetMs?: number): boolean;
+}
+
+/** Start generating one texture. size must be a power of two. */
+export function createRoadTextureJob(kind: RoadTexKind, size: number, seed = 1): RoadTextureJob {
   const N = size;
   const rec = recipeFor(kind, seed);
   const s: Sample = { h: 0, albedo: 0, rough: 0 };
@@ -362,7 +405,7 @@ export function generateRoadTexture(kind: RoadTexKind, size: number, seed = 1, o
   const gain = rec.contrast / std;
 
   const out = new Uint8Array(N * N * 4);
-  // Three rows of height in a ring, so memory stays small at 4096.
+  // Three rows in a ring, so memory stays small at 4096.
   const hRows = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
   const aRows = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
   const rRows = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
@@ -379,18 +422,17 @@ export function generateRoadTexture(kind: RoadTexKind, size: number, seed = 1, o
       rr[x] = s.rough;
     }
   };
+  // Row y lives in slot (y + 1) % 3.
   fill(-1, 0);
   fill(0, 1);
   // Slope per unit of height difference across two texels.
   const k = rec.heightScale / ((2 * rec.tile) / N);
-  const band = Math.max(1, Math.floor(65536 / N));
-  for (let y = 0; y < N; y++) {
-    // Slots rotate: row y lives in slot (y + 1) % 3.
-    const sp = y % 3;
+  let y = 0;
+  const row = () => {
+    const hp = hRows[y % 3];
     const sc = (y + 1) % 3;
     const sn = (y + 2) % 3;
     fill(y + 1, sn);
-    const hp = hRows[sp];
     const hc = hRows[sc];
     const hn = hRows[sn];
     const aRow = aRows[sc];
@@ -404,17 +446,43 @@ export function generateRoadTexture(kind: RoadTexKind, size: number, seed = 1, o
       const l = 1 / Math.sqrt(nx * nx + ny * ny + 1);
       nx *= l;
       ny *= l;
-      const a = 0.5 + (aRow[x] - mean) * gain;
       const i = o + x * 4;
-      out[i] = clamp255(a * 255);
+      out[i] = clamp255((0.5 + (aRow[x] - mean) * gain) * 255);
       out[i + 1] = clamp255((nx * 0.5 + 0.5) * 255);
       out[i + 2] = clamp255((ny * 0.5 + 0.5) * 255);
       out[i + 3] = clamp255(rRow[x] * 255);
     }
-    if (onRows && (y + 1) % band === 0) onRows(y + 1, N);
-  }
-  onRows?.(N, N);
-  return out;
+    y++;
+  };
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  return {
+    kind,
+    size,
+    seed,
+    data: out,
+    get rows() {
+      return y;
+    },
+    get done() {
+      return y >= N;
+    },
+    step(budgetMs = Infinity) {
+      const t0 = now();
+      while (y < N) {
+        row();
+        // Check the clock every few rows only.
+        if ((y & 7) === 0 && now() - t0 >= budgetMs) break;
+      }
+      return y >= N;
+    },
+  };
+}
+
+/** Generate one texture in one go. size must be a power of two. */
+export function generateRoadTexture(kind: RoadTexKind, size: number, seed = 1): Uint8Array {
+  const job = createRoadTextureJob(kind, size, seed);
+  job.step();
+  return job.data;
 }
 
 function clamp255(v: number): number {

@@ -3,8 +3,8 @@
  * the core does not keep: a speed profile along each lane and merge groupings.
  * Rebuilt on every graph version. Immutable after that.
  */
-import type { Id, LaneGraph, RoadNetwork, TurnKind } from '../core';
-import { sweepConflicts, type SweepCache, type SweepHit } from './sweep';
+import type { GLane, Id, LaneGraph, RoadNetwork, TurnKind } from '../core';
+import { sweepConflicts, type SweepCache, type SweepHit, type SweptStop } from './sweep';
 import { sharedStretches } from './proximity';
 import {
   CONNECTOR_CHORD,
@@ -16,21 +16,83 @@ import {
   ROAD_CHORD,
 } from './constants';
 
+/** Point at distance `d` back from the end of a lane, into out. */
+function backFromEnd(l: GLane, d: number, out: { x: number; z: number }): void {
+  const s = Math.max(0, l.length - d);
+  const { cum, pts } = l;
+  let i = cum.length - 2;
+  while (i > 0 && cum[i] > s) i--;
+  const span = cum[i + 1] - cum[i];
+  const f = span > 0 ? Math.min(1, Math.max(0, (s - cum[i]) / span)) : 0;
+  out.x = pts[i * 3] + (pts[i * 3 + 3] - pts[i * 3]) * f;
+  out.z = pts[i * 3 + 2] + (pts[i * 3 + 5] - pts[i * 3 + 2]) * f;
+}
+
+/** How far back from their shared end two lanes stay within `gap` of each other. */
+function closeFromEnd(a: GLane, b: GLane, gap: number): number {
+  const limit = Math.min(a.length, b.length, 300);
+  const pa = { x: 0, z: 0 };
+  const pb = { x: 0, z: 0 };
+  for (let d = 1; d <= limit; d += 1) {
+    backFromEnd(a, d, pa);
+    backFromEnd(b, d, pb);
+    if (Math.hypot(pa.x - pb.x, pa.z - pb.z) >= gap) return d;
+  }
+  return limit;
+}
+
 export const KIND_CROSS = 0;
 export const KIND_MERGE = 1;
 export const KIND_DIVERGE = 2;
-/** A long body swings over this path though the centrelines never meet. See sweep.ts. */
+/** A long body on this path swings over the other though the centrelines never meet. See sweep.ts. */
 export const KIND_SWEEP = 3;
 /** Bodies of any size touch here though the centrelines do not cross. */
 export const KIND_NEAR = 4;
+/** Two long bodies, one on each path, touch here. */
+export const KIND_SWEEP_PAIR = 5;
+/** A long body on the other path swings over this one. */
+export const KIND_SWEEP_THEIRS = 6;
+
+/** Is this one of the swept-path kinds, which are about bodies, not right of way? */
+export function isSweep(kind: number): boolean {
+  return kind === KIND_SWEEP || kind === KIND_SWEEP_THEIRS || kind === KIND_SWEEP_PAIR;
+}
+
+/**
+ * Does a conflict of this kind matter between a body of length `mine` on this path and
+ * one of length `theirs` on the other? A swept path matters only to the body that
+ * sweeps it; every other kind always matters.
+ */
+export function sweepApplies(kind: number, mine: number, theirs: number, long: number): boolean {
+  if (kind === KIND_SWEEP) return mine >= long;
+  if (kind === KIND_SWEEP_THEIRS) return theirs >= long;
+  if (kind === KIND_SWEEP_PAIR) return mine >= long && theirs >= long;
+  return true;
+}
 
 export const ALLOW_CAR = 1;
 export const ALLOW_BUS = 2;
 export const ALLOW_BIKE = 4;
+export const ALLOW_VAN = 8;
+export const ALLOW_TRUCK = 16;
+/** Every class a general traffic lane takes. */
+export const ALLOW_MOTOR = ALLOW_CAR | ALLOW_VAN | ALLOW_TRUCK | ALLOW_BUS;
+
+/** Allow bit of each vehicle class, indexed like VEHICLE_TYPES. */
+export const TYPE_BITS: readonly number[] = [ALLOW_CAR, ALLOW_VAN, ALLOW_TRUCK, ALLOW_BUS, ALLOW_BIKE];
+
+const CLASS_BITS: Record<string, number> = { car: ALLOW_CAR, van: ALLOW_VAN, truck: ALLOW_TRUCK, bus: ALLOW_BUS, bike: ALLOW_BIKE };
+
+/** Bits of the classes a lane is closed to (SegmentOverrides.laneBans). */
+function banBits(list: readonly string[] | undefined): number {
+  let bits = 0;
+  for (const c of list ?? []) bits |= CLASS_BITS[c] ?? 0;
+  return bits;
+}
 
 /** Who may use a lane of this kind. Anything else, such as rail, is closed to road traffic. */
 function allowOf(kind: string): number {
-  if (kind === 'drive') return ALLOW_CAR | ALLOW_BUS;
+  if (kind === 'drive') return ALLOW_MOTOR;
   if (kind === 'bus') return ALLOW_BUS;
   if (kind === 'bike') return ALLOW_BIKE;
   return 0;
@@ -84,6 +146,10 @@ export interface CompiledGraph {
   lastCross: Float64Array;
   /** How far before the end of a lane to wait, clear of long bodies turning past. */
   setback: Float64Array;
+  /** Per connector: road lanes of other arms whose last `sweptDepth` metres its long body swings over. */
+  sweptStart: Int32Array;
+  sweptLane: Int32Array;
+  sweptDepth: Float64Array;
   /** Where a connector first comes within a lane of another bound for the same exit. */
   mergeFrom: Float64Array;
   /** Geometry, flattened. */
@@ -236,7 +302,24 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
   const lanes = graph.lanes;
   const n = lanes.length;
   const setback = new Float64Array(n);
-  const extra = sweepConflicts(graph, sweepCache, setback);
+  const swept = new Map<number, SweptStop[]>();
+  const extra = sweepConflicts(graph, sweepCache, setback, swept);
+  const sweptStart = new Int32Array(n + 1);
+  let sweptTotal = 0;
+  for (let i = 0; i < n; i++) {
+    sweptStart[i] = sweptTotal;
+    sweptTotal += swept.get(i)?.length ?? 0;
+  }
+  sweptStart[n] = sweptTotal;
+  const sweptLane = new Int32Array(sweptTotal);
+  const sweptDepth = new Float64Array(sweptTotal);
+  for (const [c, list] of swept) {
+    let k = sweptStart[c];
+    for (const r of list) {
+      sweptLane[k] = r.lane;
+      sweptDepth[k++] = r.depth;
+    }
+  }
 
   const len = new Float64Array(n);
   const speed = new Float64Array(n);
@@ -303,8 +386,11 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
     speed[i] = Math.max(connector ? Math.min(lanes[l.fromLane].speed, lanes[l.toLane].speed) : l.speed, 1);
     isConn[i] = l.kind === 'connector' ? 1 : 0;
     allow[i] = allowOf(l.vehicleKind);
-    // A connector is no use to a class that cannot use both of the lanes it joins.
-    if (connector) allow[i] &= allowOf(lanes[l.fromLane].vehicleKind) & allowOf(lanes[l.toLane].vehicleKind);
+    // Vehicle restrictions: classes banned from this road lane (core/trafficRules.ts).
+    if (!connector) {
+      const bans = net.getSegment(l.segmentId)?.overrides.laneBans?.[l.laneIndex];
+      if (bans) allow[i] &= ~banBits(bans);
+    }
     left[i] = l.left;
     right[i] = l.right;
     fromLane[i] = l.fromLane;
@@ -338,7 +424,7 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
       confLane[k] = c.lane;
       confSelf[k] = c.selfS;
       confOther[k] = c.otherS;
-      confKind[k++] = c.all ? KIND_NEAR : KIND_SWEEP;
+      confKind[k++] = c.all ? KIND_NEAR : c.pair ? KIND_SWEEP_PAIR : c.own === false ? KIND_SWEEP_THEIRS : KIND_SWEEP;
       if (c.all && c.selfS > lastCross[i]) lastCross[i] = c.selfS;
     }
     pts.set(l.pts, ptStart[i] * 3);
@@ -351,6 +437,8 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
     }
   }
   profStart[n] = profile.length;
+  // A connector is no use to a class that cannot use both of the lanes it joins, bans included.
+  for (let i = 0; i < n; i++) if (isConn[i]) allow[i] &= allow[fromLane[i]] & allow[toLane[i]];
 
   const shared = sharedStretches(graph);
   const shareStart = new Int32Array(n + 1);
@@ -381,7 +469,24 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
     if (isConn[i]) continue;
     let feeders = 0;
     for (let k = prevStart[i]; k < prevStart[i + 1]; k++) if (isConn[prevList[k]]) feeders++;
-    if (feeders >= 2) merges.push(i);
+    // An edge merge (core/edgeMerge.ts): a ramp's connector joins a lane the highway runs
+    // straight into, so the road lane before it is a feeder to order against too.
+    const total = prevStart[i + 1] - prevStart[i];
+    if (feeders >= 2 || (feeders >= 1 && total >= 2)) merges.push(i);
+    if (feeders >= 1 && total > feeders) {
+      // The merge zone starts where the ramp's path comes within a lane of the highway lane's.
+      for (let k = prevStart[i]; k < prevStart[i + 1]; k++) {
+        const c = prevList[k];
+        if (!isConn[c]) continue;
+        for (let q = prevStart[i]; q < prevStart[i + 1]; q++) {
+          const r = prevList[q];
+          if (isConn[r]) continue;
+          const zone = closeFromEnd(lanes[c], lanes[r], (lanes[c].width + lanes[r].width) / 2);
+          if (len[c] - zone < mergeFrom[c]) mergeFrom[c] = len[c] - zone;
+          if (len[r] - zone < mergeFrom[r]) mergeFrom[r] = len[r] - zone;
+        }
+      }
+    }
   }
 
   return {
@@ -412,6 +517,9 @@ export function compileGraph(net: RoadNetwork, sweepCache: SweepCache = new Map(
     coreCross,
     turnAngle,
     setback,
+    sweptStart,
+    sweptLane,
+    sweptDepth,
     mergeFrom,
     ptStart,
     pts,

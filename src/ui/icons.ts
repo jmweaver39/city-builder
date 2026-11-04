@@ -77,6 +77,9 @@ export const ICONS = {
   markStop: svg('<path d="M3 12h18" stroke-width="3.2"/><path d="M8 18v-3M12 18v-3M16 18v-3"/>'),
   markArea: svg('<path d="M4 18 7 5l11 2 2 11z"/><path d="M6 13l6-7M8 18l9-10M13 18l6-7"/>'),
   markErase: svg('<path d="M15 4l5 5-9 9H6l-2-2z"/><path d="M10 9l5 5M6 18h14"/>'),
+  markStamp: svg('<path d="M12 20V9M8 12l4-5 4 5"/><path d="M5 4h14"/>'),
+  caret: svg('<path d="M7 10l5 5 5-5"/>', 14),
+  panelRight: svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>'),
   // The seven tools, drawn as map symbols rather than generic glyphs.
   toolBuild: svg('<path d="M3 16 16 3M8 21 21 8"/><path d="M9.5 14.5l1-1M13 11l1-1M16.5 7.5l1-1"/><circle cx="5.5" cy="18.5" r="1.6"/>'),
   toolModify: svg('<path d="M4 3l11 6.5-4.6 1.4-1.9 4.6z"/><rect x="15.5" y="15.5" width="5" height="5" rx=".5"/><path d="M11 11l4.5 4.5"/>'),

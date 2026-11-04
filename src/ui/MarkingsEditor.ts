@@ -14,7 +14,10 @@
  */
 import { autoItemKey, autoMarkingItems, type AutoItem } from '../render/autoItems';
 import { captureTemplate, fitTemplate, isAmbiguous } from '../core/markingTemplates';
-import { FILL_STYLE_INFO, LINE_STYLE_INFO, PAINT_HEX, fillStyleInfo, lineStyleInfo, markingHex } from '../core/markingStyle';
+import { FILL_STYLE_INFO, LINE_STYLE_INFO, PAINT_HEX, fillStyleInfo, lineStyleInfo, markingHex, resolvedStyle } from '../core/markingStyle';
+import { LINE_STANDARDS, matchFillStandard, matchStandard } from '../core/paintStandard';
+import type { SwatchSubject } from '../render/swatch';
+import { swatchElement } from './swatches';
 import { framesOf, lineCrossings } from '../core/nodeMarkings';
 import type {
   Id,
@@ -55,6 +58,7 @@ const DRAW_ICON: Record<MarkingDraw, keyof typeof ICONS> = {
   crosswalk: 'markCrossing',
   stop: 'markStop',
   filler: 'markArea',
+  stamp: 'markStamp',
   erase: 'markErase',
 };
 
@@ -82,9 +86,18 @@ const CHIP: Partial<CSSStyleDeclaration> = { padding: '2px 8px', fontSize: 'var(
 const GROUP: Partial<CSSStyleDeclaration> = { background: 'var(--surface-2)', borderRadius: 'var(--r-md)', padding: '4px 6px', marginBottom: '6px' };
 const BADGE: Partial<CSSStyleDeclaration> = { fontSize: '10px', padding: '0 5px', borderRadius: '8px', background: 'rgba(154,164,178,0.25)', color: 'var(--text-muted, #9aa4b2)', marginLeft: '6px' };
 
+/** The standard name of a marking's look, or its style with "own look". */
 function describe(m: NodeMarking): string {
-  if (m.kind === 'filler') return `${fillStyleInfo(m.fill).label} area`;
-  return `${lineStyleInfo(m.style).label}${m.rules?.length ? `, ${m.rules.length + 1} parts` : ''}`;
+  if (m.kind === 'filler') return matchFillStandard(m)?.name ?? `${fillStyleInfo(m.fill).label} area`;
+  const std = matchStandard(m);
+  return `${std ? std.name : `${lineStyleInfo(m.style).label} (own look)`}${m.rules?.length ? `, ${m.rules.length + 1} parts` : ''}`;
+}
+
+/** What a preview of a look shows. */
+function subjectOf(p: MarkingPreset | { kind: 'line'; style: LineStyleSpec }): SwatchSubject {
+  if (p.kind === 'filler') return { kind: 'area', spec: p.style };
+  const fam = lineStyleInfo(p.style.style).family;
+  return fam === 'crosswalk' || fam === 'stop' || fam === 'teeth' ? { kind: 'crossing', spec: p.style } : { kind: 'line', spec: p.style };
 }
 
 export class MarkingsEditor {
@@ -93,7 +106,13 @@ export class MarkingsEditor {
   private presetName = '';
   private offLib: () => void;
 
-  constructor(private readonly ui: UiContext, private readonly host: MarkingHost, private readonly root: HTMLElement) {
+  constructor(
+    private readonly ui: UiContext,
+    private readonly host: MarkingHost,
+    private readonly root: HTMLElement,
+    /** Compact: the Markings strip already has the draw tools and the standards. */
+    private readonly opts: { compact?: boolean } = {},
+  ) {
     const tool = this.tool;
     if (!tool.clipboard) tool.clipboard = storedClipboard();
     tool.onClipboard = (tpl) => storeClipboard(tpl);
@@ -168,7 +187,8 @@ export class MarkingsEditor {
     this.shown = this.key();
     const body = this.root;
     clear(body);
-    body.append(this.drawRow(), this.presetRow(), this.selectedSection(), this.listSection());
+    if (!this.opts.compact) body.append(this.drawRow(), this.presetRow());
+    body.append(this.selectedSection(), this.listSection());
     if (this.nodeId !== null) body.append(this.takenAwaySection());
     body.append(this.pointsSection(), this.templateSection(), this.footer());
   }
@@ -183,7 +203,7 @@ export class MarkingsEditor {
       'div',
       { class: 'mode-row markings-draw', attrs: { role: 'radiogroup', 'aria-label': 'Draw' } },
       // Icons only; the name, what it does and its key are in the tooltip.
-      ...DRAWS.map((d) =>
+      ...DRAWS.filter((d) => !(tool.freeFlow && (d.value === 'crosswalk' || d.value === 'stop'))).map((d) =>
         el('button', {
           class: `mode-tab ${tool.draw === d.value ? 'active' : ''}`,
           html: ICONS[DRAW_ICON[d.value]],
@@ -201,19 +221,47 @@ export class MarkingsEditor {
     const { net } = this.ui;
     const presets = allPresets(net.markingLibrary.presets ?? []);
     const tool = this.tool;
-    const wrap = el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', margin: '6px 0' } });
-    for (const p of presets) {
-      const chip = this.button(p.name, () => tool.applyPreset(p), { tip: tool.selection.length ? 'Give the selection this look' : 'Draw with this look' });
-      chip.style.borderLeft = `4px solid ${p.kind === 'line' ? markingHex(p.style) : markingHex(p.style)}`;
+    const card = (p: MarkingPreset) => {
+      const tip = `${p.kind === 'line' ? (LINE_STANDARDS.find((s) => `builtin-${s.id}` === p.id)?.tip ?? p.name) : p.name}. ${tool.selection.length ? 'Click to give the selection this look' : 'Click to draw with this look'}`;
+      const b = el(
+        'button',
+        {
+          class: 'btn marking-standard',
+          tip,
+          attrs: { type: 'button', 'aria-label': p.name },
+          dataset: { preset: p.id },
+          style: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px', padding: '3px', width: '76px', flex: '0 0 76px', height: 'auto', minHeight: '58px', whiteSpace: 'normal', overflow: 'hidden', fontSize: '10px', lineHeight: '1.15' },
+          on: { click: () => tool.applyPreset(p) },
+        },
+        // Drawn by the game's renderer with the real paint, not a sketch.
+        swatchElement(this.ui.renderer, subjectOf(p), 68, 34),
+        el('span', { text: p.name, style: { whiteSpace: 'normal', textAlign: 'center' } }),
+      );
       if (!p.id.startsWith('builtin-')) {
-        chip.addEventListener('contextmenu', (e) => {
+        b.addEventListener('contextmenu', (e) => {
           e.preventDefault();
           deletePreset(p.id);
         });
       }
-      wrap.append(chip);
+      return b;
+    };
+    const grid = () => el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', margin: '4px 0 6px' } });
+    const standards = grid();
+    const mine = grid();
+    // A free-flowing junction (highway ramps) offers no crossings or stop lines.
+    const across = (p: MarkingPreset) => p.kind === 'line' && ['crosswalk', 'stop', 'teeth'].includes(lineStyleInfo(p.style.style).family);
+    for (const p of presets) {
+      if (tool.freeFlow && across(p)) continue;
+      (p.id.startsWith('builtin-') ? standards : mine).append(card(p));
     }
-    return el('div', {}, el('div', { class: 'section-title', text: 'Presets' }), wrap);
+    return el(
+      'div',
+      {},
+      el('div', { class: 'section-title', text: 'Standard markings', tip: 'The very looks the roads paint: lane, edge and centre lines, stop lines, crossings' }),
+      standards,
+      mine.childElementCount ? el('div', { class: 'section-title', text: 'My presets' }) : null,
+      mine.childElementCount ? mine : null,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -258,6 +306,8 @@ export class MarkingsEditor {
     if (chosen.length === 1) {
       const m = chosen[0];
       box.append(el('div', { class: 'section-title', text: `Selected: ${describe(m)}` }));
+      const preview = m.kind === 'line' ? subjectOf({ kind: 'line', style: m }) : subjectOf({ id: '', name: '', kind: 'filler', style: m });
+      box.append(el('div', { style: { margin: '2px 0 6px' } }, swatchElement(this.ui.renderer, preview, 150, 40)));
       if (m.kind === 'line') this.lineFields(box, m);
       else this.fillFields(box, m);
       const look = tool.selectedLook();
@@ -318,20 +368,31 @@ export class MarkingsEditor {
   /** Fields of a line look, shared by lines, their parts and the defaults. */
   private styleFields(box: HTMLElement, spec: LineStyleSpec, apply: (patch: Partial<LineStyleSpec>, key: string) => void, withEmpty = false): void {
     const info = lineStyleInfo(spec.style);
+    // Sliders show what is drawn: unset measures as the standard fills them in.
+    const shown = resolvedStyle(spec);
     box.append(
-      row('Style', this.lineStyleSelect(spec.style, (v) => apply({ style: v, ...lineStyleInfo(v).defaults }, 'style'), withEmpty)),
+      // A new style starts as its standard: unset dashes follow the road's speed.
+      row('Style', this.lineStyleSelect(spec.style, (v) => apply({ style: v, dash: undefined, space: undefined, gap: undefined, ...lineStyleInfo(v).defaults }, 'style'), withEmpty)),
       this.colourRow(spec, (patch) => apply(patch, 'colour')),
       row(info.family === 'crosswalk' ? 'Depth' : info.family === 'lane' ? 'Lane width' : info.family === 'teeth' ? 'Tooth length' : 'Width', sliderInput(spec.width, { min: 0.05, max: info.family === 'crosswalk' || info.family === 'lane' ? 8 : 1.5, step: 0.01, format: metres }, (v) => apply({ width: v }, 'width'))),
     );
     const d = info.defaults;
     if (info.uses.includes('dash')) {
       const dashLabel = info.family === 'crosswalk' ? (spec.style === 'crosswalkChessboard' ? 'Square' : 'Stripe') : info.family === 'teeth' ? 'Tooth base' : spec.style === 'zigzag' ? 'Zig length' : 'Dash';
-      box.append(row(dashLabel, sliderInput(spec.dash ?? d.dash ?? 1, { min: 0.1, max: 6, step: 0.05, format: metres }, (v) => apply({ dash: v }, 'dash'))));
+      box.append(row(dashLabel, sliderInput(spec.dash ?? shown.dash, { min: 0.1, max: 6, step: 0.05, format: metres }, (v) => apply({ dash: v }, 'dash'))));
       if (spec.style !== 'zigzag' && spec.style !== 'crosswalkLines' && spec.style !== 'crosswalkChessboard') {
-        box.append(row('Space', sliderInput(spec.space ?? d.space ?? 1, { min: 0, max: 6, step: 0.05, format: metres }, (v) => apply({ space: v }, 'space'))));
+        box.append(row('Space', sliderInput(spec.space ?? shown.space, { min: 0, max: 15, step: 0.05, format: metres }, (v) => apply({ space: v }, 'space'))));
       }
     }
-    if (info.uses.includes('gap')) box.append(row(spec.style === 'zigzag' ? 'Swing' : 'Gap', sliderInput(spec.gap ?? d.gap ?? 0.12, { min: 0.02, max: 2, step: 0.01, format: metres }, (v) => apply({ gap: v }, 'gap'))));
+    if (['double', 'doubleDashed', 'solidDashed', 'dashedSolid'].includes(spec.style)) {
+      // A second line in its own colour, as in a yellow and white pair.
+      const second = { color: spec.color2 ?? spec.color, hex: spec.hex2 ?? (spec.color2 ? undefined : spec.hex) };
+      const r = this.colourRow(second, (patch) => apply({ color2: patch.color ?? spec.color2 ?? spec.color, hex2: patch.hex }, 'colour2'));
+      const label = r.querySelector('.label, label, span');
+      if (label) label.textContent = 'Second line';
+      box.append(r);
+    }
+    if (info.uses.includes('gap')) box.append(row(spec.style === 'zigzag' ? 'Swing' : spec.style === 'crosswalkDashedLines' ? 'Dash' : 'Gap', sliderInput(spec.gap ?? d.gap ?? 0.12, { min: 0.02, max: 2, step: 0.01, format: metres }, (v) => apply({ gap: v }, 'gap'))));
     box.append(row(info.family === 'crosswalk' ? 'Shift along arm' : 'Offset', sliderInput(spec.offset ?? 0, { min: -3, max: 3, step: 0.05, format: metres }, (v) => apply({ offset: v }, 'offset'))));
     if (info.family !== 'crosswalk' && info.family !== 'stop') {
       box.append(row('Sits', selectInput([{ value: 'centre', label: 'Centred on the points' }, { value: 'left', label: 'Left of the points' }, { value: 'right', label: 'Right of the points' }], spec.align ?? 'centre', (v) => apply({ align: v === 'centre' ? undefined : (v as 'left' | 'right') }, 'align'))));
@@ -416,6 +477,7 @@ export class MarkingsEditor {
       );
       if (m.fill !== 'hatch') box.append(row('Angle', sliderInput(m.angle ?? info.defaults.angle ?? 0, { min: -90, max: 90, step: 1, format: degrees }, (v) => tool.update({ angle: v }, 'angle'))));
       box.append(row('Edge line', checkbox(!m.noOutline, (v) => tool.update({ noOutline: v ? undefined : true }, 'outline'))));
+      if (m.fill === 'chevron' || m.fill === 'triangle') box.append(row('Point the other way', checkbox(!!m.invert, (v) => tool.update({ invert: v ? true : undefined }, 'invert'))));
     }
     box.append(row('Inset from edge', sliderInput(m.offset ?? 0, { min: 0, max: 3, step: 0.05, format: metres }, (v) => tool.update({ offset: v || undefined }, 'inset'))));
   }

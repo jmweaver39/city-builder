@@ -5,7 +5,7 @@
  *
  *   Build      draw roads and track: straight, curved, freeform, parallel
  *   Modify     select, move, and sweep changes: upgrade, reverse, electrify, align
- *   Junction   control, roundabout, lanes, shape, markings
+ *   Junction   control, roundabout, lanes, shape, markings, traffic rules
  *   Paint      road paint: lines, areas, arrows, text
  *   Zones      zoning and traffic gateways
  *   Terrain    landscaping and quays
@@ -73,23 +73,23 @@ export const GROUPS: readonly ToolGroup[] = [
     id: 'junction',
     label: 'Junction',
     icon: 'toolJunction',
-    desc: 'Control, roundabouts, lanes, shape and markings',
+    desc: 'Control, roundabouts, lanes, shape, markings and traffic rules',
     binding: 'tool.junction',
     modes: [
       { id: 'control', label: 'Control', icon: 'signalLight', tool: 'junction', desc: 'Lights, signs and priority with one click', binding: 'tool.junction' },
       { id: 'roundabout', label: 'Roundabout', icon: 'roundabout', tool: 'roundabout', desc: 'Build, resize or remove a roundabout', binding: 'tool.roundabout' },
       { id: 'lanes', label: 'Lanes', icon: 'lanes', tool: 'lanes', desc: 'Link lanes through a junction by hand', binding: 'tool.lanes' },
       { id: 'shape', label: 'Shape', icon: 'junctionShape', tool: 'junctionShape', desc: 'Drag kerbs, sidewalks, cut lines and islands', binding: 'tool.junctionShape' },
-      { id: 'markings', label: 'Markings', icon: 'intersections', tool: 'nodeMarkings', desc: 'Paint lines and fillers inside a junction', binding: 'tool.nodeMarkings' },
+      { id: 'rules', label: 'Rules', icon: 'lanes', tool: 'trafficRules', desc: 'Lane arrows, speed limits, vehicle bans, junction rules, priority roads, manual and timed lights', binding: 'tool.trafficRules' },
     ],
   },
   {
     id: 'paint',
-    label: 'Paint',
+    label: 'Markings',
     icon: 'toolPaint',
-    desc: 'Lines, areas, arrows and text on the road',
+    desc: 'Every mark on the road: along roads, at junctions, arrows and text',
     binding: 'tool.paint',
-    modes: [{ id: 'paint', label: 'Paint', icon: 'paint', tool: 'paint', desc: 'Pick a marking, then click on the road', binding: 'tool.paint' }],
+    modes: [{ id: 'markings', label: 'Markings', icon: 'paint', tool: 'paint', desc: 'Over a road it marks along it; over a junction it designs it', binding: 'tool.paint' }],
   },
   {
     id: 'zones',
@@ -142,6 +142,7 @@ export function group(id: GroupId): ToolGroup {
 /** The tool a tool implementation belongs to now. The road tool depends on its draw mode. */
 export function groupOf(tool: string, drawMode: DrawMode): GroupId | null {
   if (tool === 'road') return drawMode === 'upgrade' ? 'modify' : 'build';
+  if (tool === 'nodeMarkings') return 'paint';
   if (tool === 'template') return 'build';
   for (const g of GROUPS) if (g.modes.some((m) => m.tool === tool)) return g.id;
   return null;
@@ -149,6 +150,7 @@ export function groupOf(tool: string, drawMode: DrawMode): GroupId | null {
 
 /** The mode the editor is in, within its tool. */
 export function modeOf(tool: string, drawMode: DrawMode): ToolMode | null {
+  if (tool === 'nodeMarkings') tool = 'paint';
   for (const g of GROUPS) {
     const m = g.modes.find((x) => x.tool === tool && (x.drawMode === undefined || x.drawMode === drawMode));
     if (m) return m;
@@ -209,6 +211,7 @@ export const MIGRATION: readonly [string, string][] = [
   ['Paint tab', 'Paint (P)'],
   ['Traffic tab: gateways and zones', 'Zones (T)'],
   ['Landscaping tab', 'Terrain'],
+  ['Traffic manager features (lane arrows, speed limits, vehicle bans, junction rules, priority roads, manual and timed lights, clear traffic)', 'Junction: Rules mode (Shift+J)'],
   ['Bulldoze button', 'Bulldoze (B)'],
   ['Interchange templates (hidden)', 'Command palette'],
 ];

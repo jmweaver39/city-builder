@@ -6,7 +6,9 @@
  * and the tail still on the approach, a 12 m truck lies diagonally across the road and
  * sweeps over lanes it never crosses. Here that body is walked along each turning
  * connector, and any other connector it reaches is recorded as a conflict that applies
- * when a long vehicle is involved.
+ * when the vehicle on the walked connector is long (KIND_SWEEP on it, KIND_SWEEP_THEIRS
+ * on the other). Two long bodies are also walked against each other (KIND_SWEEP_PAIR),
+ * and each connector records the stop lines of other arms its long body swings over.
  *
  * This is geometry on the scale of a junction, so it is cached per node. GLanes are
  * shared between graph versions while unchanged, which makes identity a safe key.
@@ -45,15 +47,31 @@ export interface SweepHit {
   otherS: number;
   /** True when any two vehicles clash here, false when only a long one makes it so. */
   all: boolean;
+  /** True when only two long vehicles clash here, one on each path. */
+  pair?: boolean;
+  /**
+   * For a long-body hit: true when the long body is on this lane, false when it is on
+   * `lane`. The walk puts a long body on one path and a car-sized one on the other, so a
+   * hit says nothing about a long vehicle on the other path meeting a car on this one.
+   */
+  own?: boolean;
+}
+
+/** A road lane into a node whose last `depth` metres a connector's long body swings over. */
+export interface SweptStop {
+  lane: number;
+  depth: number;
 }
 
 interface NodeSweep {
   lanes: GLane[];
   /** By position in the node's connector list. */
   /** a by position in the node's list; b a dense lane index; road when b is an exit lane. */
-  hits: { a: number; b: number; road: boolean; aS: number; bS: number; all: boolean }[];
+  hits: { a: number; b: number; road: boolean; aS: number; bS: number; all: boolean; pair?: boolean }[];
   /** Road lanes into this node whose stop line a turning long body reaches: how far back to wait. */
   setbacks: Map<number, number>;
+  /** The same for each connector, by position in the node's list: lane to how far back. */
+  reaches: Map<number, number>[];
 }
 
 export type SweepCache = Map<Id, NodeSweep>;
@@ -95,9 +113,126 @@ function computeNode(graph: LaneGraph, ids: number[]): NodeSweep {
   const lanes = ids.map((i) => graph.lanes[i]);
   const hits: NodeSweep['hits'] = [];
   const setbacks = new Map<number, number>();
-  sweepBody(graph, ids, lanes, CAR, hits, setbacks);
-  sweepBody(graph, ids, lanes, LONG, hits, setbacks);
-  return { lanes, hits, setbacks };
+  const reaches = lanes.map(() => new Map<number, number>());
+  sweepBody(graph, ids, lanes, CAR, hits, setbacks, reaches);
+  sweepBody(graph, ids, lanes, LONG, hits, setbacks, reaches);
+  sweepPairs(graph, ids, lanes, hits);
+  return { lanes, hits, setbacks, reaches };
+}
+
+/**
+ * Two long bodies, both on the move through a turn, need more room than a long body and
+ * a car: neither lies on its centreline, so the walk below, which measures a long body
+ * against the other path's centreline with a car's half width beside it, passes two
+ * trucks that meet corner to corner. Here both bodies are walked, each as the chord from
+ * nose to tail, and every pair of positions closer than two long half widths and a margin
+ * is a conflict that applies only when both vehicles are long.
+ */
+const PAIR_CLEARANCE = 2.7;
+const PAIR_STEP = 1;
+
+interface Chords {
+  s: Float64Array;
+  fx: Float64Array;
+  fz: Float64Array;
+  rx: Float64Array;
+  rz: Float64Array;
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+}
+
+/** A long body's chord at each nose position along a connector and on into its exit. */
+function chordsOf(graph: LaneGraph, c: GLane): Chords {
+  const from = graph.lanes[c.fromLane];
+  const exit = graph.lanes[c.toLane];
+  const reach = c.length + Math.min(LONG.length, exit.length);
+  const count = Math.max(2, Math.ceil(reach / PAIR_STEP) + 1);
+  const out: Chords = {
+    s: new Float64Array(count),
+    fx: new Float64Array(count),
+    fz: new Float64Array(count),
+    rx: new Float64Array(count),
+    rz: new Float64Array(count),
+    minX: Infinity,
+    maxX: -Infinity,
+    minZ: Infinity,
+    maxZ: -Infinity,
+  };
+  const p = { x: 0, z: 0 };
+  for (let i = 0; i < count; i++) {
+    const s = (reach * i) / (count - 1);
+    if (s <= c.length) pointAt(c, s, p);
+    else pointAt(exit, s - c.length, p);
+    out.s[i] = s;
+    out.fx[i] = p.x;
+    out.fz[i] = p.z;
+    const back = s - LONG.length;
+    if (back >= 0) pointAt(c, back, p);
+    else pointAt(from, Math.max(0, from.length + back), p);
+    out.rx[i] = p.x;
+    out.rz[i] = p.z;
+    out.minX = Math.min(out.minX, out.fx[i], p.x);
+    out.maxX = Math.max(out.maxX, out.fx[i], p.x);
+    out.minZ = Math.min(out.minZ, out.fz[i], p.z);
+    out.maxZ = Math.max(out.maxZ, out.fz[i], p.z);
+  }
+  return out;
+}
+
+/** Closest distance between segments ab and cd in the plane. */
+function segmentDistance(ax: number, az: number, bx: number, bz: number, cx: number, cz: number, dx: number, dz: number): number {
+  const ex = bx - ax;
+  const ez = bz - az;
+  const fx = dx - cx;
+  const fz = dz - cz;
+  const den = ex * fz - ez * fx;
+  if (den !== 0) {
+    const t = ((cx - ax) * fz - (cz - az) * fx) / den;
+    const u = ((cx - ax) * ez - (cz - az) * ex) / den;
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) return 0;
+  }
+  return Math.min(
+    distanceToSegment(ax, az, cx, cz, dx, dz),
+    distanceToSegment(bx, bz, cx, cz, dx, dz),
+    distanceToSegment(cx, cz, ax, az, bx, bz),
+    distanceToSegment(dx, dz, ax, az, bx, bz),
+  );
+}
+
+function sweepPairs(graph: LaneGraph, ids: number[], lanes: GLane[], hits: NodeSweep['hits']): void {
+  const chords = lanes.map((c) => (c.vehicleKind === 'bike' ? null : chordsOf(graph, c)));
+  const bucket = Math.max(LONG.length, 8);
+  for (let a = 0; a < lanes.length; a++) {
+    const A = chords[a];
+    if (!A) continue;
+    for (let b = a + 1; b < lanes.length; b++) {
+      const B = chords[b];
+      if (!B) continue;
+      // One behind the other from one lane, or into one: following and merging order them.
+      if (lanes[a].fromLane === lanes[b].fromLane || lanes[a].toLane === lanes[b].toLane) continue;
+      if (A.minX - PAIR_CLEARANCE > B.maxX || B.minX - PAIR_CLEARANCE > A.maxX) continue;
+      if (A.minZ - PAIR_CLEARANCE > B.maxZ || B.minZ - PAIR_CLEARANCE > A.maxZ) continue;
+      const zones = new Map<number, { aS: number; bS: number }>();
+      for (let i = 0; i < A.s.length; i++) {
+        for (let j = 0; j < B.s.length; j++) {
+          const d = segmentDistance(A.fx[i], A.fz[i], A.rx[i], A.rz[i], B.fx[j], B.fz[j], B.rx[j], B.rz[j]);
+          if (d >= PAIR_CLEARANCE) continue;
+          const key = Math.floor(A.s[i] / bucket) * 4096 + Math.floor(B.s[j] / bucket);
+          const hit = zones.get(key);
+          if (!hit) zones.set(key, { aS: A.s[i], bS: B.s[j] });
+          else {
+            if (A.s[i] < hit.aS) hit.aS = A.s[i];
+            if (B.s[j] < hit.bS) hit.bS = B.s[j];
+          }
+        }
+      }
+      for (const hit of zones.values()) {
+        hits.push({ a, b: ids[b], road: false, aS: hit.aS + ZONE_OFFSET, bS: hit.bS + ZONE_OFFSET, all: false, pair: true });
+      }
+    }
+  }
 }
 
 function sweepBody(
@@ -107,6 +242,7 @@ function sweepBody(
   body: Body,
   hits: NodeSweep['hits'],
   setbacks: Map<number, number>,
+  reaches: Map<number, number>[],
 ): void {
   const SWEEP_LENGTH = body.length;
   const SWEEP_CLEARANCE = body.clearance;
@@ -202,6 +338,7 @@ function sweepBody(
           // The one waiting may be a truck: allow for its width over a car's.
           if (distanceToSegment(p.x, p.z, f.x, f.z, r.x, r.z) >= SWEEP_CLEARANCE + WAITING_EXTRA) continue;
           if (e + 1 > (setbacks.get(idx) ?? 0)) setbacks.set(idx, e + 1);
+          if (e + 1 > (reaches[a].get(idx) ?? 0)) reaches[a].set(idx, e + 1);
         }
       }
     }
@@ -220,8 +357,17 @@ function sameLanes(a: GLane[], ids: number[], graph: LaneGraph): boolean {
   return true;
 }
 
-/** Sweep conflicts of the whole graph, by connector. Conflicts go on both connectors. */
-export function sweepConflicts(graph: LaneGraph, cache: SweepCache, setback: Float64Array): Map<number, SweepHit[]> {
+/**
+ * Sweep conflicts of the whole graph, by connector. Conflicts go on both connectors.
+ * `swept`, when given, receives for each connector the stop lines of other arms its long
+ * body swings over, and how far back from each.
+ */
+export function sweepConflicts(
+  graph: LaneGraph,
+  cache: SweepCache,
+  setback: Float64Array,
+  swept?: Map<number, SweptStop[]>,
+): Map<number, SweepHit[]> {
   const out = new Map<number, SweepHit[]>();
   const add = (lane: number, hit: SweepHit) => {
     const list = out.get(lane);
@@ -236,10 +382,15 @@ export function sweepConflicts(graph: LaneGraph, cache: SweepCache, setback: Flo
       cache.set(nodeId, node);
     }
     for (const [lane, back] of node.setbacks) setback[lane] = back;
+    if (swept) {
+      node.reaches.forEach((reach, a) => {
+        if (reach.size) swept.set(ids[a], [...reach].map(([lane, depth]) => ({ lane, depth })));
+      });
+    }
     for (const h of node.hits) {
-      add(ids[h.a], { lane: h.b, selfS: h.aS, otherS: h.bS, all: h.all });
+      add(ids[h.a], { lane: h.b, selfS: h.aS, otherS: h.bS, all: h.all, pair: h.pair, own: true });
       // Road lanes keep no conflicts: their vehicles are on the connector's side of it.
-      if (!h.road) add(h.b, { lane: ids[h.a], selfS: h.bS, otherS: h.aS, all: h.all });
+      if (!h.road) add(h.b, { lane: ids[h.a], selfS: h.bS, otherS: h.aS, all: h.all, pair: h.pair, own: false });
     }
   }
   return out;

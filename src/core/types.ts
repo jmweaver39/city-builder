@@ -9,6 +9,8 @@
 
 import type { RailData } from './railTypes';
 import type { BarrierSpec, Quay, StructureSpec } from './wallTypes';
+import type { RoadUpgrades } from './upgradeTypes';
+import type { JunctionRules, VehicleClass } from './trafficRuleTypes';
 
 export type Id = number;
 
@@ -104,6 +106,12 @@ export type TurnKind = 'left' | 'straight' | 'right' | 'uturn';
 
 /** How a junction resolves right of way. 'auto' lets core pick from road ranks. */
 export type JunctionMode = 'auto' | 'priority' | 'allStop' | 'signal';
+/**
+ * How a junction where a road meets a highway at grade works (core/highwayCrossing.ts).
+ * 'crossing': an ordinary crossing, straight across and turning, signalled in auto mode.
+ * 'rightInOut': controlled access, right in and right out only, free-flowing.
+ */
+export type HighwayAccess = 'crossing' | 'rightInOut';
 
 /** Key of a movement through a junction: `${fromSegmentId}>${toSegmentId}`. */
 export type MovementKey = string;
@@ -210,6 +218,9 @@ export interface LineStyleSpec {
   align?: 'left' | 'right';
   /** Crosswalks: an edge line on both sides. */
   border?: 'solid' | 'dashed';
+  /** Two-line looks: the second (right-hand) line in another colour. */
+  color2?: PaintColor;
+  hex2?: string;
 }
 
 /** One part of a line with a look of its own, between two bounds. Later parts win. */
@@ -230,11 +241,19 @@ export type NodeLineStyle =
   | 'zigzag'
   | 'sharkTeeth'
   | 'stopLine'
+  /** A dashed stop line: give way here. */
+  | 'stopLineDashed'
+  /** Two solid stop bars. */
+  | 'stopLineDouble'
+  /** A solid bar and a dashed one behind it. */
+  | 'stopLineSolidDashed'
   | 'lane'
   | 'crosswalkZebra'
   | 'crosswalkDoubleZebra'
   | 'crosswalkLadder'
   | 'crosswalkLines'
+  /** Two parallel dashed lines across the road. */
+  | 'crosswalkDashedLines'
   | 'crosswalkSolid'
   | 'crosswalkChessboard'
   /** No paint. Only useful for a part of a line. */
@@ -268,6 +287,8 @@ export interface NodeLineMarking {
   offset?: number;
   align?: 'left' | 'right';
   border?: 'solid' | 'dashed';
+  color2?: PaintColor;
+  hex2?: string;
   /** Parts of the line drawn in other styles. */
   rules?: LineRule[];
 }
@@ -291,6 +312,8 @@ export interface NodeFillerMarking {
   offset?: number;
   /** Draw no edge line round a patterned area. */
   noOutline?: true;
+  /** Chevrons and triangles point the other way. */
+  invert?: true;
 }
 
 export type NodeMarking = NodeLineMarking | NodeFillerMarking;
@@ -326,6 +349,14 @@ export interface JunctionControl {
   hideAutoMarkings?: boolean;
   /** Hand edits to the junction's physical shape. Absent means automatic. See core/junctionShape.ts. */
   shape?: JunctionShape;
+  /** Lane arrows and junction restrictions per arm. Absent means automatic. See core/trafficRules.ts. */
+  rules?: JunctionRules;
+  /**
+   * At a junction with a highway arm: a crossing with turns, or right in and right out only.
+   * Absent means right in and right out (saves from before crossings), and drawRoad sets
+   * 'crossing' on crossings it makes. See core/highwayCrossing.ts.
+   */
+  highwayAccess?: HighwayAccess;
 }
 
 /**
@@ -372,6 +403,8 @@ export interface JunctionShape {
   /** Keyed by the arm's segment id. */
   arms?: Record<number, ShapeArm>;
   islands?: ShapeIsland[];
+  /** Every arm's automatic trim is multiplied by this before its own `trim` is added. Absent means 1. */
+  scale?: number;
 }
 
 export interface RoadNode {
@@ -389,6 +422,8 @@ export interface SegmentOverrides {
   laneKinds?: Record<number, LaneKind>;
   /** Per lane index: a limit in km/h that beats every other speed for that lane. */
   laneSpeeds?: Record<number, number>;
+  /** Per lane index: vehicle classes that may not use the lane. Absent means none banned. See core/trafficRules.ts. */
+  laneBans?: Record<number, VehicleClass[]>;
   surface?: 'asphalt' | 'concrete' | 'darkAsphalt' | 'red' | 'gravel';
   name?: string;
   /** Track only: how it is powered. Absent means the track type's default. */
@@ -399,12 +434,28 @@ export interface SegmentOverrides {
    */
   attachA?: RampAttach;
   attachB?: RampAttach;
+  /**
+   * Where this end lines up with a wider road it continues at its node: left edges
+   * together, right edges together (looking along this road's a to b), or centred.
+   * The end of the curve moves sideways to match, so a lane drop or add keeps the
+   * other lanes in line. Absent is centred, as in older saves. Applies only while
+   * this road is the narrower of the two. See core/laneAlign.ts.
+   */
+  alignA?: LaneAlign;
+  alignB?: LaneAlign;
   /** Embankment, retaining walls, trench and so on. Absent is 'auto'. See core/walls.ts. */
   structure?: StructureSpec;
   /** Sound barriers along the road edges. */
   barriers?: BarrierSpec;
+  /** Street lights, trees, guard rails and stops per side and on the median. See core/roadUpgrades.ts. */
+  upgrades?: RoadUpgrades;
   /** Markings placed by hand along this segment, between its two ends. Anchors carry `end`. */
   handMarkings?: NodeMarking[];
+  /**
+   * Automatic lines along this road taken away one by one, by their key across the
+   * road: 'L' and 'R' edges, 'b0', 'b1'... between lanes (core/paintStandard.ts).
+   */
+  paintOff?: string[];
   /** Point settings for those markings. */
   markingPoints?: MarkingPointSetting[];
 }
@@ -427,6 +478,29 @@ export interface RampAttach {
    * `lane` is ignored when set. Missing on highway ramps and side merges.
    */
   lanes?: number[];
+  /**
+   * An edge merge or diverge (core/edgeMerge.ts): the host stays one continuous road
+   * and the ramp blends into its outermost lane with a taper, instead of the whole
+   * carriageway becoming a junction. Absent (as in older saves) is a full junction.
+   */
+  edge?: EdgeMergeSpec;
+}
+
+/** How a narrower road's end lines up with the wider road it continues. */
+export type LaneAlign = 'left' | 'centre' | 'right';
+
+/** How an edge-merged ramp meets its highway. */
+export interface EdgeMergeSpec {
+  /**
+   * 'taper': the ramp blends into the edge lane (acceleration or deceleration lane).
+   * 'add': an on-ramp carries on as an added lane. 'drop': an off-ramp takes the edge
+   * lane, exit only. Add and drop change the host's lanes past the node.
+   */
+  mode?: 'taper' | 'add' | 'drop';
+  /** Taper length in metres. Absent: from the highway's speed and where the ramp meets it. */
+  taper?: number;
+  /** 'add' only: metres the added lane runs before it merges. Absent or 0: for good. */
+  addLength?: number;
 }
 
 /**
@@ -501,6 +575,11 @@ export interface RoadPaintPiece {
   segmentId: Id;
   t0: number;
   t1: number;
+  /**
+   * Metres right of the walking direction on this piece, beating the line's own
+   * offset: a line crossing from one road to a narrower one keeps its place on each.
+   */
+  offset?: number;
 }
 
 /** Where paint sits on a road. Nothing here is a world position. */
@@ -531,7 +610,15 @@ export interface Decal {
   points: Vec3[];
   /** Set on paint that follows a road. Read positions through resolveDecal. */
   road?: RoadPaintRef;
-  /** The strokes of a line, beating what `kind` implies. */
+  /**
+   * The look, in the shared marking vocabulary (core/paintStandard.ts): lines,
+   * crosswalks, stop lines and teeth. Wins over `kind`, `lineStyle` and `width`,
+   * which older saves used and loading turns into this.
+   */
+  style?: LineStyleSpec;
+  /** The look of an area (kinds 'hatch' and 'fill'), as a hand-placed area's. */
+  fill?: Pick<NodeFillerMarking, 'fill' | 'color' | 'hex' | 'width' | 'angle' | 'step' | 'noOutline'>;
+  /** The strokes of a line, beating what `kind` implies. Older saves only. */
   lineStyle?: LineStyle;
   color: PaintColor;
   width: number;
@@ -576,6 +663,11 @@ export interface Project {
   terrain?: TerrainData;
   /** Marking presets and templates used in this map, so it opens the same elsewhere. */
   markingLibrary?: MarkingLibrary;
+  /**
+   * 1 once marking looks follow the shared standard (core/paintStandard.ts). Saves
+   * without it are brought up to it on load (core/markingMigrate.ts).
+   */
+  paintStandard?: 1;
 }
 
 /** A named look for a line or filler. */
@@ -715,6 +807,8 @@ export interface NodeArm {
    */
   kerbLeft?: Vec3;
   kerbRight?: Vec3;
+  /** The trim this node would give the arm with no junction shape. */
+  autoTrim?: number;
 }
 
 export interface NodeGeom {
@@ -737,8 +831,38 @@ export interface NodeGeom {
   outlineSimplified: boolean;
   /** True for a smooth two-road joint needing no junction surface. */
   isPlainJoint: boolean;
-  /** Arms of the node: 0 orphan, 1 dead end, 2+ joint or junction. */
-  kind: 'empty' | 'deadEnd' | 'plain' | 'junction';
+  /**
+   * Arms of the node: 0 orphan, 1 dead end, 2+ joint or junction. 'merge' is an edge
+   * merge or diverge: the host runs through as at a plain joint and only the ramp's
+   * taper beside its edge is junction surface (`outline`, details in `edge`).
+   */
+  kind: 'empty' | 'deadEnd' | 'plain' | 'junction' | 'merge';
+  /** Set when kind is 'merge'. See core/edgeMerge.ts. */
+  edge?: EdgeMergeGeom;
+}
+
+/** The parts of an edge merge, for drawing it. Points run in the ramp's direction of travel. */
+export interface EdgeMergeGeom {
+  /** Arm indices of the ramp and of the host before and after the node, in travel order. */
+  ramp: number;
+  hostIn: number;
+  hostOut: number;
+  /** Side of the host the ramp is on, right of the host's travel being 1. */
+  side: 1 | -1;
+  /** True for an on-ramp (merge), false for an off-ramp (diverge). */
+  merge: boolean;
+  /** Outer edge of the taper, from the ramp's outer road edge at its cut to the host's road edge at the node. */
+  taperOuter: Vec3[];
+  /** Where the edge line runs along the taper: from the ramp's outer carriageway edge into the host's. */
+  taperLine: Vec3[];
+  /** The host's carriageway edge on the ramp's side along the taper, in travel order. */
+  hostEdge: Vec3[];
+  /** Painted gore between the ramp and the host carriageway, or empty. */
+  gore: Vec3[];
+  /** Taper length along the ramp, metres. */
+  taper: number;
+  /** A plain taper, or the ramp carrying on as a lane the highway adds or drops here. */
+  mode: 'taper' | 'add' | 'drop';
 }
 
 // ---------------------------------------------------------------------------

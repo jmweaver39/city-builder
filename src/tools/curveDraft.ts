@@ -4,11 +4,12 @@
  * spiral, arc, spiral, tangent. This module checks such a chain against the
  * network as validateDraft checks one cubic, and summarises it for the readout.
  */
-import { closestPointOnCubic, cubicLength, intersectCubicsXZ, type Cubic } from '../core/bezier';
+import { closestPointOnCubic, cubicLength, cubicPoint, intersectCubicsXZ, type Cubic } from '../core/bezier';
 import { comfortRadius, hardMinRadius } from '../core/curveChain';
 import { fitCurve, type FitResult } from '../core/curveFit';
 import { maxGrade } from '../core/geometry';
-import { distXZ } from '../core/math';
+import { add, distXZ, scale, sub } from '../core/math';
+import { totalHalfWidth } from '../core/roadTypes';
 import { JUNCTION_ALLOWANCE, DIVERGE_ALLOWANCE } from '../core/overlap';
 import type { CrossingInfo, DraftIssue, RoadAnchor, RoadNetwork } from '../core/RoadNetwork';
 import { GRADE_CLEARANCE } from '../core/terrain';
@@ -43,6 +44,84 @@ export function fitDraft(net: RoadNetwork, ends: ChainEnds, roadType: string): F
     // No sliver shorter than the road is wide, which validateDraft would refuse.
     minPieceLength: Math.max(6, def.halfWidth + 1),
   });
+}
+
+/** A joint closer than this to a road it would sit on, beyond both half widths, is moved off. */
+const JOINT_CLEAR = 2;
+/** Most a merged piece may stray from the two it replaces, metres. */
+const MERGE_TOLERANCE = 0.35;
+
+/** The road surface at the same level that a point lies on or beside, or null. */
+function roadUnder(net: RoadNetwork, p: Vec3, halfWidth: number): number | null {
+  const reach = 60;
+  const box = { minX: p.x - reach, minZ: p.z - reach, maxX: p.x + reach, maxZ: p.z + reach };
+  for (const id of net.segmentsInRegion(box, true)) {
+    const def = net.roadTypeOf(id);
+    const hit = closestPointOnCubic(net.cubicOf(id), p);
+    if (Math.abs(hit.point.y - p.y) >= GRADE_CLEARANCE) continue;
+    if (hit.distance < totalHalfWidth(def) + halfWidth + JOINT_CLEAR) return id;
+  }
+  return null;
+}
+
+/** One cubic in place of two neighbours, same ends and end tangents, if it stays close to them. */
+function mergePair(a: Cubic, b: Cubic): Cubic | null {
+  const p0 = a.p0;
+  const p3 = b.p3;
+  const d0 = sub(a.p1, a.p0);
+  const d1 = sub(b.p3, b.p2);
+  const l0 = Math.hypot(d0.x, d0.z);
+  const l1 = Math.hypot(d1.x, d1.z);
+  const chord = distXZ(p0, p3);
+  if (l0 < 1e-6 || l1 < 1e-6 || chord < 1e-6) return null;
+  const samples: Vec3[] = [];
+  for (const c of [a, b]) for (let i = 1; i < 8; i++) samples.push(cubicPoint(c, i / 8));
+  samples.push(a.p3);
+  let best: Cubic | null = null;
+  let bestDev = MERGE_TOLERANCE;
+  for (let i = 1; i <= 12; i++) {
+    for (let j = 1; j <= 12; j++) {
+      const k0 = (chord * i) / 18 / l0;
+      const k1 = (chord * j) / 18 / l1;
+      const c: Cubic = { p0, p1: add(p0, scale(d0, k0)), p2: sub(p3, scale(d1, k1)), p3 };
+      let dev = 0;
+      for (const q of samples) {
+        dev = Math.max(dev, closestPointOnCubic(c, q).distance);
+        if (dev >= bestDev) break;
+      }
+      if (dev < bestDev) {
+        bestDev = dev;
+        best = c;
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * A fitted chain whose joints keep off other roads. A joint becomes a node, and a
+ * node on another road's surface is a road ending on that road, not crossing it:
+ * it overlaps and is refused. The two pieces either side of such a joint are
+ * replaced by one, so the road passes over and crosses as a single stroke.
+ */
+export function jointsOffRoads(net: RoadNetwork, cubics: Cubic[], roadType: string): Cubic[] {
+  const def = net.roadType(roadType);
+  if (!def || cubics.length < 2) return cubics;
+  const hw = totalHalfWidth(def);
+  const out = cubics.slice();
+  for (let i = 0; i + 1 < out.length; ) {
+    if (roadUnder(net, out[i].p3, hw) === null) {
+      i++;
+      continue;
+    }
+    const merged = mergePair(out[i], out[i + 1]);
+    if (!merged) {
+      i++;
+      continue;
+    }
+    out.splice(i, 2, merged);
+  }
+  return out;
 }
 
 /** The same chain driven the other way. */

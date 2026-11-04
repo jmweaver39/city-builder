@@ -14,7 +14,7 @@ const FLOAT_FIELDS = [
   'vlGap', 'vlV', 'vlFloor',
   'wx', 'wy', 'wz', 'wyaw', 'wpitch', 'pwx', 'pwy', 'pwz', 'pwyaw',
   'yieldSec', 'halfWidth',
-  's0', 'lcSec0', 'latStart0', 'lcLen', 'lcLen0',
+  's0', 'lcSec0', 'latStart0', 'lcLen', 'lcLen0', 'stuckSec0', 'stuckProgress0',
 ] as const;
 
 const INT_FIELDS = [

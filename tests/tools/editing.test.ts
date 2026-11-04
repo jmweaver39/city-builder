@@ -247,7 +247,8 @@ describe('Paint', () => {
     r.click(150, 6.6);
     const d = r.net.decals[0];
     expect(d.points).toEqual([]);
-    expect(d.lineStyle).toBe('dashed');
+    // The look is stored in the shared marking vocabulary (core/paintStandard.ts).
+    expect(d.style?.style).toBe('dashed');
     expect(d.road!.pieces).toHaveLength(1);
     const pts = resolveDecal(r.net, d).points;
     expect(pts[0].x).toBeCloseTo(20, 0);
@@ -259,10 +260,12 @@ describe('Paint', () => {
     const stops = lateralStops(r.net, r.net.segments[0].id);
     expect(stops.filter((s) => s.kind === 'edge').map((s) => s.offset)).toEqual([-8.5, 8.5]);
     expect(stops.filter((s) => s.kind === 'centre')).toHaveLength(4);
-    expect(stops.some((s) => s.kind === 'boundary' && s.offset === 5)).toBe(true);
+    // The boundary between two lanes is where the road paints its lane line: a 'line' stop.
+    expect(stops.some((s) => (s.kind === 'boundary' || s.kind === 'line') && s.offset === 5)).toBe(true);
+    // Near the kerb the road paints an edge line 0.18 m in: a line drawn there lands on it.
     r.click(50, 8.3);
     r.click(120, 0);
-    expect(resolveDecal(r.net, r.net.decals[0]).points[0].z).toBeCloseTo(8.5, 5);
+    expect(resolveDecal(r.net, r.net.decals[0]).points[0].z).toBeCloseTo(8.32, 5);
   });
 
   it('clicking near the end of the road reaches its edge exactly', () => {
@@ -304,7 +307,8 @@ describe('Paint', () => {
   it('Ctrl does not turn snapping off', () => {
     r.click(30, 2.2, { ctrl: true });
     r.click(120, 2.2, { ctrl: true });
-    expect(r.net.decals[0].road!.offset).toBe(1.5);
+    // It lands on the line the road paints beside the median (1.5 m lane edge, 0.16 m in), so the two meet.
+    expect(r.net.decals[0].road!.offset).toBeCloseTo(1.66, 5);
   });
 
   it('right click drops the start', () => {
@@ -427,7 +431,7 @@ describe('Node markings tool', () => {
     expect(r.view.marks.some((m) => m.kind === 'line')).toBe(true);
     r.click(q.pos.x, q.pos.z);
     const m = r.net.getNode(j)!.control.markings![0];
-    expect(m).toMatchObject({ kind: 'line', style: 'solid', straight: false });
+    expect(m).toMatchObject({ kind: 'line', style: 'dashed', straight: false });
     expect(r.tools.nodeMarkings.selected).toBe(m.id);
   });
 
@@ -515,11 +519,15 @@ describe('Node markings tool', () => {
     expect(r.tools.nodeMarkings.pendingCorners).toBe(3);
     clickDot(0);
     expect(r.net.getNode(j)!.control.markings![0]).toMatchObject({ kind: 'filler', fill: 'hatch' });
+    const first = r.net.getNode(j)!.control.markings![0].id;
     clickDot(1);
     clickDot(6);
     clickDot(11);
     expect(r.key('Enter')).toBe(true);
-    expect(r.net.getNode(j)!.control.markings).toHaveLength(2);
+    // Areas never overlap: the new one replaces the one it lies over.
+    const list = r.net.getNode(j)!.control.markings!;
+    expect(list).toHaveLength(1);
+    expect(list[0].id).not.toBe(first);
   });
 
   it('selects by clicking a marking, edits, deletes with the key, undoes', () => {

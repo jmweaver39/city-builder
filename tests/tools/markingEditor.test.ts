@@ -267,8 +267,11 @@ describe('Junction marking editor', () => {
 
   it('opens a plain stretch of road and draws a line from one end to the other', () => {
     const seg = r.net.drawRoad({ start: free(0, 0), end: free(200, 0), roadType: 'street-2' }).segments[0];
+    // In the one Markings tool a click on a road with Line paints along it; Pick opens its road markings.
+    r.tools.markings.setDraw('select');
     r.click(100, 0);
     expect(tool().host).toEqual({ kind: 'segment', id: seg });
+    r.tools.markings.setDraw('line');
     expect(r.inspected.at(-1)).toEqual({ kind: 'segmentMarkings', id: seg });
     const [fa, fb] = segmentFrames(r.net, seg);
     const pa = { x: fa.pos.x + fa.right.x * fa.offsets[1], z: fa.pos.z + fa.right.z * fa.offsets[1] };
@@ -301,3 +304,70 @@ import { framesOf } from '../../src/core';
 function nodeFrames(node: Id) {
   return framesOf(r.net, node);
 }
+
+describe('one Markings tool', () => {
+  const free2 = (x: number, z: number) => ({ kind: 'free' as const, pos: { x, y: 0, z } });
+
+  it('P and K open the same tool, and it marks along a road, designs a junction, stamps and erases', () => {
+    const r = rig();
+    r.net.drawRoad({ start: free2(-150, 0), end: free2(150, 0), roadType: 'street-4' });
+    r.net.drawRoad({ start: free2(0, -150), end: free2(0, 150), roadType: 'street-4' });
+    r.tools.setTool('paint');
+    const tool = r.tools.active;
+    r.tools.setTool('nodeMarkings');
+    expect(r.tools.active).toBe(tool);
+    expect(tool.id).toBe('paint');
+    // Along a road: two clicks on the road paint along it.
+    r.click(-80, 3.5);
+    r.click(-40, 3.5);
+    expect(r.net.decals).toHaveLength(1);
+    expect(r.net.decals[0].kind).toBe('line');
+    // Over the junction: the same Line tool designs it.
+    const node = r.net.nodes.find((n) => n.segments.length === 4)!;
+    r.click(node.pos.x, node.pos.z);
+    expect(r.tools.nodeMarkings.host).toEqual({ kind: 'node', id: node.id });
+    const anchors = nodeAnchors(r.net, node.id);
+    const a = anchors.find((x) => x.anchor.segmentId === node.segments[0] && x.anchor.boundary === 1)!;
+    const b = anchors.find((x) => x.anchor.segmentId === node.segments[2] && x.anchor.boundary === 1)!;
+    r.click(a.pos.x, a.pos.z);
+    r.click(b.pos.x, b.pos.z);
+    expect(r.net.getNode(node.id)!.control.markings).toHaveLength(1);
+    // Stamp an arrow on a lane, away from the junction.
+    r.tools.markings.setDraw('stamp');
+    r.click(-100, 5.25);
+    const arrow = r.net.decals.find((d) => d.kind === 'arrowStraight');
+    // A full-size arrow (scale 1, 5 m long), not the width of the line drawn before.
+    expect(arrow?.width).toBe(1);
+    // Erase: one click on the arrow removes just it, one undo step brings it back.
+    const before = r.net.decals.length;
+    r.tools.markings.setDraw('erase');
+    r.click(-100, 5.25);
+    expect(r.net.decals.length).toBe(before - 1);
+    r.history.undo();
+    expect(r.net.decals.length).toBe(before);
+  });
+
+  it('a Paint line in progress carries on across a junction surface to the far road', () => {
+    const r = rig();
+    const a = r.net.drawRoad({ start: free2(-200, 0), end: free2(0, 0), roadType: 'street-4' });
+    r.net.drawRoad({ start: { kind: 'node', id: a.nodes[a.nodes.length - 1] }, end: free2(200, 0), roadType: 'street-2' });
+    r.tools.setTool('paint');
+    r.click(-60, 0);
+    // The second click is on the far road: the line runs across the transition.
+    r.click(60, 0);
+    expect(r.net.decals).toHaveLength(1);
+    expect(r.net.decals[0].road!.pieces.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('draw keys pick the draw tool anywhere in the tool, not only with a junction open', () => {
+    const r = rig();
+    r.net.drawRoad({ start: free2(-100, 0), end: free2(100, 0), roadType: 'street-2' });
+    r.tools.setTool('paint');
+    expect(r.key('t')).toBe(true);
+    expect(r.tools.markings.draw).toBe('stamp');
+    expect(r.key('c')).toBe(true);
+    expect(r.tools.settings.paint.kind).toBe('crosswalk');
+    expect(r.key('l')).toBe(true);
+    expect(r.tools.settings.paint.kind).toBe('line');
+  });
+});

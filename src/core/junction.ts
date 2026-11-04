@@ -31,6 +31,8 @@ import { lanesMirror, sidewalkOn, totalHalfWidth } from './roadTypes';
 import { GRADE_CLEARANCE } from './terrain';
 import type { JunctionShape } from './types';
 import { applyShapeTrims, hasShape, shapeOutlineHooks } from './junctionShape';
+import type { RampAttach } from './types';
+import { edgeMergeGeom, edgeMergePlan, type EdgeMergePlan } from './edgeMerge';
 
 /** Longest trim for one road end, per ARCHITECTURE.md. */
 export const MAX_TRIM = 80;
@@ -52,6 +54,10 @@ export interface ArmSource {
   def: RoadTypeDef;
   /** Lanes by kind in index order, to tell apart overridden lanes. */
   laneSig: string;
+  /** This end's lane attach, for an edge merge (core/edgeMerge.ts). */
+  attach?: RampAttach;
+  /** How far this end sits right of the node, from a lane alignment (core/laneAlign.ts). */
+  shift?: number;
 }
 
 export interface ArmLayout {
@@ -64,6 +70,8 @@ export interface ArmLayout {
   angle: number;
   /** Trim wanted by this node alone. */
   rawTrim: number;
+  /** rawTrim before a junction shape changed it. */
+  autoTrim?: number;
   /** Right vector shared across a plain joint, in this segment's a-to-b sense. */
   jointRight: Vec3 | null;
 }
@@ -73,6 +81,8 @@ export interface NodeLayout {
   kind: NodeGeom['kind'];
   /** Clockwise viewed from above. */
   arms: ArmLayout[];
+  /** Set when kind is 'merge'. */
+  merge?: EdgeMergePlan;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +271,9 @@ function cornerMargin(wa: number, wb: number): number {
  * transition becomes a speed trap. Connector speed goes as the square root of
  * TURN_ACCEL over curvature, and an S bend across d in length L peaks at 6d / L^2.
  */
-function widthTaper(a: RoadTypeDef, b: RoadTypeDef): number {
-  const shift = Math.abs(a.halfWidth - b.halfWidth);
+function widthTaper(a: RoadTypeDef, b: RoadTypeDef, aligned = 0): number {
+  // A lane alignment moves one road sideways: the lane that ends shifts by that much more.
+  const shift = Math.abs(a.halfWidth - b.halfWidth) + aligned;
   if (shift < 1e-6) return 1.5;
   const speed = Math.min(a.speedKmh, b.speedKmh) / 3.6;
   return Math.max(1.5 + 2 * shift, (speed * Math.sqrt(2 * shift)) / 2);
@@ -308,7 +319,20 @@ export function computeNodeLayout(nodeId: Id, sources: ArmSource[], shape?: Junc
   });
   arms.sort((a, b) => a.angle - b.angle || a.segmentId - b.segmentId);
   if (arms.length === 0) return { nodeId, kind: 'empty', arms };
-  if (arms.length === 1) return { nodeId, kind: 'deadEnd', arms };
+  if (arms.length === 1) {
+    // Junction shape: a dead end's road can stop short of its node. See junctionShape.ts.
+    if (shape && hasShape(shape)) applyShapeTrims(arms, shape, () => null, 0, MAX_TRIM);
+    return { nodeId, kind: 'deadEnd', arms };
+  }
+  if (arms.length === 3) {
+    // A ramp blending into the edge lane: the highway runs through as a plain joint.
+    const plan = edgeMergePlan(arms);
+    if (plan) {
+      setJointRights(arms[plan.hostIn], arms[plan.hostOut]);
+      arms[plan.ramp].rawTrim = plan.taper;
+      return { nodeId, kind: 'merge', arms, merge: plan };
+    }
+  }
   if (arms.length === 2 && isPlainJoint(arms[0], arms[1])) {
     setJointRights(arms[0], arms[1]);
     return { nodeId, kind: 'plain', arms };
@@ -353,7 +377,8 @@ export function computeNodeLayout(nodeId: Id, sources: ArmSource[], shape?: Junc
     }
   }
 
-  const taper = n === 2 ? Math.max(widthTaper(arms[0].source.def, arms[1].source.def), headOnTaper(arms[0], arms[1])) : MIN_TRIM;
+  const aligned = n === 2 ? Math.abs(arms[0].source.shift ?? 0) + Math.abs(arms[1].source.shift ?? 0) : 0;
+  const taper = n === 2 ? Math.max(widthTaper(arms[0].source.def, arms[1].source.def, aligned), headOnTaper(arms[0], arms[1])) : MIN_TRIM;
   for (const arm of arms) arm.rawTrim = clamp(Math.max(arm.rawTrim, taper), 0, MAX_TRIM);
   // Junction shape: trim deltas and room for kerb radii. See junctionShape.ts.
   if (shape && hasShape(shape)) {
@@ -596,6 +621,7 @@ export function buildNodeGeom(layout: NodeLayout, nodePos: Vec3, geomOf: (id: Id
       centre: cut.centre,
       cutDir: cut.cutDir,
       trim: cut.trim,
+      autoTrim: arm.autoTrim ?? arm.rawTrim,
     };
   });
   const hasSurface = layout.kind === 'junction';
@@ -605,6 +631,19 @@ export function buildNodeGeom(layout: NodeLayout, nodePos: Vec3, geomOf: (id: Id
     if (k?.left) arms[i].kerbLeft = k.left;
     if (k?.right) arms[i].kerbRight = k.right;
   });
+  if (layout.kind === 'merge' && layout.merge) {
+    const m = edgeMergeGeom(layout.arms, layout.merge, arms, geomOf);
+    return {
+      nodeId: layout.nodeId,
+      arms,
+      outline: m?.outline ?? [],
+      outerOutline: m?.outline ?? [],
+      outlineSimplified: false,
+      isPlainJoint: false,
+      kind: 'merge',
+      ...(m ? { edge: m.geom } : {}),
+    };
+  }
   const widths = layout.arms.map((a) => a.source.def.halfWidth);
   const inner = hasSurface ? buildOutline(cuts, widths, nodePos, hooks?.innerSides, hooks?.innerCorner) : null;
   const outerSides = layout.arms.map((a) => outerWidths(a));

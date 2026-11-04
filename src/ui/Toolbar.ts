@@ -1,8 +1,12 @@
 /** The bottom toolbar: category tabs, thumbnail cards and the left options strip. */
 import { BUILTIN_ROAD_TYPES, driveLaneCount, isOneWay } from '../core/roadTypes';
-import type { DecalKind, EndpointKind, PaintColor, RoadCategory, RoadTypeDef, ZoneKind } from '../core/types';
+import type { DecalKind, EndpointKind, LineStyle, PaintColor, RoadCategory, RoadTypeDef, ZoneKind } from '../core/types';
 import { MAX_ELEVATION, MIN_ELEVATION } from '../core/terrain';
-import { defaultDecalWidth, LINE_DECALS, LINE_STYLES, AREA_DECALS } from '../tools/PaintTool';
+import { defaultDecalWidth, LINE_DECALS, LINE_STYLES, AREA_DECALS, PAINT_LINE_STANDARDS } from '../tools/PaintTool';
+import { FILL_STANDARDS, lineStandard } from '../core/paintStandard';
+import type { SwatchSubject } from '../render/swatch';
+import { swatchElement } from './swatches';
+import { MarkingStrip } from './MarkingStrip';
 import { formatElevation } from '../tools/RoadTool';
 import { MOD_KEY } from '../tools/platform';
 import { ENDPOINT_NAMES } from '../tools/TrafficTool';
@@ -13,7 +17,9 @@ import type { UiContext } from './context';
 import { renderRailTray } from './RailPanels';
 import { ControlTray } from './ControlTray';
 import { renderLandscapeTray, roadStructureOptions } from './WallControls';
+import { rampJoinOptions } from './RampJoinControls';
 import { registerTerrainKeys, renderTerrainTray } from './TerrainControls';
+import { registerUpgradeKeys, renderUpgradeCards, upgradeOptions } from './UpgradeControls';
 import { checkbox, clear, el, hiDpiCanvas, iconButton, row, selectInput, sliderInput, textInput } from './dom';
 import { ICONS, type IconName } from './icons';
 import { drawDecalThumb, drawLineThumb, drawRoadThumb, PAINT_CSS } from './thumbnails';
@@ -32,10 +38,10 @@ export type TabId = GroupId | RoadCategory | 'intersections' | 'control' | 'traf
 
 const DECAL_CARDS: { kind: DecalKind; name: string }[] = [
   { kind: 'hatch', name: 'Hatched area' },
-  { kind: 'fill', name: 'Filled area' },
-  { kind: 'crosswalk', name: 'Crosswalk' },
+  { kind: 'fill', name: 'Solid fill' },
+  { kind: 'crosswalk', name: 'Zebra' },
   { kind: 'stopLine', name: 'Stop line' },
-  { kind: 'yieldTriangles', name: 'Yield triangles' },
+  { kind: 'yieldTriangles', name: 'Give-way teeth' },
   { kind: 'arrowStraight', name: 'Arrow ahead' },
   { kind: 'arrowLeft', name: 'Arrow left' },
   { kind: 'arrowRight', name: 'Arrow right' },
@@ -43,6 +49,24 @@ const DECAL_CARDS: { kind: DecalKind; name: string }[] = [
   { kind: 'arrowStraightRight', name: 'Ahead or right' },
   { kind: 'text', name: 'Text' },
 ];
+
+/** A preview of what a Paint card places, drawn with the real paint. */
+function decalSubject(kind: DecalKind): SwatchSubject {
+  switch (kind) {
+    case 'hatch':
+      return { kind: 'area', spec: FILL_STANDARDS[0].spec };
+    case 'fill':
+      return { kind: 'area', spec: FILL_STANDARDS[2].spec };
+    case 'crosswalk':
+      return { kind: 'crossing', spec: lineStandard('zebra').spec };
+    case 'stopLine':
+      return { kind: 'crossing', spec: lineStandard('stop').spec };
+    case 'yieldTriangles':
+      return { kind: 'crossing', spec: lineStandard('giveWay').spec };
+    default:
+      return { kind: 'stamp', decal: kind, color: 'white' };
+  }
+}
 
 const ENDPOINT_CARDS: { kind: EndpointKind; icon: IconName; meta: string }[] = [
   { kind: 'gateway', icon: 'gateway', meta: 'On a dead end' },
@@ -67,6 +91,7 @@ export class Toolbar {
   private chip: RoadCategory = 'street';
   private renderedMode = '';
   private controlTray: ControlTray | null = null;
+  private markingStrip: MarkingStrip | null = null;
 
   constructor(private readonly ui: UiContext) {
     const tabRow = el('div', { class: 'tabs', attrs: { role: 'tablist' } });
@@ -96,6 +121,7 @@ export class Toolbar {
     ui.tools.onChange(() => this.syncState());
     initGridPrefs(ui);
     registerTerrainKeys(ui);
+    registerUpgradeKeys(ui);
     ui.net.onChange((c) => {
       if (c.settingsChanged || c.reset) {
         if (this.tab === 'build' && this.chip === 'custom') this.render();
@@ -117,7 +143,7 @@ export class Toolbar {
   }
 
   private trayCards(): HTMLElement[] {
-    return [...this.cards.querySelectorAll<HTMLElement>('.card')];
+    return [...this.cards.querySelectorAll<HTMLElement>('.card, [data-pick]')];
   }
 
   /** Click the nth card of the open tab, as keys 1 to 9 do. */
@@ -141,6 +167,8 @@ export class Toolbar {
       card.querySelector('.card-num')?.remove();
       if (i >= 9) return;
       card.dataset.key = String(i + 1);
+      // Icon buttons show their key in the tooltip only.
+      if (!card.classList.contains('card')) return;
       if (!card.querySelector('.card-key')) card.append(el('kbd', { class: 'card-key card-num', text: String(i + 1) }));
     });
   }
@@ -196,6 +224,10 @@ export class Toolbar {
       this.controlTray?.dispose();
       this.controlTray = null;
     }
+    this.markingStrip?.dispose();
+    this.markingStrip = null;
+    // The Markings strip is one row: the tray fits it.
+    this.tray.classList.toggle('compact', id === 'paint');
     clear(this.options);
     clear(this.cards);
     clear(this.chips);
@@ -270,8 +302,9 @@ export class Toolbar {
     this.options.append(this.modeRow('modify'));
     const note = (text: string) => this.options.append(el('p', { class: 'opt-help', text }));
     if (mode === 'upgrade') {
-      note('Sweep over roads.');
-      this.options.append(roadStructureOptions(this.ui));
+      // Upgrade cards first (lights, barriers, trees...), then the road-type cards.
+      this.options.append(upgradeOptions(this.ui));
+      renderUpgradeCards(this.ui, this.cards);
       this.renderPicker();
     } else if (mode === 'reverse') {
       note('Sweep over one-way roads.');
@@ -319,6 +352,8 @@ export class Toolbar {
         on: {
           click: () => {
             this.tools.settings.roadType = def.id;
+            // A road card in Upgrade sweeps the road type, so it drops the upgrade card.
+            this.tools.settings.upgradeCards.card = null;
             if (this.tools.settings.drawMode === 'upgrade' && this.tools.active.id !== 'road') this.tools.settings.drawMode = 'straight';
             // The Parallel tool can build with the selected road, so picking one keeps it.
             if (this.tools.active.id === 'parallel') this.tools.settingsChanged();
@@ -414,6 +449,7 @@ export class Toolbar {
         el('div', { class: 'opt-title', text: 'Guides' }),
         guideToggleRow(this.ui),
         roadStructureOptions(this.ui),
+        rampJoinOptions(this.ui),
       ),
     );
   }
@@ -500,116 +536,16 @@ export class Toolbar {
     this.syncState();
   }
 
+  /** The Markings tool: one compact strip (MarkingStrip.ts); the rest on demand in its side panel. */
   private renderPaint(): void {
-    const p = this.tools.settings.paint;
-    // Junction markings and shape moved to the Junction tool.
-    const pick = (apply: () => void) => {
-      apply();
-      this.tools.setTool('paint');
-      this.tools.settingsChanged();
-      this.renderPaintOptions();
-      this.syncState();
-    };
-    for (const l of LINE_STYLES) {
-      const canvas = hiDpiCanvas(102, 52);
-      drawLineThumb(canvas, l.style, 102, 52);
-      this.cards.append(
-        el(
-          'button',
-          {
-            class: 'card',
-            dataset: { line: l.style },
-            tip: `${l.name}. Click where it starts, then where it ends. It follows the road`,
-            attrs: { type: 'button', 'aria-label': l.name },
-            on: {
-              click: () =>
-                pick(() => {
-                  p.kind = 'line';
-                  p.lineStyle = l.style;
-                  p.width = defaultDecalWidth('line');
-                }),
-            },
-          },
-          canvas,
-          el('div', { class: 'card-name', text: l.name }),
-        ),
-      );
-    }
-    for (const d of DECAL_CARDS) {
-      const canvas = hiDpiCanvas(102, 52);
-      drawDecalThumb(canvas, d.kind, 102, 52);
-      this.cards.append(
-        el(
-          'button',
-          {
-            class: 'card',
-            dataset: { decal: d.kind },
-            tip: d.name,
-            attrs: { type: 'button', 'aria-label': d.name },
-            on: {
-              click: () =>
-                pick(() => {
-                  p.kind = d.kind;
-                  p.width = defaultDecalWidth(d.kind);
-                }),
-            },
-          },
-          canvas,
-          el('div', { class: 'card-name', text: d.name }),
-        ),
-      );
-    }
-    this.renderPaintOptions();
-    this.syncState();
+    this.markingStrip = new MarkingStrip(this.ui, this.cards);
   }
 
-  private renderPaintOptions(): void {
-    const p = this.tools.settings.paint;
-    clear(this.options);
-    const swatches = el('div', { class: 'swatches' });
-    for (const c of PAINT_COLORS) {
-      swatches.append(
-        el('button', {
-          class: `swatch ${p.color === c ? 'active' : ''}`,
-          tip: c,
-          style: { background: PAINT_CSS[c] },
-          attrs: { type: 'button', 'aria-label': `${c} paint` },
-          on: {
-            click: () => {
-              p.color = c;
-              this.tools.settingsChanged();
-              this.renderPaintOptions();
-            },
-          },
-        }),
-      );
-    }
-    const isLine = LINE_DECALS.includes(p.kind) || AREA_DECALS.includes(p.kind);
-    this.options.append(
-      el('div', { class: 'opt-title', text: 'Colour' }),
-      swatches,
-      el('div', { class: 'opt-title', text: 'Width' }),
-      sliderInput(p.width, { min: 0.1, max: isLine ? 3 : 12, step: 0.05, format: (v) => `${v.toFixed(2)} m` }, (v) => {
-        p.width = v;
-        this.tools.settingsChanged();
-      }),
-    );
-    if (p.kind === 'text') {
-      this.options.append(
-        el('div', { class: 'opt-title', text: 'Text' }),
-        textInput(p.text, 'Text to paint', (v) => {
-          p.text = v;
-          this.tools.settingsChanged();
-        }),
-      );
-    }
-    const hint = AREA_DECALS.includes(p.kind)
-      ? 'Click one side of the area, then the other side further along. It follows the road.'
-      : isLine
-        ? 'Click a start, then an end. Near a junction the line reaches its edge.'
-        : 'Click a lane. The direction comes from the lane.';
-    this.options.append(el('div', { class: 'small muted', text: hint }));
+  /** The Markings tool's strip, while its tab is open. */
+  get markings(): MarkingStrip | null {
+    return this.markingStrip;
   }
+
 
   private renderTraffic(): void {
     const s = this.tools.settings;
@@ -790,10 +726,11 @@ export class Toolbar {
     this.cards.querySelectorAll<HTMLElement>('.card').forEach((card) => {
       const d = card.dataset;
       let on = false;
-      if (d.road) on = (active === 'road' || active === 'parallel') && s.roadType === d.road;
+      if (d.road) on = (active === 'road' || active === 'parallel') && s.roadType === d.road && !(s.drawMode === 'upgrade' && s.upgradeCards.card);
+      if (d.upgrade) on = active === 'road' && s.drawMode === 'upgrade' && s.upgradeCards.card === d.upgrade;
       if (d.template) on = active === 'template' && s.template.id === d.template;
       if (d.decal) on = active === 'paint' && s.paint.kind === d.decal;
-      if (d.line) on = active === 'paint' && s.paint.kind === 'line' && s.paint.lineStyle === d.line;
+      if (d.line) on = active === 'paint' && s.paint.kind === 'line' && s.paint.standard === d.line;
       if (d.endpoint) on = active === 'traffic' && s.trafficKind === d.endpoint;
       if (d.zone) on = active === 'zone' && s.zone.kind === d.zone;
       if (d.tool) on = active === d.tool;
@@ -802,5 +739,6 @@ export class Toolbar {
     });
     this.root.querySelector<HTMLButtonElement>('.reset-lanes')?.toggleAttribute('disabled', tools.lanes.node === null);
     if (this.tab === 'junction') this.controlTray?.sync();
+    if (this.tab === 'paint') this.markingStrip?.sync();
   }
 }

@@ -17,13 +17,14 @@
  * 3. Draft checks for the editor: a ramp drawn against the traffic it joins, and
  *    a street joining a highway at grade.
  */
-import type { Id, LaneDef, RampAttach, RoadCategory, RoadNode, RoadTypeDef, Segment, Vec3 } from './types';
+import type { HighwayAccess, Id, LaneDef, RampAttach, RoadCategory, RoadNode, RoadTypeDef, Segment, TurnKind, Vec3 } from './types';
 import type { Cubic } from './bezier';
 import { cubicPoint, cubicTangentXZ } from './bezier';
-import type { ArmLanes, LaneEnd, LinkSet } from './connectors';
-import { feedOrphans, linkGeneral, linkTurnarounds, shareLanes, turnBetween } from './connectors';
+import type { ArmLanes, LaneEnd, LaneLinkSpec } from './connectors';
+import { LinkSet, feedOrphans, linkGeneral, linkTurnarounds, shareLanes, turnBetween } from './connectors';
 import { addScaled, distXZ, dotXZ, normalizeXZ, rightOf, scale, signedTurn, sub } from './math';
 import { effectiveLanes, isOneWay } from './roadTypes';
+import { endShift } from './laneAlign';
 
 /** Sharpest turn a ramp may make off or onto the traffic it serves, radians (about 115 degrees). */
 export const MAX_RAMP_TURN = 2.0;
@@ -127,14 +128,55 @@ export function carriagewayEdge(lanes: readonly LaneDef[], aligned: 1 | -1, side
  * Where a ramp end attached to a host lands. `hostDir` is the host's a-to-b
  * direction at the node, `rampDir` the ramp's direction of travel (a to b) there.
  */
-export function attachPointFrom(nodePos: Vec3, hostDir: Vec3, hostLanes: readonly LaneDef[], attach: RampAttach, rampDir: Vec3): Vec3 {
+export function attachPointFrom(
+  nodePos: Vec3,
+  hostDir: Vec3,
+  hostLanes: readonly LaneDef[],
+  attach: RampAttach,
+  rampDir: Vec3,
+  /** The ramp's own lanes: an edge merge sits beside the carriageway edge, not on it (core/edgeMerge.ts). */
+  rampLanes?: readonly LaneDef[],
+  /** The host end's sideways move at the node, right of its a to b (core/laneAlign.ts). */
+  hostShift = 0,
+): Vec3 {
+  // A street terminal ends on the node like any junction arm; only its lanes are chosen.
+  if (attach.lanes) return { ...nodePos };
   const aligned: 1 | -1 = dotXZ(hostDir, rampDir) >= 0 ? 1 : -1;
   const travel = scale(hostDir, aligned);
   // The host on the ramp's left means the ramp is on the host's right.
   const side: 1 | -1 = attach.hostSide === -1 ? 1 : -1;
-  const edge = carriagewayEdge(hostLanes, aligned, side);
+  let edge = carriagewayEdge(hostLanes, aligned, side) + hostShift * aligned;
+  // An edge-merged ramp's inner carriageway edge meets the host's, so its lanes run alongside.
+  if (attach.edge && rampLanes) edge -= carriagewayEdge(rampLanes, 1, side === 1 ? -1 : 1);
   const p = addScaled(nodePos, rightOf(travel), edge);
   return { x: p.x, y: nodePos.y, z: p.z };
+}
+
+/**
+ * Where an edge-merged ramp end lands: beside the narrower of the host roads at the
+ * node (the one without the added or dropped lane), taking any lane alignment into account.
+ */
+export function edgeAttachPoint(acc: AttachAccess, seg: Segment | null, nodeId: Id, attach: RampAttach, rampDir: Vec3, rampLanes?: readonly LaneDef[]): Vec3 | null {
+  const node = acc.node(nodeId);
+  if (!node) return null;
+  const lanes = rampLanes ?? (seg ? effectiveLanes(acc.def(seg), seg.overrides) : undefined);
+  const side: 1 | -1 = attach.hostSide === -1 ? 1 : -1;
+  let best: Vec3 | null = null;
+  let bestLat = Infinity;
+  for (const id of node.segments) {
+    if (seg && id === seg.id) continue;
+    const host = acc.segment(id);
+    if (!host || attachAt(host, nodeId) || host.a === host.b || acc.def(host).category === 'rail') continue;
+    const dir = hostDirAt(acc, host, nodeId);
+    if (!dir) continue;
+    const p = attachPointFrom(node.pos, dir, effectiveLanes(acc.def(host), host.overrides), attach, rampDir, lanes, endShift(acc, host, nodeId));
+    const lat = dotXZ(sub(p, node.pos), rightOf(rampDir)) * side;
+    if (lat < bestLat) {
+      bestLat = lat;
+      best = p;
+    }
+  }
+  return best;
 }
 
 /** A segment's curve with any attached ends moved onto their host's carriageway edge. */
@@ -143,9 +185,11 @@ export function attachedCubic(acc: AttachAccess, seg: Segment, raw: Cubic): Cubi
   if (!attachA && !attachB) return raw;
   let { p0, p3 } = raw;
   const endPoint = (attach: RampAttach, nodeId: Id, rampDir: Vec3): Vec3 | null => {
-    const host = pickHost(acc, nodeId, seg.id);
     const node = acc.node(nodeId);
-    if (!host || !node) return null;
+    if (!node) return null;
+    if (attach.edge && !attach.lanes) return edgeAttachPoint(acc, seg, nodeId, attach, rampDir);
+    const host = pickHost(acc, nodeId, seg.id);
+    if (!host) return null;
     const dir = hostDirAt(acc, host, nodeId);
     if (!dir) return null;
     return attachPointFrom(node.pos, dir, effectiveLanes(acc.def(host), host.overrides), attach, rampDir);
@@ -178,9 +222,13 @@ export function makeAttach(lane: number, hostDir: Vec3, rampDir: Vec3, lateral: 
 // Controlled-access connectors
 // ---------------------------------------------------------------------------
 
-/** True when a node's connectors follow the controlled-access rules. */
-export function isControlledAccess(arms: readonly { category?: RoadCategory }[]): boolean {
-  return arms.length >= 3 && arms.some((a) => a.category === 'highway');
+/**
+ * True when a node's connectors follow the controlled-access rules. `access` is the
+ * node's `JunctionControl.highwayAccess`: a 'crossing' is an ordinary junction instead
+ * (core/highwayCrossing.ts), and absent keeps these rules, as in older saves.
+ */
+export function isControlledAccess(arms: readonly { category?: RoadCategory }[], access?: HighwayAccess): boolean {
+  return access !== 'crossing' && arms.length >= 3 && arms.some((a) => a.category === 'highway');
 }
 
 interface Flow {
@@ -403,6 +451,294 @@ function linkFlow(set: LinkSet, arms: ArmLanes[], f: Flow, exits: Branch[], entr
 }
 
 // ---------------------------------------------------------------------------
+// Street attaches
+// ---------------------------------------------------------------------------
+//
+// A road can attach to lanes of a street or avenue too, in one of two ways:
+//
+// - Side merge (no `lanes`): a one-way road leaving or joining along the kerb,
+//   like a highway ramp or a free-flow slip lane. Its end sits on the carriageway
+//   edge and the outermost `lane + 1` lanes of the carriageway on its side feed or
+//   take it. Nothing crosses to the other carriageway.
+// - Terminal (`lanes`): the road ends on the node like any junction arm, and turns
+//   into or out of exactly the chosen host lanes, left into the far carriageway and
+//   right into the near one. A two-way road uses the same lanes both ways.
+//
+// The host's own traffic is linked as if the attached road were not there, so its
+// through lanes keep going straight and the chosen lanes also serve the attached
+// road. Hand-set laneLinks still win, as everywhere.
+
+/** Roads a lane attach can use at grade with turns: streets, one-way streets and avenues. */
+export function isStreetHost(category: RoadCategory | undefined): boolean {
+  return category === 'street' || category === 'avenue' || category === 'oneway';
+}
+
+const roadLane = (l: LaneEnd) => l.kind !== 'bike' && l.kind !== 'rail';
+
+/** The host arm of an attached arm at a node, as pickHost picks it, and the arm it carries on as. */
+function hostArmsOf(arms: readonly ArmLanes[], k: number): { h: number; h2: number | null } | null {
+  let h = -1;
+  let best = -Infinity;
+  arms.forEach((a, i) => {
+    if (i === k || a.attach || a.category === 'rail') return;
+    const score = (a.category === 'highway' ? 1000 : 0) + (a.incoming.length + a.outgoing.length) * 10 - a.segmentId * 1e-6;
+    if (score > best) {
+      best = score;
+      h = i;
+    }
+  });
+  if (h < 0) return null;
+  let h2: number | null = null;
+  let bend = PAIR_LIMIT;
+  arms.forEach((a, i) => {
+    if (i === k || i === h || a.attach || a.category === 'rail') return;
+    const b = Math.abs(signedTurn(scale(arms[h].cutDir, -1), a.cutDir));
+    if (b < bend) {
+      bend = b;
+      h2 = i;
+    }
+  });
+  return { h, h2 };
+}
+
+/** One host lane an attached road links with, and the arm it is on at the node. */
+interface HostPick {
+  lane: LaneEnd;
+  arm: number;
+}
+
+interface StreetPlan {
+  arm: number;
+  /** Host lanes the attached road's arriving lanes turn into. */
+  targets: HostPick[];
+  /** Host lanes that turn into the attached road's leaving lanes. */
+  sources: HostPick[];
+  /** A side merge: every link is a turn to the attached road's side. */
+  forced: TurnKind | null;
+  /** Arm straight across the junction, for a terminal. */
+  across: number | null;
+}
+
+/**
+ * The host lanes across the road at arm `h`, nearest the attached road's side
+ * first, each with whether it arrives at the node there. This is the order
+ * `RampAttach.lanes` counts in.
+ */
+export function hostCrossSection(arms: readonly ArmLanes[], h: number, rightSide: boolean): { lane: LaneEnd; incoming: boolean }[] {
+  // Positions across the road, right of a driver arriving on h positive.
+  const slots = [
+    ...arms[h].incoming.filter(roadLane).map((lane) => ({ lane, incoming: true, x: lane.lat })),
+    ...arms[h].outgoing.filter(roadLane).map((lane) => ({ lane, incoming: false, x: -lane.lat })),
+  ];
+  slots.sort((a, b) => (rightSide ? b.x - a.x : a.x - b.x));
+  return slots.map(({ lane, incoming }) => ({ lane, incoming }));
+}
+
+function nearestLat(list: readonly LaneEnd[], lat: number): LaneEnd | null {
+  let best: LaneEnd | null = null;
+  for (const l of list) if (!best || Math.abs(l.lat - lat) < Math.abs(best.lat - lat)) best = l;
+  return best;
+}
+
+function planStreetAttach(arms: readonly ArmLanes[], k: number): StreetPlan | null {
+  const attach = arms[k].attach;
+  if (!attach) return null;
+  const host = hostArmsOf(arms, k);
+  if (!host || !isStreetHost(arms[host.h].category)) return null;
+  const { h, h2 } = host;
+  const terminal = Array.isArray(attach.lanes);
+  const arrive = scale(arms[h].cutDir, -1);
+  let rightSide: boolean;
+  if (terminal) {
+    rightSide = dotXZ(arms[k].cutDir, rightOf(arrive)) >= 0;
+  } else {
+    // A side merge runs nearly parallel, so it goes by the side it was drawn on.
+    const travel = arms[k].atStart ? arms[k].cutDir : scale(arms[k].cutDir, -1);
+    rightSide = (dotXZ(travel, arrive) >= 0 ? -attach.hostSide : attach.hostSide) > 0;
+  }
+  const slots = hostCrossSection(arms, h, rightSide);
+  if (!slots.length) return null;
+  let chosen: number[];
+  if (terminal) {
+    chosen = [...new Set(attach.lanes!.filter((p) => Number.isInteger(p) && p >= 0 && p < slots.length))];
+  } else {
+    // Only the carriageway on its own side: the outermost lane + 1 lanes of it.
+    let near = 0;
+    while (near < slots.length && slots[near].incoming === slots[0].incoming) near++;
+    chosen = [];
+    for (let p = 0; p <= Math.min(Math.round(attach.lane), near - 1); p++) chosen.push(p);
+  }
+  const inn = arms[k].incoming.filter(roadLane);
+  const out = arms[k].outgoing.filter(roadLane);
+  const targets: HostPick[] = [];
+  const sources: HostPick[] = [];
+  const heading = scale(arms[k].cutDir, -1);
+  for (const p of chosen) {
+    const { lane, incoming } = slots[p];
+    // The same piece of road on the far side of the node, for a lane that carries on.
+    const other = (list: 'incoming' | 'outgoing') => (h2 === null ? null : nearestLat(arms[h2][list].filter(roadLane), lane.lat));
+    if (inn.length) {
+      const t = incoming ? other('outgoing') : lane;
+      const arm = incoming ? h2 : h;
+      if (t && arm !== null && (terminal || Math.abs(signedTurn(heading, arms[arm].cutDir)) <= MAX_RAMP_TURN)) targets.push({ lane: t, arm });
+    }
+    if (out.length) {
+      const s = incoming ? lane : other('incoming');
+      const arm = incoming ? h : h2;
+      if (s && arm !== null && (terminal || Math.abs(signedTurn(scale(arms[arm].cutDir, -1), arms[k].cutDir)) <= MAX_RAMP_TURN)) sources.push({ lane: s, arm });
+    }
+  }
+  if ((inn.length && !targets.length) || (out.length && !sources.length)) return null;
+  let across: number | null = null;
+  if (terminal) {
+    let bend = PAIR_LIMIT;
+    arms.forEach((a, i) => {
+      if (i === k || i === h || i === h2) return;
+      const b = Math.abs(signedTurn(heading, a.cutDir));
+      if (b < bend) {
+        bend = b;
+        across = i;
+      }
+    });
+  }
+  return { arm: k, targets, sources, forced: terminal ? null : rightSide ? 'right' : 'left', across };
+}
+
+/**
+ * Split `r` lanes of the attached road into one block per group, left to right,
+ * each at least one lane, the rest shared by group size. Null when there are
+ * fewer lanes than groups, so a lane has to serve several.
+ */
+function blocksFor(r: number, sizes: readonly number[]): [number, number][] | null {
+  const g = sizes.length;
+  if (r < g) return null;
+  const total = sizes.reduce((a, b) => a + b, 0);
+  const counts = sizes.map(() => 1);
+  for (let left = r - g; left > 0; left--) {
+    let best = 0;
+    let need = -Infinity;
+    sizes.forEach((s, i) => {
+      const n = (s / total) * r - counts[i];
+      if (n > need) {
+        need = n;
+        best = i;
+      }
+    });
+    counts[best]++;
+  }
+  const out: [number, number][] = [];
+  let at = 0;
+  for (const c of counts) {
+    out.push([at, at + c]);
+    at += c;
+  }
+  return out;
+}
+
+/** Link the attached road's lanes with its picked host lanes, left turns on its left lanes. */
+function linkPicks(set: LinkSet, arms: ArmLanes[], plan: StreetPlan, picks: HostPick[], arriving: boolean): void {
+  const k = plan.arm;
+  const own = (arriving ? arms[k].incoming : arms[k].outgoing).filter(roadLane);
+  const groups = new Map<number, LaneEnd[]>();
+  for (const p of picks) {
+    const g = groups.get(p.arm) ?? [];
+    if (!g.includes(p.lane)) g.push(p.lane);
+    groups.set(p.arm, g);
+  }
+  const heading = scale(arms[k].cutDir, -1);
+  const list = [...groups].map(([arm, lanes]) => ({
+    arm,
+    lanes: lanes.sort((a, b) => a.lat - b.lat),
+    bend: arriving ? signedTurn(heading, arms[arm].cutDir) : signedTurn(scale(arms[arm].cutDir, -1), arms[k].cutDir),
+  }));
+  // Most to the left first: those take the attached road's left lanes.
+  list.sort((a, b) => a.bend - b.bend);
+  const turnOf = (arm: number) => plan.forced ?? (arriving ? turnBetween(arms, k, arm) : turnBetween(arms, arm, k));
+  const blocks = blocksFor(own.length, list.map((g) => g.lanes.length));
+  list.forEach((g, j) => {
+    const mine = blocks ? own.slice(blocks[j][0], blocks[j][1]) : own;
+    if (arriving) pairOrdered(set, mine, g.lanes, turnOf(g.arm));
+    else pairOrdered(set, g.lanes, mine, turnOf(g.arm));
+  });
+}
+
+/**
+ * Links at a junction on a street or avenue where roads attach to chosen lanes,
+ * or null when no attach there applies (then the usual rules run). `base` links
+ * the other arms as if the attached roads were not there.
+ */
+export function linkStreetAttaches(arms: ArmLanes[], base: (arms: ArmLanes[]) => LaneLinkSpec[]): LaneLinkSpec[] | null {
+  if (arms.length < 3 || isControlledAccess(arms)) return null;
+  const plans: StreetPlan[] = [];
+  arms.forEach((a, k) => {
+    if (!a.attach) return;
+    const plan = planStreetAttach(arms, k);
+    if (plan) plans.push(plan);
+  });
+  if (!plans.length) return null;
+  const planned = new Set(plans.map((p) => p.arm));
+  const rest = arms.filter((_, i) => !planned.has(i));
+  if (rest.length < 2) return null;
+  const set = new LinkSet();
+  const armOf = (l: LaneEnd, side: 'incoming' | 'outgoing') => arms.findIndex((a) => a[side].includes(l));
+  for (const l of base(rest)) {
+    const from = armOf(l.from, 'incoming');
+    const to = armOf(l.to, 'outgoing');
+    set.add(l.from, l.to, from >= 0 && to >= 0 && from !== to ? turnBetween(arms, from, to) : l.turn);
+  }
+  for (const plan of plans) {
+    if (plan.targets.length) linkPicks(set, arms, plan, plan.targets, true);
+    if (plan.sources.length) linkPicks(set, arms, plan, plan.sources, false);
+    // A terminal still carries straight across the junction to the road opposite.
+    const o = plan.across;
+    if (o !== null) {
+      const k = plan.arm;
+      pairOrdered(set, arms[k].incoming.filter(roadLane), arms[o].outgoing.filter(roadLane), turnBetween(arms, k, o));
+      pairOrdered(set, arms[o].incoming.filter(roadLane), arms[k].outgoing.filter(roadLane), turnBetween(arms, o, k));
+    }
+  }
+  const bike = (l: LaneEnd) => l.kind === 'bike';
+  if (plans.some((p) => arms[p.arm].incoming.some(bike) || arms[p.arm].outgoing.some(bike))) {
+    linkGeneral(set, arms, bike);
+    feedOrphans(set, arms, bike);
+  }
+  feedOrphans(set, arms, roadLane);
+  linkTurnarounds(set, arms);
+  return [...set.links.values()];
+}
+
+/** A street node where only side merges join the street: these flow freely, like a highway merge. */
+export function isStreetMerge(arms: readonly { category?: RoadCategory; attach?: RampAttach }[]): boolean {
+  const attached = arms.filter((a) => a.attach);
+  const plain = arms.filter((a) => !a.attach);
+  if (!attached.length || plain.length > 2 || plain.length === 0) return false;
+  if (attached.some((a) => a.attach!.lanes)) return false;
+  return plain.every((a) => isStreetHost(a.category));
+}
+
+/**
+ * Names of the host lanes a street terminal uses, for the inspector, with the turn
+ * each one is ('left' into the far carriageway, 'right' into the near one).
+ * `near` is how many lanes the carriageway on the road's side has.
+ */
+export function terminalLaneNames(attach: RampAttach, near: number, total: number): { position: number; name: string; turn: 'left' | 'right' }[] {
+  const out: { position: number; name: string; turn: 'left' | 'right' }[] = [];
+  for (const p of [...new Set(attach.lanes ?? [])].sort((a, b) => a - b)) {
+    if (p < 0 || p >= total) continue;
+    if (p < near) {
+      const name = p === 0 ? 'near kerb lane' : p === near - 1 ? 'near inner lane' : `near lane ${p + 1}`;
+      out.push({ position: p, name, turn: 'right' });
+    } else {
+      const far = total - near;
+      const q = p - near;
+      const name = q === far - 1 ? 'far kerb lane' : q === 0 ? 'far inner lane' : `far lane ${far - q}`;
+      out.push({ position: p, name, turn: 'left' });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Draft checks
 // ---------------------------------------------------------------------------
 
@@ -421,6 +757,8 @@ export interface DraftEnd {
   pos: Vec3;
   /** True for the start of the draft, where traffic leaves the host. */
   leaving: boolean;
+  /** The lane attach at this end, if any. */
+  attach?: RampAttach;
 }
 
 /**
@@ -428,7 +766,10 @@ export interface DraftEnd {
  * already moved onto any lane it attaches to.
  */
 export function rampEndIssues(def: RoadTypeDef, cubic: Cubic, end: DraftEnd): RampIssue[] {
-  if (end.hostDef.category !== 'highway') return [];
+  // On a street only a side merge has to run with the traffic; a terminal turns.
+  const sideMerge = isStreetHost(end.hostDef.category) && !!end.attach && !end.attach.lanes && isOneWay(def);
+  if (end.hostDef.category !== 'highway' && !sideMerge) return [];
+  const what = end.hostDef.category === 'highway' ? 'highway' : 'street';
   const out: RampIssue[] = [];
   const t = end.leaving ? 0 : 1;
   const travel = cubicTangentXZ(cubic, t);
@@ -446,8 +787,8 @@ export function rampEndIssues(def: RoadTypeDef, cubic: Cubic, end: DraftEnd): Ra
         code: 'wrongWay',
         severity: 'error',
         message: end.leaving
-          ? 'Leaves against the highway traffic, so nothing could take it. Draw it the other way round.'
-          : 'Joins against the highway traffic, so it could never merge. Draw it the other way round.',
+          ? `Leaves against the ${what} traffic, so nothing could take it. Draw it the other way round.`
+          : `Joins against the ${what} traffic, so it could never merge. Draw it the other way round.`,
         at: end.pos,
       });
     }
@@ -455,7 +796,7 @@ export function rampEndIssues(def: RoadTypeDef, cubic: Cubic, end: DraftEnd): Ra
     out.push({
       code: 'atGradeHighway',
       severity: 'warning',
-      message: 'Joins a highway at grade: right in and right out only, no turning across it.',
+      message: 'Joins a highway at grade: right in and right out only. Carry the road across for a signalled crossing, or change it in the junction panel.',
       at: end.pos,
     });
   }

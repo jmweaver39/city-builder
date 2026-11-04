@@ -50,9 +50,31 @@ export function mergePass(w: World): void {
   for (let i = 0; i < mergeLanes.length; i++) {
     const x = mergeLanes[i];
     let count = 0;
+    // An edge merge (core/edgeMerge.ts): the highway lane runs straight into x as a road
+    // lane, with no junction box and no crossings. Everyone then goes by time to the merge
+    // point, which keeps the order in step with where vehicles actually are.
+    let edge = false;
+    for (let k = prevStart[x]; k < prevStart[x + 1]; k++) if (!isConn[prevList[k]]) edge = true;
     for (let k = prevStart[x]; k < prevStart[x + 1]; k++) {
       const c = prevList[k];
-      if (!isConn[c]) continue;
+      if (!isConn[c]) {
+        for (let e = start[c]; e < start[c + 1]; e++) {
+          if (eT[e] !== ENTRY_REAL || count >= MAX_LIST) continue;
+          const toEnd = laneLen[c] - eS[e];
+          if (toEnd > FREE_MERGE_HORIZON) break;
+          const u = eV[e];
+          if (nextOf(w, u) !== x) continue;
+          const eta = etaOf(toEnd, speed[u]);
+          const zone = laneLen[c] - mergeFrom[c];
+          listV[count] = u;
+          listD[count] = toEnd;
+          listEta[count] = eta;
+          listKey[count] = toEnd <= zone ? PAST_BASE + toEnd : tick + eta / DT;
+          listHold[count] = toEnd - zone;
+          listF[count++] = k;
+        }
+        continue;
+      }
       const free = jn.ctl[c] === CTL_NONE;
       const zone = laneLen[c] - mergeFrom[c];
       for (let e = start[c]; e < start[c + 1]; e++) {
@@ -68,7 +90,7 @@ export function mergePass(w: World): void {
         // Past the merge point the body is in the way, whatever else: distance decides.
         // Inside, entry order decides, free merge or not, so that it agrees with the
         // guard; anything else lets two vehicles each defer to the other.
-        listKey[count] = d <= zone ? PAST_BASE + d : enterTick[u];
+        listKey[count] = d <= zone ? PAST_BASE + d : edge ? tick + eta / DT : enterTick[u];
         listHold[count] = d - zone;
         listF[count++] = k;
       }
@@ -88,7 +110,7 @@ export function mergePass(w: World): void {
           listEta[count] = eta;
           // When it will be inside: the same scale as entry steps of those already in,
           // so the order does not flip at the moment someone crosses the line.
-          listKey[count] = tick + etaOf(toEnd, speed[u]) / DT;
+          listKey[count] = edge ? tick + eta / DT : tick + etaOf(toEnd, speed[u]) / DT;
           listHold[count] = d - zone;
           listF[count++] = k;
         }

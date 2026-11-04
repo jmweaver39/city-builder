@@ -12,6 +12,8 @@ import { installRail, type RailApp } from './rail';
 import { registerKeys } from '../ui/keymap';
 import { markingKeys } from '../ui/markingKeys';
 import { installStreetLife } from './streetLife';
+import { installTrafficRules } from './trafficRules';
+import { installClipboard } from './clipboard';
 import { RoundaboutLayer } from '../render/roundabouts';
 import { buildStarterScene } from './starter';
 import { BenchRunner, benchPacer, benchParams, buildBenchScene } from './bench';
@@ -31,6 +33,8 @@ declare global {
       streetLife?: import('./streetLife').StreetLife;
       /** Landscaping (core/terrainEdit.ts): grid, strokes, sampling. */
       landscape?: import('../core/terrainEdit').TerrainEditor;
+      /** Middle-click copy and Cmd+V paste (app/clipboard.ts). */
+      clipboard?: import('./clipboard').ClipboardApp;
     };
   }
 }
@@ -189,6 +193,10 @@ async function boot(): Promise<void> {
   rail = installRail({ net, sim, renderer, tools, history, ui, warmRoads: warmUp });
   // Roundabout islands, drawn from the ring geometry (core/roundabout.ts).
   renderer.context.addLayer(new RoundaboutLayer(net, renderer.context));
+  // Traffic rules: speed-limit and ban signs, and the Junction > Rules keys (app/trafficRules.ts).
+  installTrafficRules({ net, sim, renderer, tools, ui });
+  // Middle-click or Option+click copies what is under the cursor; Cmd+V pastes it (app/clipboard.ts).
+  const clipboard = installClipboard({ renderer, tools, ui });
   // Trains go out on the line before the first frame, on a restored map too.
   rail.warm();
   if (bench) rail.trains.warm(300);
@@ -200,7 +208,7 @@ async function boot(): Promise<void> {
   // People, props and clutter close up. Off and free when zoomed out.
   const streetLife = installStreetLife({ net, sim, renderer, trains: rail.trains, history, ui: ui.context });
 
-  window.__cloverleaf = { net, sim, renderer, tools, history, ui, trains: rail.trains, rail: rail.layer, streetLife, landscape };
+  window.__cloverleaf = { net, sim, renderer, tools, history, ui, trains: rail.trains, rail: rail.layer, streetLife, landscape, clipboard };
 
   const runner = bench ? new BenchRunner({ sim, renderer }, bench) : null;
   let last = performance.now();

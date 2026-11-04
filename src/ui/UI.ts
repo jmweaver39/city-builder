@@ -54,6 +54,15 @@ export class UI {
       dock,
       toast: (message, kind) => this.toasts.show(message, kind),
       inspect: (target) => {
+        // The Markings tool shows a junction's or road's markings in its own side panel.
+        if (target && (target.kind === 'nodeMarkings' || target.kind === 'segmentMarkings') && options.tools.active.id === 'paint') {
+          this.inspectors.open(null);
+          if (this.toolbar && this.toolbar.currentTab !== 'paint') this.toolbar.openTab('paint');
+          this.toolbar?.refresh();
+          this.toolbar?.markings?.reveal();
+          this.shortcuts?.contextChanged();
+          return;
+        }
         // In the Junction tool, markings and shape open in its tray, not a floating panel.
         if (target && (target.kind === 'nodeMarkings' || target.kind === 'junctionShape') && this.toolbar?.currentTab === 'junction') {
           this.inspectors.open(null);
@@ -154,6 +163,12 @@ export class UI {
       },
       openPalette: () => this.palette.toggle(),
       toggleShortcuts: () => this.shortcuts.togglePinned(),
+      setRoadDetail: (pref) => {
+        const r = this.context.renderer as unknown as { setRoadDetail?(p: typeof pref): void };
+        r.setRoadDetail?.(pref);
+        this.context.toast(pref === 'auto' ? 'Road detail follows graphics quality' : `Road detail: ${pref[0].toUpperCase()}${pref.slice(1)}`);
+      },
+      openGraphics: () => this.menu.graphics(),
       setControlCard: (kind) => {
         tools.settings.junctionControl = kind as typeof tools.settings.junctionControl;
         this.toolbar.openTab('control');

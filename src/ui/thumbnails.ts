@@ -1,14 +1,10 @@
 /** Procedural card art: road cross sections from RoadTypeDef, and decal samples. */
 import type { DecalKind, LaneDef, LineStyle, PaintColor, RoadTypeDef } from '../core/types';
 import { sidewalkOn, totalHalfWidth } from '../core/roadTypes';
+import { PAINT_HEX } from '../core/paintStandard';
 
-export const PAINT_CSS: Record<PaintColor, string> = {
-  white: '#f2f4f5',
-  yellow: '#f3c63c',
-  blue: '#3f8fe8',
-  red: '#e0524d',
-  green: '#46b868',
-};
+/** The one paint palette (core/paintStandard.ts), for swatches and sketches. */
+export const PAINT_CSS: Record<PaintColor, string> = PAINT_HEX;
 
 const ASPHALT = '#3c4148';
 const SIDEWALK = '#a7abac';

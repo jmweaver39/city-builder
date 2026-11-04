@@ -224,6 +224,8 @@ describe('controlled access: no connector crosses a median', () => {
         nodes.push(street.nodes[0]);
       }
       const cross = net.drawRoad({ start: free(150, -200), end: free(150, 200), roadType: 'street-2' });
+      // A crossing drawn now is a signalled crossing; set back to right in, right out it keeps to its side.
+      for (const j of cross.junctions) net.setJunctionControl(j, { highwayAccess: 'rightInOut' });
       nodes.push(...cross.junctions);
       const g = net.laneGraph;
       for (const node of nodes) {

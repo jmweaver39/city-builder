@@ -35,6 +35,8 @@ import {
 import { lanePolyline, type PolylineData } from './geometry';
 import { roundaboutLaneLinks } from './roundabout';
 import { islandBlocker, kerbFitter } from './junctionShape';
+import { edgeMergeLinks } from './edgeMerge';
+import { applyTrafficRules } from './trafficRules';
 
 /** A road lane before it has a dense index. Immutable once built. */
 export interface RoadLaneProto extends RoadLaneInfo {
@@ -94,17 +96,33 @@ export function buildNodeLanes(
   defOf: (id: Id) => RoadTypeDef,
   lanesOf: (id: Id) => readonly (RoadLaneProto | null)[],
   attachOf?: (id: Id, atStart: boolean) => RampAttach | undefined,
+  shiftOf?: (id: Id, atStart: boolean) => number,
 ): NodeLanes {
   const nodeId = layout.nodeId;
-  const arms = buildArmLanes(layout, geom, geomOf, defOf, lanesOf, attachOf);
+  const arms = buildArmLanes(layout, geom, geomOf, defOf, lanesOf, attachOf, shiftOf);
   if (layout.kind === 'empty') return { arms, connectors: [], direct: [], directKey: '' };
+  if (layout.kind === 'merge' && layout.merge) {
+    // Edge merge: the highway's lanes join directly, only the ramp's taper has connectors (core/edgeMerge.ts).
+    const hand = control.laneLinks ? controlLaneLinks(control, arms) : null;
+    const { direct, links } = edgeMergeLinks(arms, layout.merge, hand);
+    const connectors: ConnectorProto[] = [];
+    for (const link of links) {
+      const c = buildConnector(nodeId, link);
+      if (c) connectors.push(c);
+    }
+    connectors.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    computeConflicts(connectors);
+    return { arms, connectors, direct, directKey: directKeyOf(direct) };
+  }
   if (layout.kind === 'plain') {
     // No junction space here, so even user links join the road lanes directly.
     const links = control.laneLinks ? controlLaneLinks(control, arms) : plainJointLinks(arms);
     return { arms, connectors: [], direct: links, directKey: directKeyOf(links) };
   }
   // Roundabout ring nodes have their own lane use, see core/roundabout.ts.
-  const links = control.laneLinks ? controlLaneLinks(control, arms) : (roundaboutLaneLinks(arms, defOf) ?? autoLaneLinks(arms));
+  const base = control.laneLinks ? controlLaneLinks(control, arms) : (roundaboutLaneLinks(arms, defOf) ?? autoLaneLinks(arms, control.highwayAccess));
+  // Lane arrows, U-turns and lane changing straight through (core/trafficRules.ts).
+  const links = applyTrafficRules(base, arms, control);
   const connectors: ConnectorProto[] = [];
   // A junction shape's islands split traffic: nothing drives through one.
   const blocked = islandBlocker(geom, control.shape, defOf, geomOf);

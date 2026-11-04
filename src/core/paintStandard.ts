@@ -16,7 +16,7 @@ import type { CrosswalkStyle, LaneDef, LineStyle, LineStyleSpec, MarkingStyle, N
 // ---------------------------------------------------------------------------
 
 /** Line widths. */
-export const LINE_W = {
+export const LINE_W: { readonly lane: number; readonly centre: number; readonly edge: number; readonly stop: number; readonly guide: number; readonly outline: number } = {
   lane: 0.14,
   centre: 0.14,
   edge: 0.168,
@@ -24,7 +24,25 @@ export const LINE_W = {
   guide: 0.12,
   /** The pale outline along kerbless roads. Not paint a player places. */
   outline: 0.16,
-} as const;
+};
+
+/**
+ * Lines are wider on fast roads. A width of exactly LINE_W.lane or LINE_W.edge
+ * means "the standard width" and is drawn at the road's own: a lane line placed by
+ * hand on a highway is as wide as the highway's own lane lines.
+ */
+export const FAST_W = { lane: 0.18, edge: 0.22 } as const;
+
+export function standardWidth(width: number, speedKmh: number): number {
+  if (speedClassOf(speedKmh) !== 'fast') return width;
+  if (Math.abs(width - LINE_W.lane) < 1e-9) return FAST_W.lane;
+  if (Math.abs(width - LINE_W.edge) < 1e-9) return FAST_W.edge;
+  return width;
+}
+
+/** Highway lane drops and exit-only lanes: a wide, short-dashed line over the last stretch. */
+export const EXIT_ONLY = { width: 0.3, dash: 0.9, gap: 2.7, reach: 150 } as const;
+export const LANE_DROP = { width: 0.3, dash: 2, gap: 2 } as const;
 
 /** Centre to centre distance of the two lines of a double. */
 export const DOUBLE_SPACING = 0.32;
@@ -123,6 +141,8 @@ export function styleSpan(spec: Pick<LineStyleSpec, 'style' | 'width'> & { gap: 
 export interface PaintStroke {
   /** Metres right of the path. */
   shift: number;
+  /** The second line of a two-line look, painted in `color2` when the look has one. */
+  second?: true;
   width: number;
   /** Dash period, 0 for solid. */
   period: number;
@@ -153,13 +173,13 @@ export function strokesOfSpec(spec: ResolvedSpec): PaintStroke[] | null {
     case 'dotted':
       return [dashed(centre)];
     case 'double':
-      return [solid(centre - side), solid(centre + side)];
+      return [solid(centre - side), { ...solid(centre + side), second: true }];
     case 'doubleDashed':
-      return [dashed(centre - side), dashed(centre + side)];
+      return [dashed(centre - side), { ...dashed(centre + side), second: true }];
     case 'solidDashed':
-      return [solid(centre - side), dashed(centre + side)];
+      return [solid(centre - side), { ...dashed(centre + side), second: true }];
     case 'dashedSolid':
-      return [dashed(centre - side), solid(centre + side)];
+      return [dashed(centre - side), { ...solid(centre + side), second: true }];
     case 'empty':
       return [];
     default:
@@ -174,7 +194,8 @@ export function strokesOfSpec(spec: ResolvedSpec): PaintStroke[] | null {
 export function autoLineSpec(style: LineStyle, color: PaintColor, width: number, speedKmh: number): ResolvedSpec | null {
   if (style === 'none') return null;
   const d = style === 'dotted' ? DOT : dashFor(speedKmh);
-  return { style: style as NodeLineStyle, color, width, dash: d.dash, space: d.gap, gap: DOUBLE_SPACING - width, offset: 0 };
+  const w = standardWidth(width, speedKmh);
+  return { style: style as NodeLineStyle, color, width: w, dash: d.dash, space: d.gap, gap: DOUBLE_SPACING - w, offset: 0 };
 }
 
 /**
@@ -210,7 +231,11 @@ export interface BoundaryLine {
 const OUTLINE_HEX = '#c9c9c4';
 
 /** Every painted line along a road, as offsets from the centreline. */
-export function boundaryLines(lanes: readonly LaneDef[], m: MarkingStyle, oneWay: boolean, medianKind: string, medianWidth: number, medianOffset = 0, outline = 0): BoundaryLine[] {
+export function boundaryLines(lanes: readonly LaneDef[], m: MarkingStyle, oneWay: boolean, medianKind: string, medianWidth: number, medianOffset = 0, outline = 0, speedKmh = 50): BoundaryLine[] {
+  // On fast roads the edge on the drivers' left (beside the median, or the left of a
+  // one-way carriageway) is yellow, where the edge colour is the default white.
+  const fast = speedClassOf(speedKmh) === 'fast';
+  const leftEdge: PaintColor = fast && m.edgeColor === 'white' ? 'yellow' : m.edgeColor;
   const out: BoundaryLine[] = [];
   const add = (offset: number, style: MarkingStyle['laneLine'], color: PaintColor, width: number, role: AutoLineRole, key: string) => {
     if (style !== 'none') out.push({ offset, style, color, width, role, key });
@@ -236,8 +261,9 @@ export function boundaryLines(lanes: readonly LaneDef[], m: MarkingStyle, oneWay
     // The median can sit anywhere in the strip, so it belongs to one gap only.
     const holdsMedian = medianOffset > edgeA - 0.01 && medianOffset < edgeB + 0.01 && medianWidth > 0;
     if (raised && holdsMedian) {
-      add(edgeA - EDGE_INSET + 0.02, m.edgeLine, m.edgeColor, LINE_W.lane, 'edge', `b${i}L`);
-      add(edgeB + EDGE_INSET - 0.02, m.edgeLine, m.edgeColor, LINE_W.lane, 'edge', `b${i}R`);
+      // Each side of a median is the left edge of the lanes beside it.
+      add(edgeA - EDGE_INSET + 0.02, m.edgeLine, a.dir === -1 ? leftEdge : m.edgeColor, LINE_W.lane, 'edge', `b${i}L`);
+      add(edgeB + EDGE_INSET - 0.02, m.edgeLine, b.dir === 1 ? leftEdge : m.edgeColor, LINE_W.lane, 'edge', `b${i}R`);
       continue;
     }
     if (a.dir !== b.dir) {
@@ -256,7 +282,8 @@ export function boundaryLines(lanes: readonly LaneDef[], m: MarkingStyle, oneWay
   }
   const lo = lanes[0].offset - lanes[0].width / 2;
   const hi = lanes[n - 1].offset + lanes[n - 1].width / 2;
-  add(lo + EDGE_INSET, m.edgeLine, m.edgeColor, LINE_W.edge, 'edge', 'L');
+  // A one-way carriageway's left edge is its drivers' left; on a two-way road both edges are kerb side.
+  add(lo + EDGE_INSET, m.edgeLine, oneWay ? leftEdge : m.edgeColor, LINE_W.edge, 'edge', 'L');
   add(hi - EDGE_INSET, m.edgeLine, m.edgeColor, LINE_W.edge, 'edge', 'R');
   outlines();
   return out;
@@ -297,7 +324,7 @@ export function arrowShape(left: boolean, straight: boolean, right: boolean, utu
 // The named standards a player paints with
 // ---------------------------------------------------------------------------
 
-export type LineStandardId = 'lane' | 'laneSolid' | 'edge' | 'centre' | 'centreDouble' | 'dotted' | 'guide' | 'stop' | 'giveWay' | 'zebra' | 'ladder' | 'crossLines';
+export type LineStandardId = 'lane' | 'laneSolid' | 'edge' | 'centre' | 'centreDouble' | 'dotted' | 'exitOnly' | 'laneDrop' | 'guide' | 'stop' | 'giveWay' | 'zebra' | 'ladder' | 'crossLines';
 export type FillStandardId = 'hatch' | 'gore' | 'solidFill';
 
 export interface LineStandard {
@@ -319,11 +346,13 @@ export interface FillStandard {
 
 export const LINE_STANDARDS: readonly LineStandard[] = [
   { id: 'lane', name: 'Lane line', tip: 'Dashed white between lanes going the same way; dash length follows the road speed', spec: { style: 'dashed', color: 'white', width: LINE_W.lane }, speedDash: true },
-  { id: 'laneSolid', name: 'Solid lane line', tip: 'No changing lanes here', spec: { style: 'solid', color: 'white', width: LINE_W.lane } },
+  { id: 'laneSolid', name: 'Solid no lane change', tip: 'A solid lane line: no changing lanes here, as before an exit', spec: { style: 'solid', color: 'white', width: LINE_W.lane } },
   { id: 'edge', name: 'Edge line', tip: 'Solid white along the edge of the carriageway', spec: { style: 'solid', color: 'white', width: LINE_W.edge } },
   { id: 'centre', name: 'Centre line', tip: 'Dashed yellow between the two directions', spec: { style: 'dashed', color: 'yellow', width: LINE_W.centre }, speedDash: true },
   { id: 'centreDouble', name: 'Centre double yellow', tip: 'No overtaking: two solid yellow lines', spec: { style: 'double', color: 'yellow', width: LINE_W.centre, gap: DOUBLE_SPACING - LINE_W.centre } },
   { id: 'dotted', name: 'Dotted line', tip: 'Short dashes, as at a lane drop or across a junction', spec: { style: 'dotted', color: 'white', width: LINE_W.lane, dash: DOT.dash, space: DOT.gap } },
+  { id: 'exitOnly', name: 'Exit-only dotted line', tip: 'Wide short dashes beside a lane that leaves at the next exit', spec: { style: 'dashed', color: 'white', width: EXIT_ONLY.width, dash: EXIT_ONLY.dash, space: EXIT_ONLY.gap } },
+  { id: 'laneDrop', name: 'Lane drop', tip: 'Wide dashes where a lane ends ahead', spec: { style: 'dashed', color: 'white', width: LANE_DROP.width, dash: LANE_DROP.dash, space: LANE_DROP.gap } },
   { id: 'guide', name: 'Junction guide', tip: 'Short dashes carrying a lane line through a junction', spec: { style: 'dashed', color: 'white', width: LINE_W.guide, dash: GUIDE_DASH.dash, space: GUIDE_DASH.gap } },
   { id: 'stop', name: 'Stop line', tip: 'Bar across the lanes coming in', spec: { style: 'stopLine', color: 'white', width: STOP.width } },
   { id: 'giveWay', name: 'Give-way teeth', tip: 'A row of triangles pointing at the driver', spec: { style: 'sharkTeeth', color: 'white', width: TEETH.length, dash: TEETH.base, space: TEETH.space } },
@@ -375,7 +404,7 @@ const near = (a: number | undefined, b: number | undefined) => (a === undefined 
  * dashes unset on a speed-dashed style counts as that standard on any road.
  */
 export function matchStandard(spec: LineStyleSpec): LineStandard | null {
-  if (spec.hex || spec.offset || spec.align || spec.border) return null;
+  if (spec.hex || spec.offset || spec.align || spec.border || spec.color2 || spec.hex2) return null;
   for (const s of LINE_STANDARDS) {
     const t = s.spec;
     if (t.style !== spec.style || t.color !== spec.color || !near(t.width, spec.width)) continue;

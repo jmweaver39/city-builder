@@ -311,6 +311,28 @@ summary.section-title:hover { color: var(--text-2); }
 .strip-add { margin-bottom: 2px; }
 .strip-add .btn { padding: 3px 7px; font-size: 12px; }
 .strip-editor { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; }
+.strip-item { position: relative; }
+.strip-item:focus-visible { outline: 2px solid var(--focus, var(--cyan-2)); outline-offset: -2px; }
+.strip-resize { position: absolute; top: 0; right: -3px; bottom: 0; width: 7px; z-index: 1; cursor: ew-resize; touch-action: none; }
+.strip-resize:hover, body.strip-resizing .strip-item.selected .strip-resize { background: var(--accent-ring); }
+body.strip-resizing, body.strip-resizing * { cursor: ew-resize !important; }
+.strip-add { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin-bottom: 2px; }
+.strip-add .icon-btn { min-width: 30px; height: 30px; padding: 0 4px; }
+.strip-add .card-sep { height: 20px; align-self: center; }
+.strip-editor-head { display: flex; align-items: center; gap: 2px; }
+.strip-editor-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); font-weight: 600; color: var(--text-1); }
+.strip-editor-head .icon-btn { min-width: 28px; height: 28px; padding: 0 4px; }
+.strip-editor-head .icon-btn.danger { color: var(--stop); }
+.strip-editor .seg-btn svg { width: 16px; height: 16px; }
+/* The road inspector's lane editor: the strip, then Revert and Apply. */
+.lane-editor .strip-wrap { margin-top: var(--s-1); }
+.lane-editor .strip { height: 72px; }
+.lane-edit-hint { margin-top: 2px; }
+.lane-edit-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--s-2); margin-top: var(--s-2); }
+.lane-edit-status { flex: 1; color: var(--caution); font-weight: 600; }
+.lane-apply { display: inline-flex; align-items: center; gap: var(--s-1); }
+.lane-apply svg { width: 16px; height: 16px; }
+.lane-editor.pending .strip-wrap { box-shadow: inset 0 0 0 1px var(--caution); }
 
 /* Tooltip */
 #tooltip {
@@ -380,11 +402,13 @@ summary.section-title:hover { color: var(--text-2); }
   display: flex; flex: none; gap: 2px; padding-left: var(--s-1); margin-left: auto; border-left: 1px solid var(--border);
   position: sticky; right: 0; background: var(--surface-1-solid); box-shadow: -12px 0 12px -6px var(--surface-1-solid);
 }
-.tray { display: flex; border-bottom: 1px solid var(--border); min-height: 136px; }
+.tray { display: flex; border-bottom: 1px solid var(--border); }
+/* Trays size to their content: the cards row is one row, the options column scrolls past it. */
+.tray .cards-wrap { align-self: flex-start; }
 .tray.closed { display: none; }
 .options {
   flex: none; width: 236px; padding: var(--s-3); border-right: 1px solid var(--border);
-  display: flex; flex-direction: column; gap: var(--s-2); max-height: 220px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: var(--s-2); max-height: 132px; overflow-y: auto;
 }
 .options:empty { display: none; }
 .options > .btn, .options .btn-row { align-self: flex-start; margin-top: 0; }
@@ -395,7 +419,7 @@ summary.section-title:hover { color: var(--text-2); }
 .options .field select, .options .field .vselect, .options > select { min-width: 0; text-overflow: ellipsis; }
 .options:has(.wall-options) { width: 288px; }
 /* The Junction tool's Markings and Shape tabs host their full editors in the strip. */
-.options.wide-editor { width: 380px; max-height: min(56vh, 520px); }
+.options.wide-editor { width: 380px; max-height: 132px; }
 .tab-editor { display: flex; flex-direction: column; gap: var(--s-2); }
 .markings-draw { grid-template-columns: repeat(6, 1fr); }
 .wall-options { display: flex; flex-direction: column; gap: var(--s-2); }
@@ -735,4 +759,104 @@ details.advanced[open] { display: flex; flex-direction: column; gap: var(--s-2);
   .toasts { top: calc(var(--top-h, 44px) + var(--s-2)); }
   .shortcuts { width: 150px; top: calc(var(--top-h, 44px) + var(--s-2)); right: var(--s-1); padding: var(--s-2); }
   .palette-back { padding-top: 64px; }
+}
+
+/* Modify > Upgrade cards: the picked card's styles (UpgradeControls.ts). */
+.upgrade-styles { gap: var(--s-1); margin: 2px 0 4px; }
+.upgrade-style { width: 40px; height: 40px; padding: 3px; border-radius: var(--r-md); border: 1px solid var(--border); background: var(--surface-inset); cursor: pointer; }
+.upgrade-style svg { width: 100%; height: 100%; display: block; }
+.upgrade-style:hover { border-color: var(--border-strong); background: var(--surface-3); }
+.upgrade-style.active { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.upgrade-style-name { font-size: var(--fs-xs); color: var(--accent-text); margin-bottom: 4px; }
+.upgrade-grid { gap: 4px; align-items: center; }
+.upgrade-grid select { min-width: 0; width: 100%; }
+
+/* Junction > Control | Rules switch and the traffic rules pickers (ui/TrafficRulesTray.ts). */
+.rules-switch { display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--surface-2, rgba(255, 255, 255, .04)); }
+.rules-switch-btn {
+  flex: 1; height: 26px; border: 0; border-radius: 6px; background: transparent; color: var(--text-2);
+  font: inherit; font-size: var(--fs-sm); font-weight: 600; cursor: pointer;
+}
+.rules-switch-btn:hover { color: var(--text-1); background: var(--surface-3); }
+.rules-switch-btn.active { background: var(--surface-3); color: var(--text-1); box-shadow: inset 0 0 0 1px var(--accent-ring); }
+.rules-picker { display: flex; flex-wrap: wrap; gap: 4px; }
+.rules-picker button {
+  width: 36px; height: 36px; padding: 3px; border: 1px solid transparent; border-radius: 8px;
+  background: var(--surface-2, rgba(255, 255, 255, .04)); cursor: pointer; display: grid; place-items: center;
+}
+.rules-picker button:hover { background: var(--surface-3); }
+.rules-picker button.active { border-color: var(--accent-ring); background: var(--surface-3); box-shadow: 0 0 0 1px var(--accent-ring); }
+.rules-picker svg { width: 28px; height: 28px; display: block; }
+.rules-picker .rule-all { color: var(--text-1); font-size: var(--fs-xs); font-weight: 700; }
+.card .art.picture.rule-art svg { width: 44px; height: 44px; stroke-width: initial; }
+
+/* ---------------------------------------------------------------------------
+ * The Markings tool (ui/MarkingStrip.ts): one compact strip in the tray, a side
+ * panel on demand. 4 px scale, icon-first, keys in tooltips.
+ * ------------------------------------------------------------------------- */
+.tray.compact { min-height: 0; }
+.tray.compact .options { display: none; }
+.tray.compact .cards { padding: var(--s-1) var(--s-2); overflow: visible; align-items: center; }
+.tray.compact .cards-wrap { align-self: stretch; overflow-x: auto; overflow-y: visible; scrollbar-width: none; }
+.mk-strip { position: relative; display: flex; align-items: center; gap: var(--s-2); min-height: 40px; flex: 1; min-width: max-content; }
+.mk-group { display: flex; align-items: center; gap: var(--s-1); flex: none; }
+.mk-sep { width: 1px; height: 24px; background: var(--border); flex: none; }
+.mk-draw { min-width: 32px; padding: 0 6px; }
+.mk-draw.active, .mk-dash.active, .mk-more.active { color: var(--text-1); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.icon-btn:focus-visible, .mk-look:focus-visible, .mk-dot:focus-visible, .mk-step:focus-visible, .mk-preset:focus-visible, .mk-stamp:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.mk-look {
+  display: flex; align-items: center; gap: 2px; height: 32px; padding: 2px 2px 2px 3px; border-radius: var(--r-md);
+  background: var(--surface-inset); border: 1px solid var(--border); color: var(--text-2); cursor: pointer;
+}
+.mk-look:hover { border-color: var(--border-strong); color: var(--text-1); }
+.mk-look img, .mk-look canvas { border-radius: var(--r-sm) !important; }
+.mk-caret { display: grid; place-items: center; width: 14px; }
+.mk-dots { display: flex; align-items: center; gap: var(--s-1); padding: 0 2px; }
+.mk-dot { width: 18px; height: 18px; padding: 0; border-radius: 50%; border: 1px solid rgba(0, 0, 0, .35); cursor: pointer; position: relative; }
+/* A 26 px hit area round each small dot. */
+.mk-dot::after { content: ''; position: absolute; inset: -4px; border-radius: 50%; }
+.mk-dot:hover { transform: scale(1.12); }
+.mk-dot.active { box-shadow: 0 0 0 2px var(--surface-1), 0 0 0 4px var(--accent); }
+.mk-stepper { display: flex; align-items: center; height: 28px; border-radius: var(--r-md); background: var(--surface-inset); border: 1px solid var(--border); }
+.mk-step { width: 24px; height: 26px; padding: 0; border: 0; background: transparent; color: var(--text-2); font-size: 15px; cursor: pointer; border-radius: var(--r-sm); }
+.mk-step:hover { color: var(--text-1); background: var(--surface-3); }
+.mk-step-value { min-width: 46px; text-align: center; font-size: var(--fs-sm); font-variant-numeric: tabular-nums; color: var(--text-1); }
+.mk-stamps { gap: 2px; }
+.mk-stamp { width: 34px; height: 34px; padding: 1px; display: grid; place-items: center; border-radius: var(--r-md); border: 1px solid transparent; background: var(--surface-inset); cursor: pointer; }
+.mk-stamp:hover { border-color: var(--border-strong); }
+.mk-stamp.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.mk-stamp-text { font-weight: 700; color: var(--text-1); }
+.mk-text { width: 96px; height: 28px; margin-left: var(--s-1); }
+.mk-tail { margin-left: auto; padding-left: var(--s-2); position: sticky; right: 0; background: var(--surface-1-solid); box-shadow: -10px 0 10px -6px var(--surface-1-solid); }
+.mk-context { display: flex; align-items: center; gap: 2px; height: 24px; padding: 0 2px 0 var(--s-2); border-radius: 12px; background: var(--accent-soft); color: var(--accent-text); font-size: var(--fs-xs); font-weight: 600; white-space: nowrap; }
+.mk-context-close { display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; background: transparent; color: inherit; border-radius: 50%; cursor: pointer; }
+.mk-context-close svg { width: 12px; height: 12px; }
+.mk-context-close:hover { background: var(--surface-3); color: var(--text-1); }
+.mk-more { position: relative; }
+.mk-badge { position: absolute; top: 2px; right: 2px; min-width: 14px; height: 14px; padding: 0 3px; border-radius: 7px; background: var(--accent-strong); color: var(--text-1); font-size: 9px; line-height: 14px; }
+.mk-popover {
+  position: fixed; z-index: 40; width: min(420px, calc(100vw - 16px)); max-height: min(50vh, 360px); overflow-y: auto;
+  padding: var(--s-2); background: var(--surface-1-solid);
+}
+.mk-pop-title { padding: 0 var(--s-1) var(--s-2); color: var(--text-3); font-size: 10px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+.mk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: var(--s-1); }
+.mk-preset {
+  display: flex; flex-direction: column; align-items: center; gap: 2px; padding: var(--s-1); border-radius: var(--r-md);
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); font-size: 10px; line-height: 1.2; text-align: center; cursor: pointer;
+}
+.mk-preset:hover { border-color: var(--border-strong); background: var(--surface-3); color: var(--text-1); }
+.mk-side {
+  position: absolute; right: var(--s-2); top: calc(var(--top-h, 44px) + var(--s-4)); bottom: 132px; z-index: 12; width: 312px;
+  display: none; flex-direction: column; overflow: hidden;
+}
+.mk-side.open { display: flex; }
+.mk-side-head { display: flex; align-items: center; gap: var(--s-2); padding: var(--s-1) var(--s-1) var(--s-1) var(--s-3); border-bottom: 1px solid var(--border); }
+.mk-side-title { flex: 1; font-weight: 600; font-size: var(--fs-md); }
+.mk-side-body { flex: 1; overflow-y: auto; padding: var(--s-2) var(--s-3) var(--s-3); display: flex; flex-direction: column; gap: var(--s-2); scrollbar-width: thin; }
+@media (max-width: 560px) {
+  .tray.compact .cards { padding: var(--s-1); }
+  .mk-strip { gap: var(--s-1); }
+  .mk-draw { min-width: 30px; padding: 0 4px; }
+  /* The side panel becomes a bottom sheet above the bar. */
+  .mk-side { left: var(--s-1); right: var(--s-1); width: auto; top: auto; bottom: 124px; max-height: 44vh; }
 }

@@ -11,6 +11,7 @@ import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import type { HdrEffect, PostPipelineApi } from './context';
 import type { QualitySettings } from './quality';
 import type { GpuPhase } from './profile';
+import { AO_RECON_GLSL, aoPosScaleBias } from './aoMath';
 
 const FAR_LOG = (far: number) => Math.log2(far + 1);
 
@@ -28,71 +29,137 @@ float viewDepth(vec2 uv) {
 }
 `;
 
+/*
+ * Ambient occlusion runs at a fraction of the screen in three passes.
+ *
+ * 1. AO_DEPTH_FS: each AO texel takes the view depth of one full-resolution depth
+ *    texel (aoSource) and stores it linear, as 32-bit float. Done once, so the
+ *    taps below read a small float texture and never decode log depth.
+ * 2. AO_FS: positions are rebuilt from the centre of that same full-resolution
+ *    texel (aoViewPos). Rebuilding from the AO texel's own centre, as this pass
+ *    once did, put each point up to half a full pixel off its surface; on ground at
+ *    a low angle that tilted the normal, and the rounding of each row decided which
+ *    way, so flat ground showed horizontal stripes (tests/render/aoDepth.test.ts).
+ * 3. AO_BLUR_FS twice: a separable blur that keeps to one surface, which also
+ *    removes the 4x4 rotation pattern of the taps.
+ */
+const AO_DEPTH_FS = /* glsl */ `
+precision highp float;
+uniform highp sampler2D tDepth;
+uniform float uLogFar;
+uniform vec2 uFull;
+uniform vec2 uScale;
+uniform vec2 uPosScale;
+uniform vec2 uPosBias;
+${AO_RECON_GLSL}
+void main() {
+  float d = texelFetch(tDepth, ivec2(aoSource(floor(gl_FragCoord.xy))), 0).r;
+  gl_FragColor = vec4(exp2(d * uLogFar) - 1.0, 0.0, 0.0, 1.0);
+}
+`;
+
 const AO_FS = /* glsl */ `
 precision highp float;
-varying vec2 vUv;
-${DEPTH_FN}
-uniform vec2 uTan;
-uniform vec2 uTexel;
+precision highp int;
+uniform highp sampler2D tLin;
+uniform vec2 uFull;
+uniform vec2 uScale;
+uniform vec2 uPosScale;
+uniform vec2 uPosBias;
+uniform vec2 uAoMax;
 uniform float uPx;
 #ifndef SAMPLES
 #define SAMPLES 10
 #endif
-vec3 viewPos(vec2 uv, float z) { return vec3((uv * 2.0 - 1.0) * uTan * z, -z); }
-float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+${AO_RECON_GLSL}
+// AO texel indices are floats holding whole numbers: cheaper than ints per tap.
+float linZ(vec2 a) { return texelFetch(tLin, ivec2(a), 0).r; }
+float linZc(vec2 a) { return linZ(clamp(a, vec2(0.0), uAoMax)); }
+// Tangent along one axis, from the side whose next texel continues a plane through
+// the centre: inverse depth is linear across the screen on a plane, so the side with
+// the smaller extrapolation error is the same surface. Keeps kerb edges clean.
+vec3 tangent(vec2 a, vec2 e, vec3 P, float iz) {
+  float m1 = linZc(a - e), m2 = linZc(a - 2.0 * e);
+  float p1 = linZc(a + e), p2 = linZc(a + 2.0 * e);
+  float em = abs(2.0 / m1 - 1.0 / m2 - iz);
+  float ep = abs(2.0 / p1 - 1.0 / p2 - iz);
+  // At the screen edge only the side that exists will do.
+  if (any(lessThan(a - 2.0 * e, vec2(0.0)))) em = 1e9;
+  if (any(greaterThan(a + 2.0 * e, uAoMax))) ep = 1e9;
+  return em < ep ? P - aoViewPos(a - e, m1) : aoViewPos(a + e, p1) - P;
+}
 void main() {
-  float z = viewDepth(vUv);
+  vec2 a = floor(gl_FragCoord.xy);
+  float z = linZ(a);
   if (z > 1500.0) { gl_FragColor = vec4(1.0); return; }
-  vec3 P = viewPos(vUv, z);
-  // Normal from whichever neighbour is closer on each axis, so edges stay clean.
-  float zl = viewDepth(vUv - vec2(uTexel.x, 0.0));
-  float zr = viewDepth(vUv + vec2(uTexel.x, 0.0));
-  float zd = viewDepth(vUv - vec2(0.0, uTexel.y));
-  float zu = viewDepth(vUv + vec2(0.0, uTexel.y));
-  vec3 dx = abs(zl - z) < abs(zr - z) ? P - viewPos(vUv - vec2(uTexel.x, 0.0), zl) : viewPos(vUv + vec2(uTexel.x, 0.0), zr) - P;
-  vec3 dy = abs(zd - z) < abs(zu - z) ? P - viewPos(vUv - vec2(0.0, uTexel.y), zd) : viewPos(vUv + vec2(0.0, uTexel.y), zu) - P;
-  vec3 N = normalize(cross(dx, dy));
+  vec3 P = aoViewPos(a, z);
+  vec3 N = normalize(cross(tangent(a, vec2(1.0, 0.0), P, 1.0 / z), tangent(a, vec2(0.0, 1.0), P, 1.0 / z)));
   float radius = clamp(z * 0.012, 0.9, 7.0);
-  float rPx = clamp(radius * uPx / z, 2.5, 70.0);
-  float phase = ign(gl_FragCoord.xy) * 6.2831853;
+  float rPx = clamp(radius * uPx / z, 3.0, 64.0);
+  // Bias grows with the size of a texel at this depth, so precision never reads as
+  // occlusion near or far; the angle bias leaves flat ground at grazing angles open.
+  float bias = 0.6 * z / uPx;
+  const float ANGLE_BIAS = 0.12;
+  // 4x4 Bayer rotation and radius jitter; the blur averages the pattern away.
+  ivec2 ia = ivec2(a);
+  int bx = ia.x & 3, by = ia.y & 3;
+  int bayer = (((bx ^ by) & 1) << 3) | ((by & 1) << 2) | ((bx ^ by) & 2) | ((by >> 1) & 1);
+  float rot = (float(bayer) + 0.5) * (6.2831853 / 16.0);
+  float jit = fract(float(bayer) * 0.618034 + 0.25);
+  // Taps step round a spiral by the golden angle, rotated rather than recomputed.
+  vec2 dir = vec2(cos(rot), sin(rot));
+  const mat2 GOLDEN = mat2(-0.7373688, 0.6754903, -0.6754903, -0.7373688);
+  float fallK = 1.0 / (3.0 * radius * radius);
   float occ = 0.0;
-  float bias = 0.012 * radius;
   for (int i = 0; i < SAMPLES; i++) {
-    float t = (float(i) + 0.5) / float(SAMPLES);
-    float a = phase + t * 24.0;
-    vec2 uv = vUv + vec2(cos(a), sin(a)) * sqrt(t) * rPx * uTexel;
-    float zs = viewDepth(uv);
-    vec3 v = viewPos(uv, zs) - P;
-    float len2 = dot(v, v);
-    float fall = 1.0 - smoothstep(0.25, 1.0, len2 / (radius * radius * 4.0));
-    occ += max(dot(N, v) - bias, 0.0) / (len2 + 0.05 * radius * radius) * fall * radius;
+    float t = (float(i) + jit) * (1.0 / float(SAMPLES));
+    // Clamped here so the depth and the position come from the same texel.
+    vec2 s = clamp(floor(a + 0.5 + dir * max(sqrt(t) * rPx, 1.5)), vec2(0.0), uAoMax);
+    dir = GOLDEN * dir;
+    float zs = linZ(s);
+    vec3 v = aoViewPos(s, zs) - P;
+    float len2 = dot(v, v) + 1e-8;
+    float inv = inversesqrt(len2);
+    float cosA = (dot(N, v) - bias) * inv;
+    // Full weight out to one radius, none past two.
+    float fall = clamp(4.0 / 3.0 - len2 * fallK, 0.0, 1.0);
+    // Nearer occluders count for more, which keeps the dark line under cars and kerbs.
+    float near = radius / (len2 * inv + 0.35 * radius);
+    occ += max(cosA - ANGLE_BIAS, 0.0) * fall * near;
   }
-  occ /= float(SAMPLES);
-  float ao = clamp(1.0 - 1.1 * occ, 0.0, 1.0);
+  occ /= float(SAMPLES) * (1.0 - ANGLE_BIAS);
+  float ao = clamp(1.0 - 1.6 * occ, 0.0, 1.0);
   ao = mix(ao, 1.0, smoothstep(600.0, 1500.0, z));
-  gl_FragColor = vec4(ao, ao, ao, 1.0);
+  gl_FragColor = vec4(ao, 0.0, 0.0, 1.0);
 }
 `;
 
 const AO_BLUR_FS = /* glsl */ `
 precision highp float;
-varying vec2 vUv;
-${DEPTH_FN}
+uniform highp sampler2D tLin;
 uniform sampler2D tAo;
-uniform vec2 uStep;
+uniform ivec2 uDir;
+uniform ivec2 uAoMax;
+float linZ(ivec2 a) { return texelFetch(tLin, clamp(a, ivec2(0), uAoMax), 0).r; }
 void main() {
-  float z = viewDepth(vUv);
+  ivec2 a = ivec2(gl_FragCoord.xy);
+  float z = linZ(a);
+  float iz = 1.0 / z;
+  // Inverse depth along the blur line, predicted from the flatter neighbour, so ground
+  // at a grazing angle (steep in depth, flat in inverse depth) still blurs as one surface.
+  float sm = iz - 1.0 / linZ(a - uDir);
+  float sp = 1.0 / linZ(a + uDir) - iz;
+  float slope = abs(sm) < abs(sp) ? sm : sp;
   float sum = 0.0;
   float weight = 0.0;
   for (int i = -3; i <= 3; i++) {
-    vec2 uv = vUv + uStep * float(i);
-    float zs = viewDepth(uv);
-    float w = exp(-abs(zs - z) / (0.02 * z + 0.05)) * (1.0 - abs(float(i)) * 0.12);
-    sum += texture2D(tAo, uv).r * w;
+    ivec2 s = clamp(a + uDir * i, ivec2(0), uAoMax);
+    float err = abs(1.0 / linZ(s) - (iz + float(i) * slope)) * z;
+    float w = exp(-0.125 * float(i * i)) * max(0.0, 1.0 - err * 50.0);
+    sum += texelFetch(tAo, s, 0).r * w;
     weight += w;
   }
-  float ao = sum / max(weight, 1e-4);
-  gl_FragColor = vec4(ao, ao, ao, 1.0);
+  gl_FragColor = vec4(sum / max(weight, 1e-4), 0.0, 0.0, 1.0);
 }
 `;
 
@@ -196,6 +263,8 @@ export class PostPipeline implements PostPipelineApi {
   sceneTarget: THREE.WebGLRenderTarget | null = null;
   private aoTarget: THREE.WebGLRenderTarget | null = null;
   private aoBlurTarget: THREE.WebGLRenderTarget | null = null;
+  /** Linear view depth at AO resolution, 32-bit float. */
+  private aoDepthTarget: THREE.WebGLRenderTarget | null = null;
   private bloomDown: THREE.WebGLRenderTarget[] = [];
   private bloomUp: THREE.WebGLRenderTarget[] = [];
   private fsq = new FullScreenQuad();
@@ -206,6 +275,7 @@ export class PostPipeline implements PostPipelineApi {
   private fallback = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
   private black = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
 
+  private aoDepthMat: THREE.ShaderMaterial;
   private aoMat: THREE.ShaderMaterial;
   private blurMat: THREE.ShaderMaterial;
   private downMat: THREE.ShaderMaterial;
@@ -223,8 +293,18 @@ export class PostPipeline implements PostPipelineApi {
     // Clears are explicit: the overlay pass draws on top of the finished image.
     gl.autoClear = false;
     const depthUniforms = () => ({ tDepth: { value: null as THREE.Texture | null }, uLogFar: { value: FAR_LOG(far) } });
-    this.aoMat = fsMaterial(AO_FS, { ...depthUniforms(), uTan: { value: new THREE.Vector2() }, uTexel: { value: new THREE.Vector2() }, uPx: { value: 1 } });
-    this.blurMat = fsMaterial(AO_BLUR_FS, { ...depthUniforms(), tAo: { value: null }, uStep: { value: new THREE.Vector2() } });
+    // Shared uniform objects between the AO passes: set once per frame in runAo.
+    const recon = {
+      uFull: { value: new THREE.Vector2(1, 1) },
+      uScale: { value: new THREE.Vector2(1, 1) },
+      uPosScale: { value: new THREE.Vector2() },
+      uPosBias: { value: new THREE.Vector2() },
+    };
+    const aoMax = { value: new THREE.Vector2() };
+    const lin = { value: null as THREE.Texture | null };
+    this.aoDepthMat = fsMaterial(AO_DEPTH_FS, { ...depthUniforms(), ...recon });
+    this.aoMat = fsMaterial(AO_FS, { ...recon, tLin: lin, uAoMax: aoMax, uPx: { value: 1 } });
+    this.blurMat = fsMaterial(AO_BLUR_FS, { tLin: lin, tAo: { value: null }, uDir: { value: new THREE.Vector2() }, uAoMax: aoMax });
     this.downMat = fsMaterial(DOWN_FS, { tMap: { value: null }, uTexel: { value: new THREE.Vector2() }, uThreshold: { value: 0 } });
     this.upMat = fsMaterial(UP_FS, { tMap: { value: null }, tBase: { value: null }, uTexel: { value: new THREE.Vector2() } });
     this.composite = fsMaterial(
@@ -263,8 +343,9 @@ export class PostPipeline implements PostPipelineApi {
     this.sceneTarget?.dispose();
     this.aoTarget?.dispose();
     this.aoBlurTarget?.dispose();
+    this.aoDepthTarget?.dispose();
     for (const t of [...this.bloomDown, ...this.bloomUp]) t.dispose();
-    this.sceneTarget = this.aoTarget = this.aoBlurTarget = null;
+    this.sceneTarget = this.aoTarget = this.aoBlurTarget = this.aoDepthTarget = null;
     this.bloomDown = [];
     this.bloomUp = [];
   }
@@ -287,12 +368,14 @@ export class PostPipeline implements PostPipelineApi {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
     });
-    if (q.ao > 0) {
+    // Linear depth needs a float colour target; without one, no AO rather than banded AO.
+    if (q.ao > 0 && this.gl.extensions.has('EXT_color_buffer_float')) {
       const aw = Math.max(1, Math.round(w * q.ao));
       const ah = Math.max(1, Math.round(h * q.ao));
-      const opts = { depthBuffer: false, format: THREE.RGBAFormat, type: THREE.UnsignedByteType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter };
+      const opts = { depthBuffer: false, format: THREE.RedFormat, type: THREE.UnsignedByteType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter };
       this.aoTarget = new THREE.WebGLRenderTarget(aw, ah, opts);
       this.aoBlurTarget = new THREE.WebGLRenderTarget(aw, ah, opts);
+      this.aoDepthTarget = new THREE.WebGLRenderTarget(aw, ah, { depthBuffer: false, format: THREE.RedFormat, type: THREE.FloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
     }
     if (q.bloom) {
       let bw = Math.max(2, w >> 1);
@@ -306,8 +389,8 @@ export class PostPipeline implements PostPipelineApi {
       }
     }
     const depthTex = this.sceneTarget.depthTexture;
-    this.aoMat.uniforms.tDepth.value = depthTex;
-    this.blurMat.uniforms.tDepth.value = depthTex;
+    this.aoDepthMat.uniforms.tDepth.value = depthTex;
+    this.aoMat.uniforms.tLin.value = this.aoDepthTarget?.texture ?? null;
     this.composite.uniforms.tDepth.value = depthTex;
     this.composite.uniforms.tScene.value = this.sceneTarget.texture;
   }
@@ -337,19 +420,28 @@ export class PostPipeline implements PostPipelineApi {
   }
 
   private runAo(camera: THREE.PerspectiveCamera): void {
-    if (!this.aoTarget || !this.aoBlurTarget) return;
+    if (!this.aoTarget || !this.aoBlurTarget || !this.aoDepthTarget) return;
+    const aw = this.aoTarget.width;
+    const ah = this.aoTarget.height;
     const tanH = Math.tan((camera.fov * Math.PI) / 360);
     const u = this.aoMat.uniforms;
-    u.uTan.value.set(tanH * camera.aspect, tanH);
-    u.uTexel.value.set(1 / this.aoTarget.width, 1 / this.aoTarget.height);
-    u.uPx.value = this.aoTarget.height / (2 * tanH);
+    // Shared with the depth and blur passes.
+    const [sx, bx] = aoPosScaleBias(tanH * camera.aspect, this.width);
+    const [sy, by] = aoPosScaleBias(tanH, this.height);
+    u.uPosScale.value.set(sx, sy);
+    u.uPosBias.value.set(bx, by);
+    u.uFull.value.set(this.width, this.height);
+    u.uScale.value.set(this.width / aw, this.height / ah);
+    u.uAoMax.value.set(aw - 1, ah - 1);
+    u.uPx.value = ah / (2 * tanH);
+    this.pass(this.aoDepthMat, this.aoDepthTarget);
     this.pass(this.aoMat, this.aoTarget);
     const b = this.blurMat.uniforms;
     b.tAo.value = this.aoTarget.texture;
-    b.uStep.value.set(1 / this.aoTarget.width, 0);
+    b.uDir.value.set(1, 0);
     this.pass(this.blurMat, this.aoBlurTarget);
     b.tAo.value = this.aoBlurTarget.texture;
-    b.uStep.value.set(0, 1 / this.aoTarget.height);
+    b.uDir.value.set(0, 1);
     this.pass(this.blurMat, this.aoTarget);
   }
 
@@ -428,7 +520,7 @@ export class PostPipeline implements PostPipelineApi {
   dispose(): void {
     this.disposeTargets();
     this.fsq.dispose();
-    for (const m of [this.aoMat, this.blurMat, this.downMat, this.upMat, this.composite]) m.dispose();
+    for (const m of [this.aoDepthMat, this.aoMat, this.blurMat, this.downMat, this.upMat, this.composite]) m.dispose();
     this.fallback.dispose();
     this.black.dispose();
   }

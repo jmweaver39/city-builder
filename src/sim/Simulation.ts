@@ -31,7 +31,7 @@ import {
   TABLE_REFRESH_SEC,
   THROUGHPUT_WINDOW_SEC,
 } from './constants';
-import { accelPass, integrate, type ArrivalSink } from './dynamics';
+import { accelPass, integrate, remove, type ArrivalSink } from './dynamics';
 import { CTL_SIGNAL, JunctionSystem } from './junctions';
 import { laneChangePass } from './laneChange';
 import { mergePass } from './merge';
@@ -47,6 +47,9 @@ import { strategicPass } from './strategy';
 import { clearVehicles, createVehicleStore, type VehicleStore } from './vehicles';
 import { placeAll, writeView } from './view';
 import { emptyCounters, type Counters, type World } from './world';
+
+/** No progress for this long counts as stuck for Clear traffic. */
+const STUCK_CLEAR_SEC = 20;
 
 function nowMs(): number {
   return typeof performance !== 'undefined' ? performance.now() : 0;
@@ -83,6 +86,10 @@ export class Simulation implements SimApi, ArrivalSink {
   /** Stop short of these lane ends (setStopBack), by key. */
   private stopBackKeys = new Map<string, number>();
   private sweepCache: SweepCache = new Map();
+  /** Junctions under hand light control: movement key to green. Not saved. */
+  private manualLights = new Map<Id, Map<string, boolean>>();
+  /** True while no new vehicles are sent out (the Clear traffic tool's pause). */
+  private _spawnPaused = false;
 
   // Per-segment readouts.
   private segSpeed: Float64Array;
@@ -118,6 +125,7 @@ export class Simulation implements SimApi, ArrivalSink {
     const jn = new JunctionSystem(g);
     jn.compile(this.net, g, sig, prev?.sig ?? null);
     sig.init(this._time);
+    for (const [nodeId, moves] of this.manualLights) sig.setManual(nodeId, moves, this._time);
     const routes = new Routing(g, jn);
     if (prev) routes.adoptFlow(prev.routes);
     const blocked = new Uint8Array(g.n);
@@ -308,7 +316,7 @@ export class Simulation implements SimApi, ArrivalSink {
     accelPass(w);
     laneChangePass(w);
     integrate(w, this);
-    this.spawner.step(w, this.enterSegment);
+    if (!this._spawnPaused) this.spawner.step(w, this.enterSegment);
     placeAll(w.g, w.veh);
     enforceNoOverlap(w, this.takeBackSpawn);
     writeView(w.veh);
@@ -489,6 +497,81 @@ export class Simulation implements SimApi, ArrivalSink {
     if (w.blocked[lane]) return 'red';
     if (w.jn.ctl[lane] !== CTL_SIGNAL) return 'off';
     return lightName(w.sig.state[lane]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Traffic manager extras: clearing traffic and hand light control
+  // ---------------------------------------------------------------------------
+
+  get spawnPaused(): boolean {
+    return this._spawnPaused;
+  }
+
+  setSpawnPaused(paused: boolean): void {
+    this._spawnPaused = paused;
+  }
+
+  /**
+   * Remove vehicles at once: all of them, or only those that have made no progress
+   * for `stuckSec` (waiting at a red light does not count). Clearing all also
+   * empties the queues waiting to spawn. Returns how many went.
+   */
+  clearTraffic(opts: { stuckOnly?: boolean; stuckSec?: number } = {}): number {
+    this.sync();
+    const w = this.world;
+    const { veh } = w;
+    const limit = opts.stuckSec ?? STUCK_CLEAR_SEC;
+    const doomed: number[] = [];
+    for (let i = 0; i < veh.liveCount; i++) {
+      const v = veh.live[i];
+      if (!opts.stuckOnly || veh.stuckSec[v] >= limit) doomed.push(v);
+    }
+    for (const v of doomed) remove(w, v);
+    if (!opts.stuckOnly) this.spawner.pending.fill(0);
+    w.bk.resetOrder();
+    for (let i = 0; i < veh.liveCount; i++) w.bk.append(veh.live[i]);
+    w.bk.build(w.g, veh);
+    writeView(veh);
+    return doomed.length;
+  }
+
+  /** Movement keys at a signalled junction and whether each is green now. Null without lights. */
+  signalMovements(nodeId: Id): Record<string, boolean> | null {
+    this.sync();
+    const m = this.world.sig.movesAt(nodeId);
+    return m ? Object.fromEntries(m) : null;
+  }
+
+  /** Is this junction's light under hand control? */
+  isManualSignal(nodeId: Id): boolean {
+    return this.manualLights.has(nodeId);
+  }
+
+  /**
+   * Take a junction's lights into hand control (keeping what shows now) or give
+   * them back to the plan. Returns false when the junction has no lights.
+   */
+  setManualSignal(nodeId: Id, on: boolean): boolean {
+    this.sync();
+    const sig = this.world.sig;
+    if (!on) {
+      this.manualLights.delete(nodeId);
+      sig.setManual(nodeId, null, this._time);
+      return true;
+    }
+    const now = sig.movesAt(nodeId);
+    if (!now) return false;
+    const moves = this.manualLights.get(nodeId) ?? now;
+    this.manualLights.set(nodeId, moves);
+    sig.setManual(nodeId, moves, this._time);
+    return true;
+  }
+
+  /** Under hand control: set one movement green or red. */
+  setManualMovement(nodeId: Id, key: string, green: boolean): void {
+    const moves = this.manualLights.get(nodeId);
+    if (!moves) return;
+    moves.set(key, green);
   }
 
   blockConflict(lane: number, blocked: boolean): void {

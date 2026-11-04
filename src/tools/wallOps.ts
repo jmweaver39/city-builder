@@ -7,8 +7,8 @@ import type { DraftIssue } from '../core/RoadNetwork';
 
 /** Which sides get a wall. 'auto' leaves it to the mode: walls for retaining and trench. */
 export type WallSides = 'auto' | 'both' | 'left' | 'right' | 'none';
-/** What the Upgrade draw mode paints over roads. */
-export type UpgradeTarget = 'road' | 'structure' | 'barriers';
+/** What the Upgrade draw mode paints over roads. 'style' is a road copied with a middle click (clipboard.ts). */
+export type UpgradeTarget = 'road' | 'structure' | 'barriers' | 'style';
 
 export interface WallToolSettings {
   mode: StructureMode;
@@ -53,6 +53,7 @@ export const UPGRADE_TARGETS: readonly { value: UpgradeTarget; label: string }[]
   { value: 'road', label: 'Road type' },
   { value: 'structure', label: 'Structure and walls' },
   { value: 'barriers', label: 'Sound barriers' },
+  { value: 'style', label: 'Copied road style' },
 ];
 
 /** The structure the settings describe, left and right as drawn. */

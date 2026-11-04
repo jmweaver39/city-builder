@@ -3,6 +3,7 @@
  * versions, validates everything and returns a fresh Project with node.segments
  * rebuilt. Anything wrong throws ProjectFormatError naming the bad field.
  */
+import { migrateMarkingLooks } from './markingMigrate';
 import type {
   AutoMarkingRef,
   JunctionControl,
@@ -27,6 +28,7 @@ import { builtinRoadType, roadTypeProblems } from './roadTypes';
 import type { Quay } from './wallTypes';
 import { normaliseShape, shapeOnNode } from './junctionShape';
 import { autoRefSegments } from './autoMarkings';
+import { tidyRules } from './trafficRules';
 
 export const PROJECT_VERSION = 1;
 
@@ -109,6 +111,7 @@ export function createEmptyProject(name = 'Untitled'): Project {
     decals: [],
     customRoadTypes: [],
     traffic: defaultTrafficSettings(),
+    paintStandard: 1,
   };
 }
 
@@ -144,6 +147,15 @@ function checkControl(raw: unknown, where: string): JunctionControl {
   if (c.autoOff !== undefined) {
     const list = checkArray(c.autoOff, `${where}.autoOff`).map((r, i) => checkAutoRef(r, `${where}.autoOff[${i}]`));
     if (list.length) out.autoOff = list;
+  }
+  if (c.rules !== undefined) {
+    if (!isObject(c.rules)) fail(`${where}.rules must be an object`);
+    const rules = tidyRules(structuredClone(c.rules));
+    if (rules) out.rules = rules;
+  }
+  if (c.highwayAccess !== undefined) {
+    if (c.highwayAccess !== 'crossing' && c.highwayAccess !== 'rightInOut') fail(`${where}.highwayAccess "${String(c.highwayAccess)}" is unknown`);
+    out.highwayAccess = c.highwayAccess;
   }
   if (c.shape !== undefined) {
     if (!isObject(c.shape)) fail(`${where}.shape must be an object`);
@@ -523,9 +535,9 @@ export function parseProject(input: unknown): Project {
     terrain = { v: 1, cell: checkNumber(t.cell, 'terrain.cell'), tiles: t.tiles, ...(typeof t.water === 'string' ? { water: t.water } : {}) };
   }
 
-  return {
+  const project: Project = {
     version: 1,
-    name: raw.name,
+    name: raw.name as string,
     nextId: Math.max(nextIdIn, maxId + 1),
     nodes,
     segments,
@@ -533,6 +545,8 @@ export function parseProject(input: unknown): Project {
     decals,
     customRoadTypes,
     traffic,
+    // Before any optional block, in the same place as in createEmptyProject, so signatures match.
+    paintStandard: 1,
     // Stays absent when unused, so files that never had it keep their signature.
     ...(rail ? { rail } : {}),
     ...(zones.length ? { zones } : {}),
@@ -540,6 +554,9 @@ export function parseProject(input: unknown): Project {
     ...(terrain ? { terrain } : {}),
     ...(isObject(raw.markingLibrary) ? { markingLibrary: checkLibrary(raw.markingLibrary) } : {}),
   };
+  // Older marking looks move to the shared standard; placement is untouched.
+  if (raw.paintStandard !== 1) migrateMarkingLooks(project);
+  return project;
 }
 
 function checkLibrary(raw: Record<string, unknown>): MarkingLibrary {

@@ -336,16 +336,56 @@ export interface LinePoint {
   u: number;
 }
 
+/** Stacking layers of paint, in draw order (core/paintStandard.ts). */
+export type PaintLayerName = 'fill' | 'line' | 'bar' | 'symbol';
+const LAYER_INDEX: Record<PaintLayerName, number> = { fill: 0, line: 1, bar: 2, symbol: 3 };
+export const PAINT_LAYER_NAMES: readonly PaintLayerName[] = ['fill', 'line', 'bar', 'symbol'];
+
 export class PaintBuf {
   pos: number[] = [];
   side: number[] = [];
   line: number[] = [];
   dash: number[] = [];
   col: number[] = [];
-  idx: number[] = [];
+  /** Triangles per layer. `idx` reads them all, bottom layer first. */
+  private layerIdx: number[][] = [[], [], [], []];
+  private cur = 1;
+
+  /** The layer the next marks go in. Lines unless set. */
+  get layer(): PaintLayerName {
+    return PAINT_LAYER_NAMES[this.cur];
+  }
+
+  set layer(l: PaintLayerName) {
+    this.cur = LAYER_INDEX[l];
+  }
+
+  /** Run `fn` with marks going into `layer`, then go back. */
+  inLayer<T>(layer: PaintLayerName, fn: () => T): T {
+    const was = this.cur;
+    this.cur = LAYER_INDEX[layer];
+    try {
+      return fn();
+    } finally {
+      this.cur = was;
+    }
+  }
+
+  get idx(): number[] {
+    return ([] as number[]).concat(...this.layerIdx);
+  }
 
   get vertexCount(): number {
     return this.pos.length / 3;
+  }
+
+  /** Index count in one layer. */
+  layerSize(layer: PaintLayerName): number {
+    return this.layerIdx[LAYER_INDEX[layer]].length;
+  }
+
+  private get out(): number[] {
+    return this.layerIdx[this.cur];
   }
 
   /** A ribbon along pts. */
@@ -362,10 +402,11 @@ export class PaintBuf {
         this.col.push(color[0], color[1], color[2]);
       }
     }
+    const out = this.out;
     for (let i = 0; i + 1 < pts.length; i++) {
       const a = base + i * 2;
       // Side +1 is right of travel, so this is counter-clockwise from above.
-      this.idx.push(a, a + 1, a + 3, a, a + 3, a + 2);
+      out.push(a, a + 1, a + 3, a, a + 3, a + 2);
     }
   }
 
@@ -400,6 +441,7 @@ export class PaintBuf {
       this.dash.push(-1, 1);
       this.col.push(color[0], color[1], color[2]);
     }
+    const out = this.out;
     for (let i = 0; i < n; i += 3) {
       // Keep front faces up whatever order the caller gave.
       const ax = coords[i * 2];
@@ -409,29 +451,46 @@ export class PaintBuf {
       const cx = coords[(i + 2) * 2];
       const cz = coords[(i + 2) * 2 + 1];
       const area = (bx - ax) * (cz - az) - (bz - az) * (cx - ax);
-      if (area < 0) this.idx.push(base + i, base + i + 1, base + i + 2);
-      else this.idx.push(base + i, base + i + 2, base + i + 1);
+      if (area < 0) out.push(base + i, base + i + 1, base + i + 2);
+      else out.push(base + i, base + i + 2, base + i + 1);
     }
   }
 
+  /** Everything as one piece, layers in stacking order. */
   toPiece(): Piece | null {
-    const n = this.vertexCount;
-    if (n === 0) return null;
+    return this.pieceOf(this.idx);
+  }
+
+  /** One piece per layer, each with only the vertices it uses. Null for an empty layer. */
+  toLayerPieces(): (Piece | null)[] {
+    return this.layerIdx.map((ix) => this.pieceOf(ix));
+  }
+
+  private pieceOf(ix: readonly number[]): Piece | null {
+    if (!ix.length) return null;
+    const all = ix.length === this.layerIdx.reduce((a, l) => a + l.length, 0);
+    const remap = all ? null : new Map<number, number>();
+    const order: number[] = [];
+    if (remap) {
+      for (const i of ix) if (!remap.has(i)) remap.set(i, order.push(i) - 1);
+    }
+    const n = remap ? order.length : this.vertexCount;
+    const pick = (src: number[], size: number) => {
+      if (!remap) return new Float32Array(src);
+      const out = new Float32Array(n * size);
+      for (let k = 0; k < n; k++) for (let c = 0; c < size; c++) out[k * size + c] = src[order[k] * size + c];
+      return out;
+    };
+    const pos = pick(this.pos, 3);
     let sx = 0;
     let sz = 0;
     for (let i = 0; i < n; i++) {
-      sx += this.pos[i * 3];
-      sz += this.pos[i * 3 + 2];
+      sx += pos[i * 3];
+      sz += pos[i * 3 + 2];
     }
     return {
-      attrs: [
-        new Float32Array(this.pos),
-        new Float32Array(this.side),
-        new Float32Array(this.line),
-        new Float32Array(this.dash),
-        new Float32Array(this.col),
-      ],
-      index: new Uint32Array(this.idx),
+      attrs: [pos, pick(this.side, 2), pick(this.line, 3), pick(this.dash, 2), pick(this.col, 3)],
+      index: new Uint32Array(remap ? ix.map((i) => remap.get(i)!) : ix),
       vertexCount: n,
       cx: sx / n,
       cz: sz / n,

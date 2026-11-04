@@ -48,17 +48,38 @@ maskTexture.needsUpdate = true;
 export const terrainEditUniforms = {
   uEditTex: { value: placeholder() as THREE.Texture },
   uEditMask: { value: maskTexture as THREE.Texture },
+  /** 255 where landscaping says water (connected to the river or let in), 0 dry. */
+  uEditWet: { value: placeholderByte() as THREE.Texture },
   uEditOn: { value: 0 },
 };
+
+function placeholderByte(): THREE.DataTexture {
+  const t = new THREE.DataTexture(new Uint8Array(1), 1, 1, THREE.RedFormat, THREE.UnsignedByteType);
+  t.minFilter = THREE.NearestFilter;
+  t.magFilter = THREE.NearestFilter;
+  t.generateMipmaps = false;
+  t.needsUpdate = true;
+  return t;
+}
 
 /** Add the landscaping uniforms to a material's shader in onBeforeCompile. */
 export function useTerrainEditUniforms(s: { uniforms: Record<string, THREE.IUniform> }): void {
   s.uniforms.uEditTex = terrainEditUniforms.uEditTex;
   s.uniforms.uEditMask = terrainEditUniforms.uEditMask;
+  s.uniforms.uEditWet = terrainEditUniforms.uEditWet;
   s.uniforms.uEditOn = terrainEditUniforms.uEditOn;
 }
 
 const f = (v: number) => v.toFixed(1);
+
+/** Earth colours for dug ground, as linear GLSL vec3 literals (sRGB hex in, as the palette). */
+const DUG = (() => {
+  const v = (hex: number) => {
+    const c = new THREE.Color(hex);
+    return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+  };
+  return { soil: v(0x7a5a3c), soilDark: v(0x4a3624), rock: v(0x857d70), rockDark: v(0x514b44) };
+})();
 
 /**
  * tEdit(p): the landscaping offset at plan point p (x, z), bilinear over the grid,
@@ -68,6 +89,7 @@ const f = (v: number) => v.toFixed(1);
 export const TERRAIN_EDIT_GLSL = /* glsl */ `
 uniform highp sampler2D uEditTex;
 uniform sampler2D uEditMask;
+uniform sampler2D uEditWet;
 uniform float uEditOn;
 float tEditPt(ivec2 q) { return texelFetch(uEditTex, q, 0).r; }
 float tEdit(vec2 p) {
@@ -90,6 +112,31 @@ float tEditTile(vec2 p) {
   vec2 t = floor((p - vec2(${f(EDIT_ORIGIN)})) / ${f(EDIT_TILE * EDIT_CELL)});
   if (t.x < 0.0 || t.y < 0.0 || t.x >= ${f(EDIT_TILES)} || t.y >= ${f(EDIT_TILES)}) return 0.0;
   return texelFetch(uEditMask, ivec2(t), 0).r;
+}
+// 1 where landscaping says water, 0 dry, -1 where the generated river decides.
+// Wet if any surrounding grid point is, as TerrainEditGrid's wetAt.
+float tWet(vec2 p) {
+  if (tEditTile(p) < 0.5) return -1.0;
+  vec2 g = (p - vec2(${f(EDIT_ORIGIN)})) / ${f(EDIT_CELL)};
+  ivec2 q = ivec2(floor(g));
+  float w = max(max(texelFetch(uEditWet, q, 0).r, texelFetch(uEditWet, q + ivec2(1, 0), 0).r), max(texelFetch(uEditWet, q + ivec2(0, 1), 0).r, texelFetch(uEditWet, q + ivec2(1, 1), 0).r));
+  return w > 0.5 ? 1.0 : 0.0;
+}
+/** Dug and dry ground: soil, darker and banded with depth, rock on steep faces. Colours are linear. */
+vec3 tDugColour(vec3 c, vec2 p, float h, float slope, float grain) {
+  float dig = -tEdit(p);
+  float steep = smoothstep(0.32, 0.6, slope);
+  // Edited slopes of any kind show bare earth when steep; dug ground does everywhere.
+  float edited = step(0.05, abs(tEdit(p)));
+  float amount = max(smoothstep(0.3, 1.4, dig), steep * edited * 0.85);
+  if (amount <= 0.0 || tWet(p) > 0.5) return c;
+  float depth = clamp(dig / 18.0, 0.0, 1.0);
+  float band = 0.5 + 0.5 * sin(h * 1.9 + sin(p.x * 0.05 + p.y * 0.031) * 1.2);
+  vec3 soil = mix(${DUG.soil}, ${DUG.soilDark}, depth * 0.8 + band * 0.25);
+  vec3 rock = mix(${DUG.rock}, ${DUG.rockDark}, depth * 0.7 + band * 0.35);
+  vec3 earth = mix(soil, rock, clamp(steep + depth * 0.5, 0.0, 1.0));
+  earth *= 0.88 + grain * 0.24;
+  return mix(c, earth, amount);
 }
 `;
 
@@ -143,6 +190,12 @@ function tilesGeometry(keys: number[]): THREE.BufferGeometry | null {
   return geo;
 }
 
+function wetPt(grid: TerrainEditor['grid'], i: number, j: number): boolean {
+  if (i >= EDIT_POINTS || j >= EDIT_POINTS) return false;
+  const t = grid.wet[(j >> 5) * EDIT_TILES + (i >> 5)];
+  return !!t && t[((j & 31) << 5) | (i & 31)] === 1;
+}
+
 interface FloodPiece {
   pos: number[];
   edge: number[];
@@ -179,6 +232,8 @@ function floodCells(grid: TerrainEditor['grid'], key: number): FloodPiece | null
       const c2 = h[a + (b + 1) * n];
       const c3 = h[a + 1 + (b + 1) * n];
       if (Math.min(c0, c1, c2, c3) >= WATER_LEVEL) continue;
+      // Only water that reaches the river (or was let in): dry pits stay dry.
+      if (!wetPt(grid, i0 + a, j0 + b) && !wetPt(grid, i0 + a + 1, j0 + b) && !wetPt(grid, i0 + a, j0 + b + 1) && !wetPt(grid, i0 + a + 1, j0 + b + 1)) continue;
       const x = EDIT_ORIGIN + (i0 + a) * EDIT_CELL;
       const z = EDIT_ORIGIN + (j0 + b) * EDIT_CELL;
       // The river's own water mesh covers its strip.
@@ -193,6 +248,9 @@ function floodCells(grid: TerrainEditor['grid'], key: number): FloodPiece | null
 /** Keeps the GPU copy of the landscaping in step with the editor. */
 export class TerrainEditLayer implements RenderLayer {
   private texture: THREE.DataTexture | null = null;
+  private wetTexture: THREE.DataTexture | null = null;
+  private wetSeen = -1;
+  private wetUploaded = new Set<number>();
   private pending = new Set<number>();
   private meshDirty = false;
   private floodDirty = false;
@@ -272,13 +330,12 @@ export class TerrainEditLayer implements RenderLayer {
     return t;
   }
 
-  private upload(fn: () => void): void {
-    const t = this.texture!;
+  private upload(fn: () => void, t: THREE.Texture = this.texture!): void {
     const ctx = this.gl.getContext() as WebGL2RenderingContext;
     const handle = (this.gl.properties.get(t) as { __webglTexture?: WebGLTexture }).__webglTexture;
     if (!handle) return;
     this.gl.state.bindTexture(ctx.TEXTURE_2D, handle);
-    ctx.pixelStorei(ctx.UNPACK_ALIGNMENT, 4);
+    ctx.pixelStorei(ctx.UNPACK_ALIGNMENT, 1);
     ctx.pixelStorei(ctx.UNPACK_FLIP_Y_WEBGL, false);
     ctx.pixelStorei(ctx.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     ctx.pixelStorei(ctx.UNPACK_ROW_LENGTH, 0);
@@ -292,9 +349,13 @@ export class TerrainEditLayer implements RenderLayer {
     const ed = this.bound;
     if (!ed) return;
     this.floodTimer += dt;
-    if (!this.pending.size && !(this.floodDirty && this.floodTimer > 0.25)) return;
     const t0 = performance.now();
     const grid = ed.grid;
+    if (ed.wetVersion !== this.wetSeen && (grid.effCount > 0 || this.wetTexture)) this.syncWet(ed);
+    if (!this.pending.size && !(this.floodDirty && this.floodTimer > 0.25)) {
+      if (this.wetSeen === ed.wetVersion) this.lastFlushMs = performance.now() - t0;
+      return;
+    }
     if (this.pending.size && (grid.effCount > 0 || this.texture)) {
       this.ensureTexture();
       const zeros = new Float32Array(EDIT_TILE * EDIT_TILE);
@@ -369,8 +430,49 @@ export class TerrainEditLayer implements RenderLayer {
     this.lastFlushMs = performance.now() - t0;
   }
 
+  /** Upload the water mask where it changed, and redo the water over it. */
+  private syncWet(ed: TerrainEditor): void {
+    // While painting the editor refreshes it a few times a second.
+    ed.ensureWet();
+    if (ed.wetVersion === this.wetSeen) return;
+    this.wetSeen = ed.wetVersion;
+    const grid = ed.grid;
+    if (!this.wetTexture) {
+      const t = new THREE.DataTexture(null as unknown as Uint8Array, EDIT_POINTS, EDIT_POINTS, THREE.RedFormat, THREE.UnsignedByteType);
+      t.minFilter = THREE.NearestFilter;
+      t.magFilter = THREE.NearestFilter;
+      t.generateMipmaps = false;
+      t.source.dataReady = false;
+      t.needsUpdate = true;
+      this.gl.initTexture(t);
+      this.wetTexture = t;
+      terrainEditUniforms.uEditWet.value = t;
+      const zeros = new Uint8Array(EDIT_TILE * EDIT_TILE);
+      this.upload(() => {
+        const ctx = this.gl.getContext() as WebGL2RenderingContext;
+        for (let tj = 0; tj < EDIT_TILES; tj++) for (let ti = 0; ti < EDIT_TILES; ti++) ctx.texSubImage2D(ctx.TEXTURE_2D, 0, ti * EDIT_TILE, tj * EDIT_TILE, EDIT_TILE, EDIT_TILE, ctx.RED, ctx.UNSIGNED_BYTE, zeros);
+      }, t);
+    }
+    const keys = new Set(this.wetUploaded);
+    for (let k = 0; k < grid.wet.length; k++) if (grid.wet[k]) keys.add(k);
+    const buf = new Uint8Array(EDIT_TILE * EDIT_TILE);
+    this.upload(() => {
+      const ctx = this.gl.getContext() as WebGL2RenderingContext;
+      for (const k of keys) {
+        const w = grid.wet[k];
+        for (let n = 0; n < buf.length; n++) buf[n] = w && w[n] ? 255 : 0;
+        ctx.texSubImage2D(ctx.TEXTURE_2D, 0, (k % EDIT_TILES) * EDIT_TILE, Math.floor(k / EDIT_TILES) * EDIT_TILE, EDIT_TILE, EDIT_TILE, ctx.RED, ctx.UNSIGNED_BYTE, buf);
+      }
+    }, this.wetTexture);
+    this.wetUploaded = new Set([...keys].filter((k) => grid.wet[k]));
+    // Where water stands may have changed anywhere in the domain.
+    for (const k of keys) this.floodPending.add(k);
+    this.floodDirty = true;
+  }
+
   dispose(): void {
     this.off?.();
     this.texture?.dispose();
+    this.wetTexture?.dispose();
   }
 }

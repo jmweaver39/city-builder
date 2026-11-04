@@ -6,7 +6,7 @@
  * Shift+] set its strength. Every stroke is one undo step (core/terrainEdit.ts).
  */
 import { BRUSH_MAX_RADIUS, BRUSH_MIN_RADIUS, terrainEditor, type BrushOp, type BrushShape, type ClampKind } from '../core/terrainEdit';
-import { MAX_ELEVATION, MIN_ELEVATION, terrainHeight, WATER_LEVEL } from '../core/terrain';
+import { isWater, MAX_ELEVATION, MIN_ELEVATION, terrainHeight, WATER_LEVEL } from '../core/terrain';
 import type { Vec3 } from '../core/types';
 import type { ToolMark } from '../render/api';
 import { Tool } from './Tool';
@@ -27,6 +27,8 @@ export interface TerrainBrush {
   /** Slope's two ends. */
   from: Vec3 | null;
   to: Vec3 | null;
+  /** "Let water in": painted ground floods below the water level even if it does not reach the river. */
+  letWater: boolean;
 }
 
 export const TERRAIN_MODES: readonly { value: TerrainMode; label: string; key: string; desc: string }[] = [
@@ -44,7 +46,7 @@ const CLAMP_NOTE: Record<ClampKind, string> = {
 
 export class TerrainTool extends Tool {
   readonly id: ToolId = 'terrain';
-  readonly brush: TerrainBrush = { mode: 'shift', radius: 40, strength: 0.5, shape: 'soft', target: null, from: null, to: null };
+  readonly brush: TerrainBrush = { mode: 'shift', radius: 40, strength: 0.5, shape: 'soft', target: null, from: null, to: null, letWater: false };
   /** Plan point under the cursor, on the ground. */
   private cursor: Vec3 | null = null;
   private painting: BrushOp | null = null;
@@ -180,6 +182,7 @@ export class TerrainTool extends Tool {
       target: b.target ?? undefined,
       from: b.from ?? undefined,
       to: b.to ?? undefined,
+      letWater: b.letWater,
     });
     const ms = performance.now() - t0;
     this.timing.ticks++;
@@ -322,9 +325,10 @@ export class TerrainTool extends Tool {
     const lines = [
       `Landscaping: ${mode.label}`,
       `Brush ${b.radius} m, ${Math.round(b.strength * 100)}%, ${b.shape}`,
-      `Ground ${h.toFixed(1)} m${h < WATER_LEVEL ? ', under water' : ''}`,
+      `Ground ${h.toFixed(1)} m${isWater(c.x, c.z) ? ', under water' : h < WATER_LEVEL ? ', below the river, dry' : ''}`,
     ];
     if (b.mode === 'level') lines.push(b.target === null ? 'Target: first click samples it' : `Target ${b.target.toFixed(1)} m`);
+    if (b.letWater) lines.push('Let water in: on');
     const notes: string[] = [];
     if (b.mode === 'slope') notes.push(!b.from ? 'Click the start of the slope' : !b.to ? 'Click the end of the slope' : 'Paint along it. Right click starts again');
     else notes.push(mode.desc);

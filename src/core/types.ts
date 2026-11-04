@@ -419,6 +419,14 @@ export interface RampAttach {
   lane: number;
   /** Which side of the ramp the host lies on, looking along the ramp's a to b. */
   hostSide: 1 | -1;
+  /**
+   * A terminal on a street or avenue (see core/ramps.ts). The road ends on the node,
+   * not on the carriageway edge, and turns into or out of exactly these host lanes,
+   * counted across the host's driving lanes from its edge on this road's side: 0 is
+   * the near kerb lane, then inwards, then the far carriageway from its middle out.
+   * `lane` is ignored when set. Missing on highway ramps and side merges.
+   */
+  lanes?: number[];
 }
 
 /**

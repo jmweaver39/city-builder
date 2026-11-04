@@ -6,7 +6,7 @@
 import { closestPointOnCubic } from '../core/bezier';
 import { behindQuay } from '../core/quays';
 import type { RoadNetwork } from '../core/RoadNetwork';
-import { riverDistance, RIVER_HALF_WIDTH, terrainHeight } from '../core/terrain';
+import { hasTerrainEdits, isWater, riverDistance, RIVER_HALF_WIDTH, terrainHeight } from '../core/terrain';
 import type { Id, Vec3 } from '../core/types';
 import { pointInPolygon } from '../core/zones';
 
@@ -43,7 +43,9 @@ export function polygonEdgeDistance(x: number, z: number, poly: readonly Vec3[])
  */
 export function footprintAt(net: RoadNetwork, x: number, y: number, z: number, opts: FootprintOptions = {}): 'road' | 'rail' | 'water' | null {
   const r = opts.radius ?? 0;
-  if (riverDistance(x, z) < RIVER_HALF_WIDTH + r && y < terrainHeight(x, z) + 1.5 && !nearQuay(net, x, z)) return 'water';
+  // With landscaping, water is wherever isWater says (connected to the river, or let in).
+  const wet = hasTerrainEdits() ? isWater(x, z) : riverDistance(x, z) < RIVER_HALF_WIDTH + r;
+  if (wet && y < terrainHeight(x, z) + 1.5 && !nearQuay(net, x, z)) return 'water';
   const reach = 40;
   const p = { x, y: 0, z };
   for (const id of net.segmentsInRegion({ minX: x - reach, minZ: z - reach, maxX: x + reach, maxZ: z + reach }, true)) {

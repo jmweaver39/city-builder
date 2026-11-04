@@ -3,7 +3,10 @@
  * is called, its default measures, which settings apply to it, the built-in
  * presets, and colour helpers. Pure data, shared by the renderer, tools and panels.
  */
+import { CROSSWALK, DOT, DOUBLE_SPACING, FILL_STANDARDS, HATCH, GORE, LINE_STANDARDS, LINE_W, PAINT_HEX, STOP, dashFor, lineStandard } from './paintStandard';
 import type { LineStyleSpec, MarkingPreset, NodeFillStyle, NodeFillerMarking, NodeLineMarking, NodeLineStyle, PaintColor } from './types';
+
+export { PAINT_HEX };
 
 export type LineFamily = 'line' | 'stop' | 'crosswalk' | 'teeth' | 'lane' | 'empty';
 
@@ -17,25 +20,28 @@ export interface LineStyleInfo {
   uses: ('dash' | 'gap' | 'border')[];
 }
 
+const STD = (id: Parameters<typeof lineStandard>[0]) => lineStandard(id).spec;
+
 export const LINE_STYLE_INFO: readonly LineStyleInfo[] = [
-  { value: 'solid', label: 'Solid', family: 'line', defaults: { width: 0.15 }, uses: [] },
-  { value: 'dashed', label: 'Dashed', family: 'line', defaults: { width: 0.15, dash: 3, space: 3 }, uses: ['dash'] },
-  { value: 'double', label: 'Double solid', family: 'line', defaults: { width: 0.12, gap: 0.12 }, uses: ['gap'] },
-  { value: 'doubleDashed', label: 'Double dashed', family: 'line', defaults: { width: 0.12, gap: 0.12, dash: 0.6, space: 0.3 }, uses: ['dash', 'gap'] },
-  { value: 'solidDashed', label: 'Solid and dashed', family: 'line', defaults: { width: 0.12, gap: 0.12, dash: 3, space: 3 }, uses: ['dash', 'gap'] },
-  { value: 'dashedSolid', label: 'Dashed and solid', family: 'line', defaults: { width: 0.12, gap: 0.12, dash: 3, space: 3 }, uses: ['dash', 'gap'] },
-  { value: 'dotted', label: 'Dotted', family: 'line', defaults: { width: 0.18, dash: 0.18, space: 0.42 }, uses: ['dash'] },
-  { value: 'zigzag', label: 'Zigzag', family: 'line', defaults: { width: 0.12, dash: 1, gap: 0.5 }, uses: ['dash', 'gap'] },
-  { value: 'sharkTeeth', label: "Shark's teeth (yield)", family: 'teeth', defaults: { width: 0.6, dash: 0.45, space: 0.3 }, uses: ['dash'] },
-  { value: 'stopLine', label: 'Stop line', family: 'stop', defaults: { width: 0.45 }, uses: [] },
+  { value: 'solid', label: 'Solid', family: 'line', defaults: { width: LINE_W.lane }, uses: [] },
+  // Dash and space left unset follow the road's speed class (paintStandard.ts).
+  { value: 'dashed', label: 'Dashed', family: 'line', defaults: { width: LINE_W.lane }, uses: ['dash'] },
+  { value: 'double', label: 'Double solid', family: 'line', defaults: { width: LINE_W.centre, gap: DOUBLE_SPACING - LINE_W.centre }, uses: ['gap'] },
+  { value: 'doubleDashed', label: 'Double dashed', family: 'line', defaults: { width: LINE_W.lane, gap: DOUBLE_SPACING - LINE_W.lane, dash: 0.6, space: 0.3 }, uses: ['dash', 'gap'] },
+  { value: 'solidDashed', label: 'Solid and dashed', family: 'line', defaults: { width: LINE_W.centre, gap: DOUBLE_SPACING - LINE_W.centre }, uses: ['dash', 'gap'] },
+  { value: 'dashedSolid', label: 'Dashed and solid', family: 'line', defaults: { width: LINE_W.centre, gap: DOUBLE_SPACING - LINE_W.centre }, uses: ['dash', 'gap'] },
+  { value: 'dotted', label: 'Dotted', family: 'line', defaults: { width: LINE_W.lane, dash: DOT.dash, space: DOT.gap }, uses: ['dash'] },
+  { value: 'zigzag', label: 'Zigzag', family: 'line', defaults: { width: LINE_W.lane, dash: 1, gap: 0.5 }, uses: ['dash', 'gap'] },
+  { value: 'sharkTeeth', label: "Shark's teeth (yield)", family: 'teeth', defaults: { width: STD('giveWay').width, dash: STD('giveWay').dash, space: STD('giveWay').space }, uses: ['dash'] },
+  { value: 'stopLine', label: 'Stop line', family: 'stop', defaults: { width: STOP.width }, uses: [] },
   { value: 'lane', label: 'Lane (painted area)', family: 'lane', defaults: { width: 3 }, uses: [] },
-  { value: 'crosswalkZebra', label: 'Crosswalk, zebra', family: 'crosswalk', defaults: { width: 3, dash: 0.5, space: 0.5 }, uses: ['dash', 'border'] },
-  { value: 'crosswalkDoubleZebra', label: 'Crosswalk, double zebra', family: 'crosswalk', defaults: { width: 5, dash: 0.5, space: 0.5, gap: 0.4 }, uses: ['dash', 'gap', 'border'] },
-  { value: 'crosswalkLadder', label: 'Crosswalk, ladder', family: 'crosswalk', defaults: { width: 3, dash: 0.5, space: 0.5 }, uses: ['dash'] },
-  { value: 'crosswalkLines', label: 'Crosswalk, parallel lines', family: 'crosswalk', defaults: { width: 3, dash: 0.3 }, uses: ['dash'] },
-  { value: 'crosswalkSolid', label: 'Crosswalk, solid', family: 'crosswalk', defaults: { width: 3 }, uses: ['border'] },
-  { value: 'crosswalkChessboard', label: 'Crosswalk, chessboard', family: 'crosswalk', defaults: { width: 3, dash: 0.6 }, uses: ['dash', 'border'] },
-  { value: 'empty', label: 'No paint', family: 'empty', defaults: { width: 0.15 }, uses: [] },
+  { value: 'crosswalkZebra', label: 'Crosswalk, zebra', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.stripe, space: CROSSWALK.gap }, uses: ['dash', 'border'] },
+  { value: 'crosswalkDoubleZebra', label: 'Crosswalk, double zebra', family: 'crosswalk', defaults: { width: 5, dash: CROSSWALK.stripe, space: CROSSWALK.gap, gap: 0.4 }, uses: ['dash', 'gap', 'border'] },
+  { value: 'crosswalkLadder', label: 'Crosswalk, ladder', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.stripe, space: CROSSWALK.gap }, uses: ['dash'] },
+  { value: 'crosswalkLines', label: 'Crosswalk, parallel lines', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.rail }, uses: ['dash'] },
+  { value: 'crosswalkSolid', label: 'Crosswalk, solid', family: 'crosswalk', defaults: { width: CROSSWALK.depth }, uses: ['border'] },
+  { value: 'crosswalkChessboard', label: 'Crosswalk, chessboard', family: 'crosswalk', defaults: { width: CROSSWALK.depth, dash: CROSSWALK.stripe }, uses: ['dash', 'border'] },
+  { value: 'empty', label: 'No paint', family: 'empty', defaults: { width: LINE_W.lane }, uses: [] },
 ];
 
 export function lineStyleInfo(style: NodeLineStyle): LineStyleInfo {
@@ -55,27 +61,34 @@ export interface FillStyleInfo {
 }
 
 export const FILL_STYLE_INFO: readonly FillStyleInfo[] = [
-  { value: 'stripes', label: 'Stripes', defaults: { width: 0.3, angle: 45, step: 1.4 } },
-  { value: 'hatch', label: 'Hatch (45°)', defaults: { width: 0.3, step: 1.4 } },
-  { value: 'chevron', label: 'Chevrons', defaults: { width: 0.4, angle: 0, step: 2 } },
+  { value: 'stripes', label: 'Stripes', defaults: { width: HATCH.stripe, angle: 45, step: HATCH.step } },
+  { value: 'hatch', label: 'Hatch (45°)', defaults: { width: HATCH.stripe, step: HATCH.step } },
+  { value: 'chevron', label: 'Chevrons', defaults: { width: GORE.stripe, angle: 0, step: GORE.step } },
   { value: 'grid', label: 'Grid', defaults: { width: 0.15, angle: 0, step: 1.5 } },
   { value: 'triangle', label: 'Triangles', defaults: { width: 0.3, angle: 0, step: 2 } },
-  { value: 'solid', label: 'Solid colour', defaults: { width: 0.2 } },
+  { value: 'solid', label: 'Solid colour', defaults: { width: LINE_W.lane } },
 ];
 
 export function fillStyleInfo(fill: NodeFillStyle): FillStyleInfo {
   return FILL_STYLE_INFO.find((f) => f.value === fill) ?? FILL_STYLE_INFO[0];
 }
 
-/** Measures a style uses, defaults filled in. */
-export function resolvedStyle(spec: LineStyleSpec): Required<Pick<LineStyleSpec, 'width' | 'dash' | 'space' | 'gap' | 'offset'>> & LineStyleSpec {
+/** Styles whose dashes, when left unset, follow the speed of the road they are on. */
+const SPEED_DASHED = new Set<NodeLineStyle>(['dashed', 'solidDashed', 'dashedSolid']);
+
+/**
+ * Measures a style uses, defaults filled in from the marking standard. `speedKmh`
+ * is the road's speed, which sets an unset dash and space on dashed styles.
+ */
+export function resolvedStyle(spec: LineStyleSpec, speedKmh = 50): Required<Pick<LineStyleSpec, 'width' | 'dash' | 'space' | 'gap' | 'offset'>> & LineStyleSpec {
   const d = lineStyleInfo(spec.style).defaults;
+  const speed = SPEED_DASHED.has(spec.style) ? dashFor(speedKmh) : null;
   return {
     ...spec,
     width: spec.width,
-    dash: spec.dash ?? d.dash ?? 3,
-    space: spec.space ?? d.space ?? 3,
-    gap: spec.gap ?? d.gap ?? 0.12,
+    dash: spec.dash ?? speed?.dash ?? d.dash ?? 3,
+    space: spec.space ?? speed?.gap ?? d.space ?? 6,
+    gap: spec.gap ?? d.gap ?? DOUBLE_SPACING - spec.width,
     offset: spec.offset ?? 0,
   };
 }
@@ -136,15 +149,6 @@ export function mirroredStyle(spec: LineStyleSpec): LineStyleSpec {
 // Colour
 // ---------------------------------------------------------------------------
 
-/** The named paint colours, as hex, matching the renderer's palette. */
-export const PAINT_HEX: Record<PaintColor, string> = {
-  white: '#f2f2ee',
-  yellow: '#f2c230',
-  blue: '#3f7fe0',
-  red: '#d9443a',
-  green: '#3faa5a',
-};
-
 export function isHex(s: unknown): s is string {
   return typeof s === 'string' && /^#[0-9a-fA-F]{6}$/.test(s);
 }
@@ -164,31 +168,10 @@ export function markingHex(m: { color: PaintColor; hex?: string }): string {
 // Built-in presets
 // ---------------------------------------------------------------------------
 
+/** The built-in presets are the marking standard itself (paintStandard.ts), by name. */
 export const BUILTIN_PRESETS: readonly MarkingPreset[] = [
-  {
-    id: 'builtin-us-double-yellow',
-    name: 'US double yellow',
-    kind: 'line',
-    style: { style: 'double', color: 'yellow', width: 0.1, gap: 0.1 },
-  },
-  {
-    id: 'builtin-uk-give-way',
-    name: 'UK give-way',
-    kind: 'line',
-    style: { style: 'doubleDashed', color: 'white', width: 0.2, gap: 0.2, dash: 0.6, space: 0.3 },
-  },
-  {
-    id: 'builtin-continental-zebra',
-    name: 'Continental zebra',
-    kind: 'line',
-    style: { style: 'crosswalkZebra', color: 'white', width: 4, dash: 0.5, space: 0.5 },
-  },
-  {
-    id: 'builtin-gore-chevron',
-    name: 'Highway gore chevron',
-    kind: 'filler',
-    style: { fill: 'chevron', color: 'white', width: 0.45, angle: 0, step: 3 },
-  },
+  ...LINE_STANDARDS.map((s): MarkingPreset => ({ id: `builtin-${s.id}`, name: s.name, kind: 'line', style: { ...s.spec } })),
+  ...FILL_STANDARDS.map((s): MarkingPreset => ({ id: `builtin-${s.id}`, name: s.name, kind: 'filler', style: { ...s.spec } })),
 ];
 
 export function isBuiltinPreset(id: string): boolean {

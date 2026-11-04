@@ -164,6 +164,8 @@ export class Simulation implements SimApi, ArrivalSink {
   private onNetChange(e: NetworkChange): void {
     this.graphDirty = true;
     for (const id of e.reversedSegments) this.reversedSegs.add(id);
+    // A re-laid road keeps its lane keys, but they may name other lanes now: re-seat by position.
+    for (const id of e.relaidSegments ?? []) this.reversedSegs.add(id);
     if (e.endpointsChanged || e.settingsChanged) this.placesDirty = true;
     // Undo arrives as a reset too. Only a different project drops the traffic; anything
     // else keeps it, remapped by lane key like any other edit.

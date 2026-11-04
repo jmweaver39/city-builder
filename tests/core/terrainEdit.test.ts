@@ -176,22 +176,84 @@ describe('landscaping and roads', () => {
 });
 
 describe('landscaping and water', () => {
-  it('ground dug below the water level floods, river bed raised above it is dry', () => {
+  /** Dig a straight channel from (x, z0) to (x, z1), hard brush. */
+  function channel(ed: TerrainEditor, x: number, z0: number, z1: number, radius = 14): void {
+    const step = Math.sign(z1 - z0) * 8;
+    for (let z = z0; step > 0 ? z <= z1 : z >= z1; z += step) stroke(ed, { op: 'lower', x, z, radius, strength: 1, shape: 'hard' }, 40);
+  }
+
+  it('a pit dug far from the river stays dry, with no water anywhere in it', () => {
+    const net = new RoadNetwork();
+    const ed = bindTerrainEdits(net);
+    stroke(ed, { op: 'lower', x: 0, z: Z, radius: 40, strength: 1, shape: 'hard' }, 60);
+    expect(terrainHeight(0, Z)).toBeLessThan(-15);
+    for (let d = 0; d < 40; d += 4) {
+      expect(isWater(d, Z)).toBe(false);
+      expect(isWater(0, Z + d)).toBe(false);
+    }
+  });
+
+  it('a channel dug through to the river lets the water in, and filling the river dries it', () => {
     const net = new RoadNetwork();
     const ed = bindTerrainEdits(net);
     const x = 0;
     const zc = riverCentreZ(x);
-    // Dig a pit 80 m from the river, and right beside the bank.
-    stroke(ed, { op: 'lower', x, z: zc - 120, radius: 30, strength: 1 }, 40);
+    // A pit 120 m from the river: dry.
+    stroke(ed, { op: 'lower', x, z: zc - 120, radius: 30, strength: 1, shape: 'hard' }, 40);
     expect(terrainHeight(x, zc - 120)).toBeLessThan(WATER_LEVEL);
+    expect(isWater(x, zc - 120)).toBe(false);
+    // Cut a channel from it to the river: it floods.
+    channel(ed, x, zc - 110, zc - 20);
     expect(isWater(x, zc - 120)).toBe(true);
-    expect(isWater(x, zc - 120 + 29)).toBe(terrainHeight(x, zc - 120 + 29) < WATER_LEVEL);
-    // Fill the channel.
+    expect(isWater(x, zc - 70)).toBe(true);
+    // Water only ever stands on ground below the water level.
+    for (let dz = -150; dz <= 60; dz += 3) if (isWater(x, zc + dz)) expect(terrainHeight(x, zc + dz)).toBeLessThan(WATER_LEVEL);
+    // River bed raised above the level is dry land.
     stroke(ed, { op: 'raise', x: 300, z: riverCentreZ(300), radius: 40, strength: 1 }, 60);
     expect(terrainHeight(300, riverCentreZ(300))).toBeGreaterThan(WATER_LEVEL);
     expect(isWater(300, riverCentreZ(300))).toBe(false);
-    // Consistent everywhere: water exactly where ground is under the water level.
-    for (let dz = -150; dz <= 60; dz += 7) for (const px of [0, 300]) expect(isWater(px, riverCentreZ(px) + dz)).toBe(terrainHeight(px, riverCentreZ(px) + dz) < WATER_LEVEL);
+    // The untouched river is still water.
+    expect(isWater(-600, riverCentreZ(-600))).toBe(true);
+  });
+
+  it('a road in a flooded cut stays dry, and so does a trench', () => {
+    const net = new RoadNetwork();
+    const ed = bindTerrainEdits(net);
+    const x = 0;
+    const zc = riverCentreZ(x);
+    // A wide basin connected to the river.
+    stroke(ed, { op: 'lower', x, z: zc - 120, radius: 60, strength: 1, shape: 'hard' }, 60);
+    channel(ed, x, zc - 80, zc - 20, 16);
+    const floor = terrainHeight(x, zc - 120);
+    expect(floor).toBeLessThan(-10);
+    expect(isWater(x, zc - 120)).toBe(true);
+    // A road along the basin floor, below the water level.
+    net.drawRoad({ start: free(x - 30, zc - 120, floor), end: free(x + 30, zc - 120, floor), roadType: 'street-2' });
+    const w = totalHalfWidth(net.roadType('street-2')!);
+    for (const dx of [-20, 0, 20]) {
+      expect(isWater(x + dx, zc - 120)).toBe(false);
+      expect(isWater(x + dx, zc - 120 + w - 0.5)).toBe(false);
+    }
+    // Further out in the basin the water stands.
+    expect(isWater(x, zc - 120 + 30)).toBe(true);
+    // A trench road (walls module) through the wet basin: its cut stays dry.
+    net.drawRoad({ start: free(x - 30, zc - 140, floor - 2), end: free(x + 30, zc - 140, floor - 2), roadType: 'street-2', overrides: { structure: { mode: 'trench' } } });
+    expect(isWater(x, zc - 140)).toBe(false);
+  });
+
+  it('"Let water in" floods a pit that does not reach the river, and it survives save and load', () => {
+    const net = new RoadNetwork();
+    const ed = bindTerrainEdits(net);
+    stroke(ed, { op: 'lower', x: 0, z: Z, radius: 40, strength: 1, shape: 'hard', letWater: true }, 40);
+    stroke(ed, { op: 'lower', x: 200, z: Z, radius: 40, strength: 1, shape: 'hard' }, 40);
+    expect(isWater(0, Z)).toBe(true);
+    expect(isWater(200, Z)).toBe(false);
+    expect(net.project.terrain!.water).toBeTruthy();
+    const text = net.serialize();
+    unbindTerrainEdits();
+    bindTerrainEdits(new RoadNetwork(text));
+    expect(isWater(0, Z)).toBe(true);
+    expect(isWater(200, Z)).toBe(false);
   });
 });
 

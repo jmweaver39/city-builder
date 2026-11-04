@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { roadLevel, terrainHeight, totalHalfWidth, type Vec3 } from '../../src/core';
+import { isWater, roadLevel, terrainHeight, totalHalfWidth, type Vec3 } from '../../src/core';
 import { cubicPoint } from '../../src/core/bezier';
 import { bindTerrainEdits, unbindTerrainEdits, type TerrainEditor } from '../../src/core/terrainEdit';
 import type { TerrainTool } from '../../src/tools/TerrainTool';
@@ -177,6 +177,30 @@ describe('roads on landscaped land', () => {
         expect(Math.abs(b.y - a.y) / Math.hypot(b.x - a.x, b.z - a.z)).toBeLessThan(0.12);
       }
     }
+  });
+
+  it('a road drawn down into a dry pit is an open cut, and the pit stays dry', () => {
+    tool.brush.strength = 1;
+    tool.brush.radius = 40;
+    tool.brush.shape = 'hard';
+    hold(0, Z, 30, { button: 2 });
+    const floor = terrainHeight(0, Z);
+    expect(floor).toBeLessThan(-8);
+    expect(isWater(0, Z)).toBe(false);
+    r.tools.setTool('road');
+    r.tools.settings.drawMode = 'straight';
+    r.tools.settingsChanged();
+    r.click(110, Z);
+    r.click(0, Z);
+    expect(r.toasts).toEqual([]);
+    const segs = r.net.segments;
+    expect(segs.length).toBeGreaterThan(0);
+    // The end sits on the pit floor; where it runs below the ground it is a sloped cut, not a tunnel.
+    const end = r.net.nodes.find((n) => Math.abs(n.pos.x) < 5)!;
+    expect(Math.abs(end.pos.y - terrainHeight(end.pos.x, end.pos.z))).toBeLessThan(0.5);
+    expect(segs.some((s) => s.overrides.structure?.mode === 'cut')).toBe(true);
+    expect(isWater(0, Z)).toBe(false);
+    expect(r.history.undoLabel).toBe('Draw road');
   });
 
   it('roads far from any landscaping are drawn as before', () => {

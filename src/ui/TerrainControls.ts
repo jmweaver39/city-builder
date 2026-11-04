@@ -8,7 +8,7 @@ import { MAX_ELEVATION, MIN_ELEVATION } from '../core/terrain';
 import { TERRAIN_MODES, type TerrainMode } from '../tools/TerrainTool';
 import type { ToolId } from '../tools/types';
 import type { UiContext } from './context';
-import { el, numberInput, row, selectInput, sliderInput } from './dom';
+import { checkbox, el, numberInput, row, selectInput, sliderInput } from './dom';
 import { registerKeys, type KeyBinding } from './keymap';
 
 /** Line icons, drawn for this game. */
@@ -103,6 +103,11 @@ export function renderTerrainTray(ui: UiContext, options: HTMLElement, cards: HT
   target.placeholder = 'sample';
   if (b.target === null) target.value = '';
   const levelRow = row('Level to (m)', target, 'Typed height for Level. Right click or Option+click on the ground samples it');
+  const water = checkbox(b.letWater, (v) => {
+    b.letWater = v;
+    tool.settingsChanged();
+  });
+  const waterRow = row('Let water in', water, 'Ground you paint floods below the river level even if it does not reach the river: ponds and lakes. Off, only ground connected to the river floods');
   const help = el('div', { class: 'small muted', text: '' });
   options.append(
     el('div', { class: 'opt-title', text: 'Brush' }),
@@ -110,6 +115,7 @@ export function renderTerrainTray(ui: UiContext, options: HTMLElement, cards: HT
     row('Strength', strength, 'Shift+[ and Shift+]'),
     row('Shape', shape),
     levelRow,
+    waterRow,
     help,
   );
   const sync = () => {
@@ -126,6 +132,7 @@ export function renderTerrainTray(ui: UiContext, options: HTMLElement, cards: HT
       strength.querySelector('output')!.textContent = `${pct}%`;
       st.dispatchEvent(new Event('sync'));
     }
+    water.checked = b.letWater;
     if (document.activeElement !== target) target.value = b.target === null ? '' : String(Math.round(b.target * 10) / 10);
     levelRow.style.display = b.mode === 'level' ? '' : 'none';
     const on = ui.tools.active.id === 'terrain';

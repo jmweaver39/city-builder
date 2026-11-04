@@ -18,7 +18,7 @@ import { totalHalfWidth } from '../core/roadTypes';
 import { isWater, MAP_HALF_SIZE } from '../core/terrain';
 import type { Id, Vec3 } from '../core/types';
 import type { GridView } from '../render/api';
-import { visibleSnapSpacing } from '../render/gridLevels';
+import { GRID_FINEST, visibleSnapSpacing } from '../render/gridLevels';
 import type { SnapFrom, SnapHit, SnapQuery } from './snap';
 
 export interface GridSettings {
@@ -37,15 +37,22 @@ export interface GridSettings {
   alignOrigin: boolean;
   /** Snap to the finest subdivision visible at the current zoom. Off: base spacing only. */
   snapSubdivisions: boolean;
+  /**
+   * Smallest grid, metres: neither drawn lines nor snapping subdivide below it,
+   * so squares stay this big however close the camera. Never above the spacing.
+   */
+  minSpacing: number;
 }
 
 export const GRID_SPACINGS: readonly number[] = [8, 16, 32, 64, 128];
 export const GRID_MIN_SPACING = 2;
 export const GRID_MAX_SPACING = 512;
+/** Presets for the smallest grid. */
+export const GRID_MIN_SPACINGS: readonly number[] = [0.5, 1, 2, 4, 8, 16, 32];
 const QUARTER = Math.PI / 2;
 
 export function defaultGrid(): GridSettings {
-  return { enabled: false, spacing: 32, rotation: 0, originX: 0, originZ: 0, majorEvery: 4, alignOrigin: true, snapSubdivisions: true };
+  return { enabled: false, spacing: 32, rotation: 0, originX: 0, originZ: 0, majorEvery: 4, alignOrigin: true, snapSubdivisions: true, minSpacing: GRID_FINEST };
 }
 
 /** Rotation folded into [0, PI/2). */
@@ -74,7 +81,19 @@ export function sanitizeGrid(raw: Partial<GridSettings> | null | undefined): Gri
     majorEvery: major === 5 ? 5 : 4,
     alignOrigin: typeof raw.alignOrigin === 'boolean' ? raw.alignOrigin : d.alignOrigin,
     snapSubdivisions: typeof raw.snapSubdivisions === 'boolean' ? raw.snapSubdivisions : d.snapSubdivisions,
+    minSpacing: clampMinSpacing(num(raw.minSpacing, d.minSpacing), spacing),
   };
+}
+
+/** A smallest grid kept between GRID_FINEST and the base spacing. */
+export function clampMinSpacing(min: number, spacing: number): number {
+  const m = Number.isFinite(min) ? min : GRID_FINEST;
+  return Math.min(Math.max(GRID_FINEST, spacing), Math.max(GRID_FINEST, m));
+}
+
+/** The smallest grid in effect: the setting, never above the base spacing. */
+export function gridMinSpacing(g: Pick<GridSettings, 'spacing'> & Partial<Pick<GridSettings, 'minSpacing'>>): number {
+  return clampMinSpacing(g.minSpacing ?? GRID_FINEST, g.spacing);
 }
 
 /** Back to the defaults, keeping whether snapping is on. */
@@ -142,10 +161,11 @@ export function gridLineCatch(g: Pick<GridSettings, 'spacing'>, metresPerPixel =
 
 /**
  * The grid snapping uses at this zoom: the base grid with its spacing swapped
- * for the finest subdivision currently shown (unless subdivisions are off).
+ * for the finest subdivision currently shown (unless subdivisions are off),
+ * never below the smallest grid.
  */
 export function snapGridAt(g: GridSettings, metresPerPixel: number): SnapGrid {
-  const spacing = visibleSnapSpacing(g.spacing, g.majorEvery, metresPerPixel, g.snapSubdivisions);
+  const spacing = visibleSnapSpacing(g.spacing, g.majorEvery, metresPerPixel, g.snapSubdivisions, gridMinSpacing(g));
   return { ...g, spacing, subdivided: spacing < g.spacing };
 }
 
@@ -353,6 +373,7 @@ export function gridViewFor(
     originX: s.originX,
     originZ: s.originZ,
     majorEvery: s.majorEvery,
+    minSpacing: gridMinSpacing(s),
     center: { x: center.x, z: center.z },
     elevation,
   };

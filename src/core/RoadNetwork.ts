@@ -247,6 +247,11 @@ export interface NetworkChange {
   reason?: ResetReason;
   /** Segments whose a and b swapped. Same ids, but every lane on them changed meaning. */
   reversedSegments: Id[];
+  /**
+   * Segments given a road type with a different lane layout (lanes added, removed,
+   * moved or turned round). Same ids, but a lane index may now mean another lane.
+   */
+  relaidSegments?: Id[];
 }
 
 export type ChangeListener = (change: NetworkChange) => void;
@@ -319,6 +324,7 @@ export class RoadNetwork {
   private evtQuays = false;
   private evtTerrain = false;
   private readonly evtReversed = new Set<Id>();
+  private readonly evtRelaid = new Set<Id>();
   private evtReset = false;
   private evtReason: ResetReason | undefined = undefined;
 
@@ -443,6 +449,7 @@ export class RoadNetwork {
       quaysChanged: this.evtQuays,
       terrainChanged: this.evtTerrain,
       reversedSegments: [...this.evtReversed],
+      ...(this.evtRelaid.size ? { relaidSegments: [...this.evtRelaid].filter((id) => this.segIndex.has(id)) } : {}),
       reset: this.evtReset,
       reason: this.evtReason,
     };
@@ -462,6 +469,7 @@ export class RoadNetwork {
     this.evtQuays = false;
     this.evtTerrain = false;
     this.evtReversed.clear();
+    this.evtRelaid.clear();
     this.evtReset = false;
     this.evtReason = undefined;
   }
@@ -819,10 +827,17 @@ export class RoadNetwork {
     this.batch(() => {
       const copyOf = structuredClone(def);
       const i = this.p.customRoadTypes.findIndex((t) => t.id === def.id);
+      const before = i >= 0 ? this.p.customRoadTypes[i].lanes : null;
+      const relaid = !!before && (before.length !== copyOf.lanes.length || before.some((l, k) => l.dir !== copyOf.lanes[k].dir || Math.abs(l.offset - copyOf.lanes[k].offset) > 1e-6));
       if (i >= 0) this.p.customRoadTypes[i] = copyOf;
       else this.p.customRoadTypes.push(copyOf);
       this.customTypes.set(def.id, copyOf);
-      for (const s of this.p.segments) if (s.roadType === def.id) this.touchSeg(s.id);
+      if (relaid) this.graphTopologyChanged = true;
+      for (const s of this.p.segments) {
+        if (s.roadType !== def.id) continue;
+        if (relaid) this.evtRelaid.add(s.id);
+        this.touchSeg(s.id);
+      }
       this.evtSettings = true;
       this.markEdit();
     });
@@ -1412,7 +1427,17 @@ export class RoadNetwork {
     this.requireRoadType(roadType);
     const seg = this.requireSegment(id);
     this.batch(() => {
+      const before = this.roadTypeOf(id).lanes;
       seg.roadType = roadType;
+      const after = this.roadTypeOf(id).lanes;
+      const same =
+        before.length === after.length &&
+        before.every((l, i) => l.dir === after[i].dir && l.kind === after[i].kind && Math.abs(l.offset - after[i].offset) < 1e-6 && Math.abs(l.width - after[i].width) < 1e-6);
+      if (!same) {
+        // Lane indices change meaning: the sim re-seats vehicles by position (sim/remap.ts).
+        this.evtRelaid.add(id);
+        this.graphTopologyChanged = true;
+      }
       this.touchSeg(id);
     });
   }

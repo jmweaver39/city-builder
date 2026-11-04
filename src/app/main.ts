@@ -225,7 +225,17 @@ async function boot(): Promise<void> {
   };
   // The benchmark paces itself at 60 Hz from a worker, so it keeps running when the
   // page is hidden (requestAnimationFrame stops then). GPU and CPU times stay valid.
-  const pacer = runner ? benchPacer((t) => frame(t)) : null;
+  // A frame that throws must not end a benchmark run: the next one is still scheduled.
+  const pacer = runner
+    ? benchPacer((t) => {
+        try {
+          frame(t);
+        } catch (err) {
+          console.error(err);
+          pacer?.postMessage(0);
+        }
+      })
+    : null;
   if (pacer) pacer.postMessage(0);
   else requestAnimationFrame(frame);
 }

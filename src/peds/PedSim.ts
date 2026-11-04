@@ -432,7 +432,9 @@ export class PedSim {
 
   private pathTo(to: number): Int32Array {
     const out: number[] = [];
-    for (let v = to; v >= 0; v = this.prev[v]) out.push(v);
+    // Bounded: a stale prev chain can loop, which used to grow this array until it threw
+    // (seconds of stall, then a dead frame loop). Found by the benchmark's rail view.
+    for (let v = to; v >= 0 && out.length <= this.prev.length; v = this.prev[v]) out.push(v);
     out.reverse();
     return Int32Array.from(out);
   }

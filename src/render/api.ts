@@ -143,6 +143,8 @@ export interface GridView {
   originZ: number;
   /** Every this many lines is a major line. */
   majorEvery: number;
+  /** Smallest subdivision drawn, metres. Absent: 0.5 m. */
+  minSpacing?: number;
   /** Lines fade out with distance from this point, usually the cursor. */
   center: { x: number; z: number };
   /** Height of the plane it lies on, the drawing elevation. */

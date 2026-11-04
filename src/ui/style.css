@@ -481,6 +481,8 @@ dl.kv { margin: 0; }
 .phase-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .phase-row .icon-btn { min-width: 26px; height: 26px; padding: 0 2px; }
 .phase-row .icon-btn svg { width: 14px; height: 14px; }
+/* Grid popover: the seven smallest-grid presets fit one row. */
+.grid-popover .grid-min { min-width: 28px; padding: 0 4px; font-variant-numeric: tabular-nums; }
 .diagram { display: block; margin: var(--s-2) auto var(--s-1); background: var(--surface-inset); border: 1px solid var(--border); border-radius: var(--r-lg); cursor: pointer; }
 .legend { display: flex; gap: var(--s-3); color: var(--text-2); font-size: var(--fs-xs); justify-content: center; }
 .legend i { display: inline-block; width: 16px; height: 0; margin-right: var(--s-1); vertical-align: middle; border-top: 2px solid; }

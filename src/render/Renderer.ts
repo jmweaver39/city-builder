@@ -67,6 +67,7 @@ export class Renderer implements RendererApi, RendererExtras {
   private gpuTimer: GpuTimer;
   private lastGpuMs: number | null = null;
   private qualityListeners = new Set<(level: QualityName) => void>();
+  private failedLayers = new WeakSet<object>();
   /** One query over the whole frame's GPU work, for the governor. */
   private governorPhase = (p: GpuPhase | null) => this.gpuTimer.switchTo(p === 'shadow' ? 'scene' : p === null ? null : undefined);
   private onGpuTime = (_frame: number, _phase: GpuPhase, ms: number) => {
@@ -309,7 +310,16 @@ export class Renderer implements RendererApi, RendererExtras {
     this.vehicles.update(this.sim, camera, dist);
     prof?.lap('r.vehicles');
     for (const layer of this.context.layers) {
-      layer.update?.(dt, this.context);
+      // One failing layer must not stop the frame loop and freeze the game; its error is
+      // reported once.
+      try {
+        layer.update?.(dt, this.context);
+      } catch (err) {
+        if (!this.failedLayers.has(layer)) {
+          this.failedLayers.add(layer);
+          console.error(`Cloverleaf: ${layer.constructor.name}.update failed; later errors from it are not logged.`, err);
+        }
+      }
       prof?.lap(`L.${layer.constructor.name}`);
     }
     this.furniture.updateSignals(this.sim);
@@ -321,7 +331,9 @@ export class Renderer implements RendererApi, RendererExtras {
     prof?.lap('r.trees');
     this.terrain.update(this.cam.target.x, this.cam.target.z, camera.position.y - this.cam.target.y);
     this.laneDebug.refresh();
-    this.tools.updateLabels((p) => this.project(p), this.canvas.getBoundingClientRect());
+    // One rect read per frame: reading it per label, between label style writes, forced a layout each time.
+    const rect = this.canvas.getBoundingClientRect();
+    this.tools.updateLabels((p) => this.project(p, rect), rect);
     prof?.lap('r.misc');
 
     this.gl.info.reset();
@@ -458,12 +470,12 @@ export class Renderer implements RendererApi, RendererExtras {
     return this.vehicles.pick(this.sim.vehicles, this.cam.ray(clientX, clientY), this.sim.renderAlpha);
   }
 
-  project(pos: Vec3): { x: number; y: number } | null {
+  project(pos: Vec3, rect?: DOMRect): { x: number; y: number } | null {
     const camera = this.cam.camera;
     const v = this.projected.set(pos.x, pos.y, pos.z).applyMatrix4(camera.matrixWorldInverse);
     if (v.z >= -camera.near) return null;
     v.applyMatrix4(camera.projectionMatrix);
-    const r = this.canvas.getBoundingClientRect();
+    const r = rect ?? this.canvas.getBoundingClientRect();
     return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height };
   }
 

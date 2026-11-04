@@ -3,8 +3,8 @@
  * tool is active.
  *
  * Adaptive like a CAD grid: finer subdivisions fade in as the camera closes in
- * and coarser levels take over zoomed out (levels from gridLevels.ts). Each level
- * fades by its cell size in screen pixels, so zooming crossfades with no popping
+ * and coarser levels take over zoomed out (levels from gridLevels.ts), never
+ * finer than the player's smallest grid. Each level fades by its cell size in screen pixels, so zooming crossfades with no popping
  * and lines are dropped before they get dense enough to shimmer. Lines further
  * apart on screen draw brighter, and major lines stay brightest.
  *
@@ -132,7 +132,7 @@ export class GridLayer implements RenderLayer {
     const u = this.material.uniforms;
     u.uOrigin.value.set(view.originX, view.originZ);
     u.uRot.value.set(Math.cos(view.rotation), Math.sin(view.rotation));
-    const levels = gridLevels(Math.max(0.5, view.spacing), Math.max(2, view.majorEvery));
+    const levels = gridLevels(Math.max(0.5, view.spacing), Math.max(2, view.majorEvery), view.minSpacing);
     const sp = u.uLevels.value as number[];
     const wt = u.uWeights.value as number[];
     for (let i = 0; i < GRID_MAX_LEVELS; i++) {

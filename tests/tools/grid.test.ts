@@ -9,6 +9,7 @@ import {
   normalizeGridRotation,
   sanitizeGrid,
   saveGridPrefs,
+  gridMinSpacing,
   snapGridAt,
   toGrid,
   type GridSettings,
@@ -345,5 +346,100 @@ describe('adaptive grid levels', () => {
     r.tools.settingsChanged();
     r.hover(17, 1);
     expect(r.tools.hud?.lines.join(' ')).not.toContain('Grid');
+  });
+});
+
+describe('smallest grid', () => {
+  const FOV = 40;
+  const H = 900;
+  const distances = [3, 7, 15, 30, 60, 120, 250, 500, 1000, 2000, 4000, 6800];
+  const store = () => {
+    const map = new Map<string, string>();
+    return { map, getItem: (k: string) => map.get(k) ?? null, setItem: (k: string, s: string) => void map.set(k, s) };
+  };
+
+  it('defaults to 0.5 m, and the default grid behaves as before', () => {
+    expect(defaultGrid().minSpacing).toBe(GRID_FINEST);
+    expect(gridLevels(64, 4, GRID_FINEST)).toEqual(gridLevels(64, 4));
+    const g = grid({ spacing: 64 });
+    for (const d of distances) {
+      const mpp = metresPerPixel(d, FOV, H);
+      expect(snapGridAt(g, mpp).spacing).toBe(visibleSnapSpacing(64, 4, mpp));
+    }
+    expect(snapGridAt(g, metresPerPixel(3, FOV, H)).spacing).toBe(0.5);
+  });
+
+  it('never snaps below the minimum at any camera distance', () => {
+    for (const min of [1, 2, 4, 8, 16, 32]) {
+      const g = grid({ spacing: 64, minSpacing: min });
+      const spacings = distances.map((d) => snapGridAt(g, metresPerPixel(d, FOV, H)).spacing);
+      for (const s of spacings) expect(s).toBeGreaterThanOrEqual(min);
+      // Street level stops at exactly the minimum, a power-of-two split of 64.
+      expect(spacings[0]).toBe(min);
+      for (let i = 1; i < spacings.length; i++) expect(spacings[i]).toBeGreaterThanOrEqual(spacings[i - 1]);
+      // Far out, the minimum makes no difference.
+      const far = metresPerPixel(6800, FOV, H);
+      expect(snapGridAt(g, far).spacing).toBe(snapGridAt(grid({ spacing: 64 }), far).spacing);
+    }
+  });
+
+  it('draws no line level below the minimum', () => {
+    expect(gridLevels(64, 4, 8).map((l) => l.spacing)).toEqual([8, 16, 32, 64, 256, 1024, 4096]);
+    // A custom minimum that is not a halving of the spacing stops at the last halving above it.
+    expect(Math.min(...gridLevels(32, 4, 5).map((l) => l.spacing))).toBe(8);
+    expect(Math.min(...gridLevels(30, 4, 5).map((l) => l.spacing))).toBe(7.5);
+    // At or above the spacing: no subdivisions at all.
+    expect(gridLevels(32, 4, 32)[0]).toMatchObject({ spacing: 32, kind: 'base' });
+    // The renderer is handed the minimum.
+    const view = gridViewFor('road', 'straight', grid({ spacing: 64, minSpacing: 8 }), null, { x: 0, z: 0 }, 0)!;
+    expect(view.minSpacing).toBe(8);
+    for (const l of gridLevels(view.spacing, view.majorEvery, view.minSpacing)) expect(l.spacing).toBeGreaterThanOrEqual(8);
+  });
+
+  it('is never above the base spacing', () => {
+    expect(gridMinSpacing({ spacing: 16, minSpacing: 32 })).toBe(16);
+    expect(gridMinSpacing({ spacing: 16, minSpacing: 0.1 })).toBe(GRID_FINEST);
+    expect(sanitizeGrid({ spacing: 16, minSpacing: 32 }).minSpacing).toBe(16);
+    expect(sanitizeGrid({ spacing: 16, minSpacing: Number.NaN }).minSpacing).toBe(GRID_FINEST);
+    // Snapping with a too-large minimum still uses the base spacing.
+    expect(snapGridAt(grid({ spacing: 16, minSpacing: 32 }), metresPerPixel(3, FOV, H)).spacing).toBe(16);
+  });
+
+  it('is saved with the grid preferences, and old preferences load as 0.5 m', () => {
+    const st = store();
+    const g = grid({ spacing: 64, minSpacing: 8 });
+    saveGridPrefs(st, g);
+    expect(loadGridPrefs(st).minSpacing).toBe(8);
+    // A preference saved before the setting existed.
+    const { minSpacing: _drop, ...old } = grid({ spacing: 48 });
+    st.map.set('cloverleaf.grid', JSON.stringify(old));
+    expect(loadGridPrefs(st)).toMatchObject({ spacing: 48, minSpacing: GRID_FINEST });
+  });
+
+  it('keeps snapped points on the coarse grid close up', () => {
+    const g = grid({ spacing: 64, minSpacing: 8, originX: 3, originZ: -1 });
+    const mpp = metresPerPixel(5, FOV, H);
+    const close = snapGridAt(g, mpp);
+    expect(close.spacing).toBe(8);
+    const empty = new RoadNetwork();
+    for (let i = 0; i < 40; i++) {
+      const raw = v(Math.sin(i) * 30, Math.cos(i * 1.7) * 30);
+      const hit = snapRoadPoint(empty, query(raw, { grid: close, gridMetresPerPixel: mpp }));
+      expect(['grid', 'gridLine']).toContain(hit.kind);
+      expect(onLine(grid({ spacing: 8, originX: 3, originZ: -1 }), hit.pos)).toBe(true);
+    }
+  });
+
+  it('shows the clamped snap size in the road tool readout', () => {
+    const r = rig();
+    Object.assign(r.tools.settings.grid, { enabled: true, spacing: 32, minSpacing: 16 });
+    r.tools.setTool('road');
+    // The fake view is 1 m per pixel, which picks 16 m anyway; a 32 m minimum overrides it.
+    r.hover(17, 1);
+    expect(r.tools.hud?.lines.join(' ')).toContain('Grid 16 m');
+    r.tools.settings.grid.minSpacing = 32;
+    r.tools.settingsChanged();
+    r.hover(17, 1);
+    expect(r.tools.hud?.lines.join(' ')).toContain('Grid 32 m');
   });
 });

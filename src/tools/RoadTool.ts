@@ -10,7 +10,7 @@ import type { CrossingInfo, DraftIssue, RoadAnchor } from '../core/RoadNetwork';
 import { addScaled, clamp, distXZ, dotXZ, normalizeXZ, sub } from '../core/math';
 import { isOneWay } from '../core/roadTypes';
 import { ELEVATION_STEP, hasTerrainEdits, MAX_ELEVATION, MIN_ELEVATION, surfaceLevel, terrainEditDelta } from '../core/terrain';
-import { followTerrain, pickGround, roadBed } from './terrainFollow';
+import { autoCut, followTerrain, pickGround, roadBed } from './terrainFollow';
 import type { Id, RampAttach, Vec3 } from '../core/types';
 import type { RoadPreview, ToolMark } from '../render/api';
 import { buildCubic, endState, formatReadout, readout, usableEndDir } from './draft';
@@ -444,14 +444,19 @@ export class RoadTool extends Tool {
     }
     this.ctx.history.hint('Draw road');
     // A fitted curve is several pieces joined by plain joints, drawn as one step.
-    const result = drawChain(net, {
-      start: draft.start,
-      end: draft.end,
-      cubics: draft.cubics,
-      roadType: settings.roadType,
-      startAttach: draft.startAttach,
-      endAttach: draft.endAttach,
-      overrides: this.drawnOverrides(draft),
+    // One step: the road, and a sloped cut where it runs down into landscaped ground (terrainFollow.ts).
+    const result = net.batch(() => {
+      const r = drawChain(net, {
+        start: draft.start,
+        end: draft.end,
+        cubics: draft.cubics,
+        roadType: settings.roadType,
+        startAttach: draft.startAttach,
+        endAttach: draft.endAttach,
+        overrides: this.drawnOverrides(draft),
+      });
+      autoCut(net, r.segments, settings.elevation);
+      return r;
     });
     if (draft.flipped) {
       // The far end is where this road begins, so there is nothing to carry on from.

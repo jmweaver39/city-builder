@@ -16,6 +16,10 @@ import { EDIT_CELL, EDIT_ORIGIN, EDIT_TILE, EDIT_TILES, terrainEditor } from '..
 import { hasTerrainEdits, isWater, MAX_ELEVATION, MIN_ELEVATION, surfaceLevel, terrainHeight } from '../core/terrain';
 import type { Vec3 } from '../core/types';
 import { pickRay } from './pick';
+import type { RoadNetwork } from '../core/RoadNetwork';
+import type { Id } from '../core/types';
+import { structureOf } from '../core/walls';
+import { applyStructure } from './wallOps';
 import type { ToolContext, ToolPointer } from './types';
 
 /** Where the cursor's ray meets the landscaped ground, lifted by `lift`. */
@@ -233,4 +237,20 @@ export function followTerrain(cubics: readonly Cubic[], opt: FollowOptions): Cub
   const e = out.length - 1;
   out[e] = { ...out[e], p3: { ...out[e].p3, y: y1 } };
   return out;
+}
+
+/**
+ * A road drawn at ground level that runs well below the landscaped ground (into
+ * a dug pit, say) is built as a sloped cut, the walls module's open earthwork,
+ * not a tunnel: it stays open to the sky and dry. Only roads left on Auto.
+ */
+export function autoCut(net: RoadNetwork, segments: readonly Id[], elevation: number): void {
+  if (elevation !== 0 || !hasTerrainEdits()) return;
+  for (const id of segments) {
+    const seg = net.getSegment(id);
+    if (!seg || structureOf(seg.overrides).mode !== 'auto') continue;
+    const st = net.curveOf(id).stations;
+    const sunk = st.some((s) => s.pos.y < surfaceLevel(s.pos.x, s.pos.z) - 1.5);
+    if (sunk) applyStructure(net, id, { mode: 'cut' });
+  }
 }

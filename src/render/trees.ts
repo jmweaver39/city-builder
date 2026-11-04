@@ -7,7 +7,7 @@
 import * as THREE from 'three';
 import type { RoadNetwork } from '../core/RoadNetwork';
 import { totalHalfWidth } from '../core/roadTypes';
-import { isWater, riverDistance, terrainEditDelta, terrainHeight, WATER_LEVEL } from '../core/terrain';
+import { isWater, riverDistance, terrainEditDelta, terrainHeight } from '../core/terrain';
 import { terrainModsFor } from '../core/terrainMods';
 import type { QualitySettings } from './quality';
 import type { Shared } from './materials';
@@ -805,7 +805,7 @@ export class TreeLayer {
       if (d !== 0 || Math.abs(this.y[i] - y) > 0.01) {
         this.y[i] = y;
         const steep = Math.hypot(terrainEditDelta(x + 2, z) - terrainEditDelta(x - 2, z), terrainEditDelta(x, z + 2) - terrainEditDelta(x, z - 2)) / 4;
-        if (y < WATER_LEVEL + 0.25 || steep > 0.9) this.hidden[i] = 1;
+        if (isWater(x, z) || d < -1 || steep > 0.9) this.hidden[i] = 1;
       }
     }
   }

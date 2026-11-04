@@ -60,9 +60,9 @@ float blocked = textureLod(uMask, maskUv, 0.0).r;
 float dist = distance(wrapped, cameraPosition.xz);
 float scale = (1.0 - smoothstep(${(RANGE * 0.62).toFixed(1)}, ${(RANGE * 0.97).toFixed(1)}, dist)) * step(blocked, 0.002);
 scale *= step(max(abs(wrapped.x), abs(wrapped.y)), 2000.0);
-// Landscaping lifts or sinks the tufts with the land, and floods drown them.
+// Landscaping lifts or sinks the tufts with the land; dug ground is bare earth.
 float gEdit = tEdit(wrapped);
-scale *= step(-2.3, gEdit);
+scale *= step(-0.6, gEdit);
 vec3 local = mat3(instanceMatrix) * transformed * scale;
 // Sway from the top of the blades.
 float gust = sin(uTime * 1.4 + wrapped.x * 0.13 + wrapped.y * 0.09) + 0.5 * sin(uTime * 2.9 + wrapped.x * 0.31);

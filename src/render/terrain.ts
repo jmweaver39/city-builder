@@ -309,6 +309,8 @@ ${GROUND_COLOUR_GLSL}
   ${patch && !editTiles ? '' : 'if (vWorld.x > uPatchRect.x && vWorld.x < uPatchRect.z && vWorld.z > uPatchRect.y && vWorld.z < uPatchRect.w) discard;'}
   ${patch ? '' : 'if (tEditTile(vWorld.xz) > 0.5) discard;'}
   vec3 c = groundColour(vWorld.xz, vWorld.y, vSlope, length(vViewPosition));
+  // Landscaping: dug, dry ground shows soil and rock, not grass or river bed.
+  c = tDugColour(c, vWorld.xz, vWorld.y, vSlope, texture2D(uDetail, vWorld.xz / 9.5).r);
   float out_ = max(abs(vWorld.x), abs(vWorld.z)) - MAP_EDGE;
   if (out_ > 0.0) c *= 0.95;
   float w = max(fwidth(out_) * 1.2, 1.0);
@@ -317,7 +319,11 @@ ${GROUND_COLOUR_GLSL}
     float l = dot(c, vec3(0.3, 0.6, 0.1));
     c = mix(c, vec3(l) * 0.75 + vec3(0.02, 0.025, 0.03), uDim);
   }
-  if (uUnder > 0.5) c = vec3(dot(c, vec3(0.3, 0.6, 0.1))) * vec3(0.5, 0.62, 0.8);
+  if (uUnder > 0.5) {
+    c = vec3(dot(c, vec3(0.3, 0.6, 0.1))) * vec3(0.5, 0.62, 0.8);
+    // Excavations stay readable in the underground view: warm earth against the blue-grey.
+    c = mix(c, vec3(0.42, 0.3, 0.2), smoothstep(0.3, 1.4, -tEdit(vWorld.xz)) * 0.55);
+  }
   diffuseColor.rgb = c;
 }
 `,
@@ -362,9 +368,12 @@ uniform vec3 uSunDir;
 uniform vec3 uFoam;
 uniform float uOpacity;
 varying vec3 vWorld;
+${TERRAIN_EDIT_GLSL}
 varying float vEdge;
 void main() {
   #include <logdepthbuf_fragment>
+  // Landscaping: water only where it reaches the river; dug pits, roads and trenches stay dry.
+  if (tWet(vWorld.xz) == 0.0) discard;
   vec2 ra = texture2D(uNoise, vWorld.xz / 30.0 + vec2(uTime * 0.01, uTime * 0.006)).rg;
   vec2 rb = texture2D(uNoise, vWorld.xz / 9.0 + vec2(-uTime * 0.016, uTime * 0.012)).rg;
   vec3 n = normalize(vec3((ra.x - 0.5) * 0.12 + (rb.x - 0.5) * 0.08, 1.0, (ra.y - 0.5) * 0.12 + (rb.y - 0.5) * 0.08));
@@ -470,6 +479,7 @@ export class Terrain implements EditSurfaces {
     });
     this.waterMat.uniforms.uNoise = shared.uNoise;
     this.waterMat.uniforms.uTime = shared.uTime;
+    useTerrainEditUniforms(this.waterMat);
     this.water = new THREE.Mesh(buildWater(), this.waterMat);
     this.water.renderOrder = 1;
     this.water.matrixAutoUpdate = false;
@@ -578,7 +588,8 @@ export class Terrain implements EditSurfaces {
     this.shared.uUnder.value = on ? 1 : 0;
     this.ground.renderOrder = on ? 3 : -5;
     if (this.patch) this.patch.renderOrder = on ? 3 : -5;
-    this.waterMat.uniforms.uOpacity.value = on ? 0.25 : 0.93;
+    // Faint underground, so it never hides tunnels, metro lines or stations.
+    this.waterMat.uniforms.uOpacity.value = on ? 0.06 : 0.93;
   }
 
   dispose(): void {

@@ -8,9 +8,12 @@
  * and keeping them out of the save format means old and new saves load unchanged.
  */
 import {
+  clampMinSpacing,
   GRID_MAX_SPACING,
   GRID_MIN_SPACING,
+  GRID_MIN_SPACINGS,
   GRID_SPACINGS,
+  gridMinSpacing,
   loadGridPrefs,
   normalizeGridRotation,
   resetGrid,
@@ -24,6 +27,7 @@ import { MOD_KEY } from '../tools/platform';
 import { GUIDE_KEYS } from './guideKeys';
 import type { UiContext } from './context';
 import { checkbox, el, iconButton, numberInput, row, selectInput, sliderInput } from './dom';
+import { formatSpacing, GRID_FINEST } from '../render/gridLevels';
 
 const svg = (body: string) =>
   `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
@@ -55,6 +59,26 @@ let lastSaved = '';
 /** Load the saved grid preference and keep it saved. Call once. */
 export function initGridPrefs(ui: UiContext): void {
   registerKeys(GUIDE_KEYS);
+  registerKeys([
+    {
+      id: 'grid.minLarger',
+      label: 'Smallest grid larger',
+      group: 'View',
+      keys: [],
+      scope: 'global',
+      desc: 'Bigger squares close up: grid lines and snapping stop subdividing at the next size up',
+      run: () => stepMinSpacing(ui, 1),
+    },
+    {
+      id: 'grid.minSmaller',
+      label: 'Smallest grid smaller',
+      group: 'View',
+      keys: [],
+      scope: 'global',
+      desc: 'Finer squares close up, down to 0.5 m',
+      run: () => stepMinSpacing(ui, -1),
+    },
+  ]);
   const s = ui.tools.settings;
   Object.assign(s.grid, loadGridPrefs(store()));
   lastSaved = JSON.stringify(s.grid);
@@ -65,6 +89,17 @@ export function initGridPrefs(ui: UiContext): void {
     saveGridPrefs(store(), s.grid);
   });
   ui.tools.settingsChanged();
+}
+
+/** Step the smallest grid through its presets, never above the base spacing. */
+export function stepMinSpacing(ui: UiContext, dir: 1 | -1): void {
+  const g = ui.tools.settings.grid;
+  const cur = gridMinSpacing(g);
+  const fits = GRID_MIN_SPACINGS.filter((m) => m <= g.spacing + 1e-9);
+  const next = dir > 0 ? fits.find((m) => m > cur + 1e-9) ?? fits[fits.length - 1] : [...fits].reverse().find((m) => m < cur - 1e-9) ?? GRID_FINEST;
+  g.minSpacing = next;
+  ui.tools.settingsChanged();
+  ui.toast(`Smallest grid ${formatSpacing(next)}`, 'info');
 }
 
 /** Turn grid snapping on or off. */
@@ -211,6 +246,7 @@ function fillPopover(ui: UiContext, panel: HTMLElement, render: () => void): voi
       class: `grid-spacing ${g.spacing === m ? 'active' : ''}`,
       onClick: () => {
         g.spacing = m;
+        g.minSpacing = clampMinSpacing(g.minSpacing, m);
         apply(true);
       },
     });
@@ -219,10 +255,50 @@ function fillPopover(ui: UiContext, panel: HTMLElement, render: () => void): voi
   const custom = numberInput(g.spacing, { min: GRID_MIN_SPACING, max: GRID_MAX_SPACING, step: 1 }, (v) => {
     if (v < GRID_MIN_SPACING || v > GRID_MAX_SPACING) return;
     g.spacing = v;
+    g.minSpacing = clampMinSpacing(g.minSpacing, v);
     spacing.querySelectorAll('.grid-spacing').forEach((b) => b.classList.toggle('active', Number(b.textContent) === v));
+    syncMin();
     apply();
   });
   custom.style.width = '64px';
+
+  // Smallest grid: presets above the base spacing are greyed out.
+  const minRow = el('div', { class: 'opt-row', style: { flexWrap: 'wrap' } });
+  const minButtons = GRID_MIN_SPACINGS.map((m) => {
+    const b = iconButton('', {
+      tip: `Squares never smaller than ${formatSpacing(m)}, however close you zoom`,
+      label: `${m}`,
+      class: 'grid-min',
+      onClick: () => {
+        if (m > g.spacing) return;
+        g.minSpacing = m;
+        minCustom.value = String(m);
+        syncMin();
+        apply();
+      },
+    });
+    b.dataset.min = String(m);
+    minRow.append(b);
+    return b;
+  });
+  const minCustom = numberInput(gridMinSpacing(g), { min: GRID_FINEST, max: g.spacing, step: 0.5 }, (v) => {
+    if (v < GRID_FINEST || v > g.spacing) return;
+    g.minSpacing = v;
+    syncMin();
+    apply();
+  });
+  minCustom.style.width = '64px';
+  function syncMin(): void {
+    const cur = gridMinSpacing(g);
+    for (const b of minButtons) {
+      const m = Number(b.dataset.min);
+      b.disabled = m > g.spacing + 1e-9;
+      b.classList.toggle('active', Math.abs(m - cur) < 1e-9);
+    }
+    minCustom.max = String(g.spacing);
+    if (document.activeElement !== minCustom) minCustom.value = String(cur);
+  }
+  syncMin();
 
   const deg = Math.round(((g.rotation * 180) / Math.PI) * 10) / 10;
   const rotation = sliderInput(deg, { min: 0, max: 89.5, step: 0.5, format: (v) => `${v.toFixed(1)}°` }, (v) => {
@@ -248,11 +324,14 @@ function fillPopover(ui: UiContext, panel: HTMLElement, render: () => void): voi
         g.snapSubdivisions = v;
         apply();
       }),
-      'On: zoom in for finer lines and finer snapping, down to 0.5 m. Off: base spacing only',
+      'On: zoom in for finer lines and finer snapping, down to the smallest grid. Off: base spacing only',
     ),
     el('div', { class: 'opt-title', text: 'Spacing (m)' }),
     spacing,
     row('Custom', custom, `Any spacing from ${GRID_MIN_SPACING} to ${GRID_MAX_SPACING} m`),
+    el('div', { class: 'opt-title', text: 'Smallest grid (m)', tip: 'Zoomed in, lines and snapping stop subdividing at this size, so squares stay large' }),
+    minRow,
+    row('Custom', minCustom, 'Any size from 0.5 m up to the spacing. Subdivisions halve the spacing, so the finest is the last halving at least this big'),
     el('div', { class: 'opt-title', text: 'Rotation' }),
     rotation,
     el('div', { class: 'opt-title', text: 'Origin' }),
@@ -297,7 +376,7 @@ function fillPopover(ui: UiContext, panel: HTMLElement, render: () => void): voi
       el('button', {
         class: 'btn grid-reset',
         text: 'Reset',
-        tip: 'Back to 32 m, no rotation, origin at the map centre',
+        tip: 'Back to 32 m, no rotation, origin at the map centre, smallest grid 0.5 m',
         attrs: { type: 'button' },
         on: {
           click: () => {
